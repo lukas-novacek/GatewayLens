@@ -1,0 +1,47 @@
+name: release
+
+# Push a tag such as v0.3.0 and this builds GatewayLens.exe, runs the tests, and
+# publishes a GitHub release with the exe and the script attached.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the test suite
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+
+      - name: Check the tag matches the version in the script
+        shell: pwsh
+        run: |
+          $v = [regex]::Match((Get-Content ./GatewayLens.ps1 -Raw), "AppVersion\s*=\s*'([\d.]+)'").Groups[1].Value
+          if ("v$v" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match the script version $v." }
+
+      - name: Build GatewayLens.exe
+        shell: pwsh
+        run: ./build/Build-Exe.ps1
+
+      - name: Release notes from the changelog
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $c = Get-Content ./CHANGELOG.md -Raw
+          $m = [regex]::Match($c, "(?s)## \[$([regex]::Escape($v))\][^\n]*\n(.*?)(?=\n## \[|\z)")
+          ($m.Success ? $m.Groups[1].Value.Trim() : "GatewayLens $v") | Set-Content notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: GatewayLens ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            dist/GatewayLens.exe
+            GatewayLens.ps1

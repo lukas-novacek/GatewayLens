@@ -1,0 +1,11 @@
+{
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "[powershell]": {
+    "editor.formatOnSave": false,
+    "files.eol": "\r\n"
+  },
+  "search.exclude": {
+    "dist": true
+  }
+}

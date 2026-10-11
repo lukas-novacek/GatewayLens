@@ -1,0 +1,12 @@
+# Store text with LF in the repository; give Windows users CRLF on checkout
+# for the script, which is what PowerShell on Windows expects.
+* text=auto
+*.ps1 text eol=crlf
+*.md  text eol=lf
+*.yml text eol=lf
+*.cs     text eol=crlf
+*.csproj text eol=crlf
+
+# Images are binary - never convert line endings in them
+*.ico binary
+*.png binary

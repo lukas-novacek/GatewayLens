@@ -1,0 +1,36 @@
+# Runs the test suite on every push and pull request, on Linux and Windows.
+# The tests need no tenant and no sign-in, so this works on GitHub's free runners.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+
+  exe:
+    # Builds GatewayLens.exe on every push. Download it from the run's
+    # "Artifacts" section to try it before a release.
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build GatewayLens.exe
+        shell: pwsh
+        run: ./build/Build-Exe.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GatewayLens-exe
+          path: dist/GatewayLens.exe
+          if-no-files-found: error

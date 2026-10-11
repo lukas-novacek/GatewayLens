@@ -1,0 +1,22 @@
+# Local only - never published
+*.local.txt
+*.local.*
+
+# Exports and logs can contain your tenant's gateway, connection and user names
+*.csv
+*.log
+
+# Editors and operating systems - the project's VS Code settings are shared, personal ones are not
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+Thumbs.db
+.DS_Store
+
+# Claude Code - CLAUDE.md is shared; personal settings and notes are not
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Build output - the exe is published on the Releases page, never committed
+dist/
