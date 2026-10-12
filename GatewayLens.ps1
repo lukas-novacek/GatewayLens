@@ -137,22 +137,20 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.8.2'
+$script:AppVersion = '0.9.0'
 # What is new, in a few lines for the window - shown once after an update. The full
 # list is CHANGELOG.md. The tests check that it is about the current version.
 $script:WhatsNew = @{
-    Version = '0.8.2'
+    Version = '0.9.0'
     Lines   = @(
+        'Alerts when a gateway member goes down, and when it is back: a Windows notification, a sound, or a message in Teams or a Power Automate flow. Off until you turn them on - Alerts on the Gateways tab.'
+        'The taskbar button turns yellow while a gateway is degraded, red while one is offline.'
+        'The status bar says what is loading and how far it is, and shows what GatewayLens uses - CPU, memory, workers, calls to Microsoft.'
         'Access lists match the portal. Accounts that are no longer in Microsoft Entra ID are counted apart - tick Show to see or remove them.'
         'A countdown to the next automatic refresh on the Gateways tab.'
-        'From the demo straight to the start page: Sign in to your tenant.'
         'Update credentials the way the portal does: the username stays visible in the Account column and in the portal.'
         'A start page: sign in when you are ready, or try the demo first.'
         'Names everywhere: the Users column and the User filter show people, not object ids.'
-        'A coloured activity log that follows the text size - green done, amber warnings, red failures.'
-        'Panels you can resize by dragging, remembered for next time.'
-        'Kiosk view and help moved to the top bar. Press F1 for help.'
-        'Picking a remembered entry from a search box works again after its text was deleted.'
     )
 }
 
@@ -212,6 +210,17 @@ function ConvertFrom-GLApiError {
     return (@($code, $why) | Where-Object { $_ }) -join ': '
 }
 
+# How many calls this session made, and how many Microsoft throttled - shared by the
+# window and every worker in the process, for the meter in the status bar.
+if (-not [System.AppDomain]::CurrentDomain.GetData('GatewayLens.Stats')) {
+    [System.AppDomain]::CurrentDomain.SetData('GatewayLens.Stats', [hashtable]::Synchronized(@{ Calls = 0; Throttled = 0 }))
+}
+
+function Add-GLStat([string]$Name, [int]$By = 1) {
+    $st = [System.AppDomain]::CurrentDomain.GetData('GatewayLens.Stats')
+    if ($st) { $st[$Name] = [long]$st[$Name] + $By }
+}
+
 function Invoke-GLRequest {
     <#
         One REST call. Retries throttling (429) and server errors (5xx), honouring
@@ -226,6 +235,7 @@ function Invoke-GLRequest {
         $Body,
         [int]$MaxRetry = 4
     )
+    Add-GLStat Calls
     if ([System.AppDomain]::CurrentDomain.GetData('GatewayLens.Demo')) {      # -Demo: answered locally, nothing is sent
         $d = Invoke-GLDemoHttp -Method $Method -Uri $Uri -Body $Body
         if ($d.Status -ge 200 -and $d.Status -lt 300) { return $d.Body }
@@ -247,6 +257,7 @@ function Invoke-GLRequest {
             $resp = $_.Exception.Response
             if ($resp) { try { $code = [int]$resp.StatusCode } catch { } }
 
+            if ($code -eq 429) { Add-GLStat Throttled }
             if (($code -eq 429 -or $code -ge 500) -and $attempt -le $MaxRetry) {
                 $wait = [math]::Min(60, 2 * $attempt)
                 try {
@@ -279,7 +290,8 @@ function Get-GLPaged {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$Token,
-        [int]$MaxPages = 500
+        [int]$MaxPages = 500,
+        [hashtable]$Report       # a job's progress: Done is the count so far
     )
     $all   = [System.Collections.Generic.List[object]]::new()
     $next  = $Uri
@@ -290,6 +302,7 @@ function Get-GLPaged {
         if ($null -ne $r) {
             foreach ($v in $r.value) { if ($null -ne $v) { $all.Add($v) } }
         }
+        if ($Report) { $Report.Done = $all.Count }
         $next = $null
         if ($r -and $r.continuationUri) {
             $next = [string]$r.continuationUri
@@ -321,6 +334,7 @@ function Invoke-GLParallelGet {
         [int]$Batch = 10
     )
     $out    = @{}
+    Add-GLStat Calls -By @($Uris).Count
     if ([System.AppDomain]::CurrentDomain.GetData('GatewayLens.Demo')) {      # -Demo: answered locally, nothing is sent
         for ($i = 0; $i -lt $Uris.Count; $i += $Batch) {
             $slow = $false
@@ -467,15 +481,20 @@ function Get-GLGatewayData {
         [Parameter(Mandatory)][string]$FabricToken,
         [string]$PbiToken,
         [switch]$LiveStatus,
-        [switch]$CheckVnet      # off unless asked: a status check wakes a sleeping VNet gateway
+        [switch]$CheckVnet,     # off unless asked: a status check wakes a sleeping VNet gateway
+        [hashtable]$Report
     )
     $base     = 'https://api.fabric.microsoft.com/v1'
     $log      = [System.Collections.Generic.List[string]]::new()
+    Set-GLReport $Report 'reading the gateways'
     $gateways = Get-GLPaged -Uri "$base/gateways" -Token $FabricToken
 
     $members = @{}
+    $onPrem = @($gateways | Where-Object { [string]$_.type -eq 'OnPremises' })
+    Set-GLReport $Report 'reading the members of each gateway' -Total $onPrem.Count
     foreach ($g in $gateways) {
         if ([string]$g.type -ne 'OnPremises') { continue }   # personal and VNet gateways have no member list
+        if ($Report) { $Report.Done = [int]$Report.Done + 1 }
         try {
             $m = Get-GLPaged -Uri "$base/gateways/$($g.id)/members" -Token $FabricToken
             $members[[string]$g.id] = $m
@@ -485,6 +504,7 @@ function Get-GLGatewayData {
 
     $live = $null
     if ($LiveStatus -and $PbiToken) {
+        Set-GLReport $Report 'asking every member whether it is online'
         $leave = if (-not $CheckVnet) { @($gateways | Where-Object { [string]$_.type -eq 'VirtualNetwork' } | ForEach-Object { [string]$_.id }) } else { @() }
         try { $live = Get-GLLiveStatus -PbiToken $PbiToken -SkipClusterIds $leave }
         catch { $log.Add("Live status is unavailable (unofficial API): $($_.Exception.Message)") }
@@ -495,11 +515,21 @@ function Get-GLGatewayData {
 
 function Get-GLConnectionData {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$FabricToken)
-    $base        = 'https://api.fabric.microsoft.com/v1'
-    $gateways    = Get-GLPaged -Uri "$base/gateways"    -Token $FabricToken
-    $connections = Get-GLPaged -Uri "$base/connections" -Token $FabricToken
+    param([Parameter(Mandatory)][string]$FabricToken, [hashtable]$Report)
+    $base = 'https://api.fabric.microsoft.com/v1'
+    Set-GLReport $Report 'reading the gateways'
+    $gateways = Get-GLPaged -Uri "$base/gateways" -Token $FabricToken
+    Set-GLReport $Report 'reading the connections' -Expect $(if ($Report) { [int]$Report.ExpectConnections } else { 0 })
+    $connections = Get-GLPaged -Uri "$base/connections" -Token $FabricToken -Report $Report
     return @{ Gateways = $gateways; Connections = $connections }
+}
+
+function Set-GLReport {
+    # A job tells the window what it is doing now: a stage, and a total when known
+    # (-Expect: about how many - from the last time).
+    param([hashtable]$Report, [string]$Stage, [int]$Total = 0, [int]$Expect = 0)
+    if (-not $Report) { return }
+    $Report.Stage = $Stage; $Report.Done = 0; $Report.Total = $Total; $Report.Expect = $Expect
 }
 
 function Get-GLRoleAssignments {
@@ -703,6 +733,142 @@ function Format-GLDuration([timespan]$Span) {
     if ($Span.TotalHours -lt 1)   { return "$([int][math]::Floor($Span.TotalMinutes)) min" }
     if ($Span.TotalDays -lt 1)    { return '{0} h {1:00} min' -f [int][math]::Floor($Span.TotalHours), $Span.Minutes }
     return '{0} d {1} h' -f [int][math]::Floor($Span.TotalDays), $Span.Hours
+}
+
+function Get-GLAlertEvents {
+    <#
+        What to tell the user, from one refresh to the next. A member counts as down
+        when it is not online two checks in a row - one slow answer wakes nobody -
+        and as back when it is online again after it was reported down. Members an
+        admin disabled are left out. -OnlyClusterIds: only those clusters were read
+        again; the others keep their count as it was.
+        Returns @{ Track = what to carry to the next refresh; Events = Down and Up }.
+    #>
+    param([hashtable]$Track, [hashtable]$Live, [string[]]$OnlyClusterIds, [int]$Confirm = 2, [datetime]$Now = (Get-Date))
+    $only = @($OnlyClusterIds | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() })
+    $next = @{}
+    if ($Track -and $only.Count) {
+        foreach ($k in $Track.Keys) { if ($only -notcontains [string]$Track[$k].Cluster) { $next[$k] = $Track[$k] } }
+    }
+    $events = [System.Collections.Generic.List[object]]::new()
+    if ($Live) {
+        foreach ($k in $Live.Keys) {
+            $m  = $Live[$k]
+            $cl = ([string]$m.Cluster).ToLowerInvariant()
+            if ($only.Count -and $only -notcontains $cl) { continue }
+            if ($m.Enabled -eq $false) { continue }
+            $prev  = if ($Track -and $Track.ContainsKey($k)) { $Track[$k] } else { $null }
+            $down  = [string]$m.Status -ne 'Live'
+            $count = if ($down) { 1 + [int]$prev.DownChecks } else { 0 }
+            $since = if ($down) { if ($prev -and $prev.Since) { $prev.Since } else { $Now } } else { $null }
+            $told  = [bool]($prev -and $prev.Alerted)
+            if ($down -and -not $told -and $count -ge $Confirm) {
+                $events.Add([pscustomobject]@{ Kind = 'Down'; MemberId = $k; ClusterId = $cl; Machine = [string]$m.Machine; Status = [string]$m.Status; Since = $since; DownFor = $null })
+                $told = $true
+            }
+            elseif (-not $down -and $told) {
+                $was = if ($prev.Since) { $Now - [datetime]$prev.Since } else { [timespan]::Zero }
+                $events.Add([pscustomobject]@{ Kind = 'Up'; MemberId = $k; ClusterId = $cl; Machine = [string]$m.Machine; Status = 'Live'; Since = $prev.Since; DownFor = $was })
+                $told = $false
+            }
+            $next[$k] = [pscustomobject]@{ Cluster = $cl; DownChecks = $count; Alerted = $told; Since = $since }
+        }
+    }
+    return @{ Track = $next; Events = $events.ToArray() }
+}
+
+function Format-GLAlertText {
+    # Alert events as a title and one line each - the same words everywhere they go.
+    param($Events, [hashtable]$Live, [hashtable]$ClusterNames, [hashtable]$MemberNames)
+    $all  = @($Events | Where-Object { $_ })
+    $down = @($all | Where-Object { $_.Kind -eq 'Down' })
+    $up   = @($all | Where-Object { $_.Kind -eq 'Up' })
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($e in @($down) + @($up)) {
+        $who = if ($MemberNames -and $MemberNames[$e.MemberId]) { $MemberNames[$e.MemberId] } elseif ($e.Machine) { $e.Machine } else { $e.MemberId }
+        $cl  = if ($ClusterNames -and $ClusterNames[$e.ClusterId]) { $ClusterNames[$e.ClusterId] } else { $e.ClusterId }
+        $mem = @(if ($Live) { $Live.Values | Where-Object { ([string]$_.Cluster).ToLowerInvariant() -eq $e.ClusterId -and $_.Enabled -ne $false } })
+        $on  = @($mem | Where-Object { [string]$_.Status -eq 'Live' }).Count
+        if ($e.Kind -eq 'Down') {
+            $how = switch ([string]$e.Status) { 'Timeout' { 'does not answer' } 'Error' { 'cannot be reached' } default { "is $(([string]$e.Status).ToLowerInvariant())" } }
+            $since = if ($e.Since) { ' since {0:HH:mm}' -f [datetime]$e.Since } else { '' }
+            $tail = if ($on -eq 0) { 'no member of the cluster is online' } else { "$on of $($mem.Count) members online" }
+            $lines.Add("$who in $cl $how$since - $tail")
+        }
+        else {
+            $lines.Add("$who in $cl is back online, after $(Format-GLDuration ([timespan]$e.DownFor)) - $on of $($mem.Count) members online")
+        }
+    }
+    $title = if ($down.Count -and $up.Count) { "$($down.Count) gateway member(s) down, $($up.Count) back online" }
+             elseif ($down.Count -eq 1) { 'A gateway member is down' }
+             elseif ($down.Count) { "$($down.Count) gateway members are down" }
+             elseif ($up.Count -eq 1) { 'A gateway member is back online' }
+             else { "$($up.Count) gateway members are back online" }
+    return [pscustomobject]@{ Title = $title; Lines = $lines.ToArray(); Severity = $(if ($down.Count) { 'Down' } else { 'Up' }) }
+}
+
+function New-GLAlertCard {
+    # The message for Teams or a flow: an Adaptive Card, the format Teams workflows take.
+    param([string]$Title, [string[]]$Lines, [string]$Severity, [string]$Version)
+    $body = [System.Collections.Generic.List[object]]::new()
+    $body.Add([ordered]@{ type = 'TextBlock'; text = $Title; weight = 'Bolder'; size = 'Medium'; wrap = $true; color = $(if ($Severity -eq 'Down') { 'Attention' } else { 'Good' }) })
+    foreach ($l in @($Lines)) { $body.Add([ordered]@{ type = 'TextBlock'; text = [string]$l; wrap = $true; spacing = 'Small' }) }
+    $body.Add([ordered]@{ type = 'TextBlock'; text = "GatewayLens $Version - $((Get-Date).ToString('yyyy-MM-dd HH:mm'))"; isSubtle = $true; size = 'Small'; wrap = $true; spacing = 'Medium' })
+    return [ordered]@{
+        type        = 'message'
+        attachments = @([ordered]@{
+            contentType = 'application/vnd.microsoft.card.adaptive'
+            contentUrl  = $null
+            content     = [ordered]@{ '$schema' = 'http://adaptivecards.io/schemas/adaptive-card.json'; type = 'AdaptiveCard'; version = '1.4'; body = $body.ToArray() }
+        })
+    }
+}
+
+function Test-GLWebhookUrl {
+    <#
+        '' when GatewayLens may post alerts to this address: https, and a Teams
+        workflow or a Power Automate flow - Microsoft's own - so an alert can go
+        nowhere else. Otherwise, why not, in words for the user.
+    #>
+    param([string]$Url)
+    $v = ([string]$Url).Trim()
+    if (-not $v) { return 'Paste the address of the Teams workflow or the Power Automate flow first.' }
+    $u = $null
+    if (-not [uri]::TryCreate($v, [System.UriKind]::Absolute, [ref]$u)) { return 'That is not a web address.' }
+    if ($u.Scheme -ne 'https') { return 'The address must start with https://.' }
+    $h = $u.Host.ToLowerInvariant()
+    $ok = $h -match '(^|\.)logic\.azure\.com$' -or $h -match '(^|\.)api\.powerplatform\.com$' -or $h -match '(^|\.)powerautomate\.com$'
+    if ($u.UserInfo -or -not $ok) { return 'Only a Teams workflow or a Power Automate flow can receive alerts - its address ends in logic.azure.com or api.powerplatform.com.' }
+    return ''
+}
+
+function Protect-GLText([string]$Text) {
+    # Readable only by this Windows account (DPAPI): the settings file never holds it plain.
+    if (-not $Text) { return '' }
+    return (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString -String $Text -AsPlainText -Force))
+}
+
+function Unprotect-GLText([string]$Protected) {
+    if (-not $Protected) { return '' }
+    try { return [System.Net.NetworkCredential]::new('', (ConvertTo-SecureString -String $Protected)).Password }
+    catch { return '' }      # another account's, or damaged - as if none was set
+}
+
+function Send-GLWebhook {
+    # One alert to a Teams workflow or a Power Automate flow. The address works like a
+    # password - whoever has it can post - so it is never in a message, an error or the log.
+    param([Parameter(Mandatory)][string]$Url, [Parameter(Mandatory)]$Body)
+    $store = [System.AppDomain]::CurrentDomain.GetData('GatewayLens.Demo')
+    if ($store) { $store.WebhookPosts.Add($Body); return }          # the demo sends nothing
+    $json = $Body | ConvertTo-Json -Depth 20 -Compress
+    try {
+        $null = Invoke-RestMethod -Method POST -Uri $Url -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json; charset=utf-8' -TimeoutSec 20 -ErrorAction Stop
+    }
+    catch {
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+        throw $(if ($code) { "the flow answered HTTP $code" } else { 'no answer from the flow' })
+    }
 }
 
 function Update-GLDownSince {
@@ -1082,11 +1248,12 @@ function Get-GLPrincipalNames {
         easy to miss that it still has access. Throws if Graph refuses: callers carry
         on without names.
     #>
-    param([string[]]$Ids, [string]$GraphToken, [hashtable]$Known = @{})
+    param([string[]]$Ids, [string]$GraphToken, [hashtable]$Known = @{}, [hashtable]$Report)
     $out  = @{}
     $want = @($Ids | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Sort-Object -Unique |
               Where-Object { -not $Known.ContainsKey($_) })
     if (-not $GraphToken -or $want.Count -eq 0) { return $out }
+    Set-GLReport $Report 'naming the people with access' -Total $want.Count
     $missing = [System.Collections.Generic.List[string]]::new()
     for ($i = 0; $i -lt $want.Count; $i += 1000) {
         $chunk = @($want[$i..([Math]::Min($i + 1000, $want.Count) - 1)])
@@ -1099,9 +1266,11 @@ function Get-GLPrincipalNames {
             $out[([string]$o.id).ToLowerInvariant()] = [pscustomobject]@{ Name = [string]$o.displayName; Email = [string]$mail; Missing = $false }
         }
         foreach ($id in $chunk) { if (-not $out.ContainsKey($id)) { $missing.Add($id) } }
+        if ($Report) { $Report.Done = [Math]::Min($i + 1000, $want.Count) }
     }
     if ($missing.Count) {
-        $why = Get-GLMissingPrincipals -Ids $missing.ToArray() -GraphToken $GraphToken
+        Set-GLReport $Report 'checking the accounts that are not in Entra ID' -Total $missing.Count
+        $why = Get-GLMissingPrincipals -Ids $missing.ToArray() -GraphToken $GraphToken -Report $Report
         foreach ($id in $missing) { $out[$id] = $why[$id] }
     }
     return $out
@@ -1110,7 +1279,7 @@ function Get-GLPrincipalNames {
 function Get-GLGraphBatch {
     # Graph's $batch: up to 20 GET requests in one call. -Urls are relative to v1.0,
     # like /directoryObjects/{id}. Returns url -> Status, Body.
-    param([string[]]$Urls, [string]$GraphToken)
+    param([string[]]$Urls, [string]$GraphToken, [hashtable]$Report)
     $out = @{}
     $all = @($Urls | Where-Object { $_ })
     for ($i = 0; $i -lt $all.Count; $i += 20) {
@@ -1121,6 +1290,7 @@ function Get-GLGraphBatch {
             if ($null -eq $resp) { continue }
             $out[$chunk[[int]$resp.id]] = [pscustomobject]@{ Status = [int]$resp.status; Body = $resp.body }
         }
+        if ($Report) { $Report.Done = [Math]::Min($i + 20, $all.Count) }
     }
     return $out
 }
@@ -1134,13 +1304,13 @@ function Get-GLMissingPrincipals {
         Unknown - and is never called deleted.
         Returns id -> Name, Email, Missing, State, DeletedOn.
     #>
-    param([string[]]$Ids, [string]$GraphToken)
+    param([string[]]$Ids, [string]$GraphToken, [hashtable]$Report)
     $out = @{}
     $list = @($Ids | Where-Object { $_ })
     foreach ($id in $list) { $out[$id] = [pscustomobject]@{ Name = ''; Email = ''; Missing = $true; State = 'Unknown'; DeletedOn = $null } }
     if ($list.Count -eq 0 -or -not $GraphToken) { return $out }
     $bin = @{}
-    try { $bin = Get-GLGraphBatch -Urls @($list | ForEach-Object { "/directory/deletedItems/$_" }) -GraphToken $GraphToken } catch { return $out }
+    try { $bin = Get-GLGraphBatch -Urls @($list | ForEach-Object { "/directory/deletedItems/$_" }) -GraphToken $GraphToken -Report $Report } catch { return $out }
     $ask = [System.Collections.Generic.List[string]]::new()
     foreach ($id in $list) {
         $r = $bin["/directory/deletedItems/$id"]
@@ -1667,7 +1837,10 @@ function Set-GLConnectionCredentialPortal {
         [Parameter(Mandatory)][string]$PbiToken,
         [string]$Method = (Get-GLPortalCredentialMethod)
     )
-    $ds = Invoke-GLRequest -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources/$ConnectionId" -Token $PbiToken -MaxRetry 2
+    # Only reading so far: whatever this answers, nothing was changed - the documented
+    # way may be tried, and gives its own answer.
+    try { $ds = Invoke-GLRequest -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources/$ConnectionId" -Token $PbiToken -MaxRetry 2 }
+    catch { throw "PORTAL-NOT-USABLE: $($_.Exception.Message)" }
     $keys = $ds.memberGatewayPublicKeys
     $members = @(if ($keys) { $keys.PSObject.Properties | Where-Object { $_.Value } })
     if ($members.Count -eq 0) { throw 'PORTAL-NOT-USABLE: the data source lists no gateway member keys.' }
@@ -1793,7 +1966,8 @@ function Get-GLDatasourceDirectory {
             Users     - list of @{ Principal; Right }
             ClusterId - the gateway it is on, lower case
     #>
-    param([Parameter(Mandatory)][string]$PbiToken, [int]$MaxPages = 200)
+    param([Parameter(Mandatory)][string]$PbiToken, [int]$MaxPages = 200, [hashtable]$Report)
+    Set-GLReport $Report 'reading usernames and access'
     $next  = 'https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources?$expand=users'
     $out   = @{}
     $pages = 0
@@ -1818,6 +1992,7 @@ function Get-GLDatasourceDirectory {
             }
             $out[([string]$ds.id).ToLowerInvariant()] = [pscustomobject]@{ Account = $stored; Users = @($users); ClusterId = ([string]$ds.clusterId).ToLowerInvariant() }
         }
+        if ($Report) { $Report.Done = $out.Count }
         $next = $null
         $nl = $r.PSObject.Properties['@odata.nextLink']
         if ($nl -and $nl.Value) { $next = [string]$nl.Value }
@@ -2468,7 +2643,11 @@ function New-GLDefaultSettings {
     # Layout: the panel sizes the user dragged to. SeenVersion: the last version whose
     # news was shown. LastAccount: who signed in last, offered on the start page.
     # ShowGone: list accounts that are not in Entra ID in the access panels too.
-    return [ordered]@{ Theme = 'Light'; FontSize = 12; History = [ordered]@{}; Layout = [ordered]@{}; SeenVersion = ''; LastAccount = ''; ShowGone = $false }
+    # Alerts: when a gateway member goes down - each way off until turned on. The
+    # webhook address is kept encrypted for this Windows account.
+    # LastConnectionCount: how many the last load found - "about how many" in the progress.
+    return [ordered]@{ Theme = 'Light'; FontSize = 12; History = [ordered]@{}; Layout = [ordered]@{}; SeenVersion = ''; LastAccount = ''; ShowGone = $false
+                       Alerts = [ordered]@{ Desktop = $false; Sound = $false; WebhookProtected = '' }; LastConnectionCount = 0 }
 }
 
 function Read-GLSettings {
@@ -2482,6 +2661,12 @@ function Read-GLSettings {
         if ($j.FontSize) { $s.FontSize = [Math]::Max(9, [Math]::Min(20, [int]$j.FontSize)) }
         if ($j.SeenVersion) { $s.SeenVersion = [string]$j.SeenVersion }
         if ($j.ShowGone -is [bool]) { $s.ShowGone = $j.ShowGone }
+        try { $s.LastConnectionCount = [Math]::Max(0, [Math]::Min(1000000, [int]$j.LastConnectionCount)) } catch { }
+        if ($j.Alerts) {
+            $s.Alerts.Desktop = ($j.Alerts.Desktop -eq $true)
+            $s.Alerts.Sound   = ($j.Alerts.Sound -eq $true)
+            if ([string]$j.Alerts.WebhookProtected -match '^[0-9a-fA-F]+$') { $s.Alerts.WebhookProtected = [string]$j.Alerts.WebhookProtected }
+        }
         if ($j.LastAccount -and [string]$j.LastAccount -match '^[^\s@]+@[^\s@]+$') { $s.LastAccount = [string]$j.LastAccount }
         if ($j.Layout) {
             foreach ($p in $j.Layout.PSObject.Properties) {
@@ -2889,6 +3074,7 @@ function New-GLDemoStore {
     )
     $s.Connections = [System.Collections.Generic.List[object]]::new()
     $s.Accounts    = @{}
+    $s.WebhookPosts = [System.Collections.Generic.List[object]]::new()   # alerts the demo "sent" - nothing leaves
     $iso = { param($d) if ($d) { $d.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null } }
     $now = (Get-Date).Date.AddHours(8)
     $n   = 0
@@ -3284,7 +3470,7 @@ function Disable-GLDemo { [System.AppDomain]::CurrentDomain.SetData('GatewayLens
 # Everything a background worker needs. The UI thread hands each worker its own
 # copy of these through the runspace pool's initial session state.
 $script:WorkerFunctions = @(
-    'Test-GLGuid', 'ConvertFrom-GLApiError', 'Invoke-GLRequest', 'Get-GLPaged',
+    'Test-GLGuid', 'ConvertFrom-GLApiError', 'Invoke-GLRequest', 'Get-GLPaged', 'Add-GLStat',
     'Invoke-GLParallelGet', 'Get-GLLiveStatus', 'Get-GLGatewayData', 'Get-GLConnectionData', 'Get-GLRoleAssignments',
     'New-GLRoleAssignmentBody', 'Add-GLRoleAssignment', 'Remove-GLRoleAssignment', 'Set-GLRoleAssignment',
     'Test-GLPrincipalMatch', 'Get-GLHandoverStep', 'Resolve-GLHandoverFrom', 'Invoke-GLAccessHandover',
@@ -3294,9 +3480,10 @@ $script:WorkerFunctions = @(
     'ConvertTo-GLCredentialJson', 'ConvertTo-GLEncryptedCredential', 'New-GLCredentialDetails',
     'Set-GLConnectionCredential', 'Invoke-GLBulkMembers', 'Set-GLConnectionCredentialPortal', 'Get-GLPortalCredentialMethod',
     'ConvertFrom-GLRsaXmlKey', 'Test-GLPortalWayRefused', 'Get-GLGraphBatch', 'Get-GLMissingPrincipals', 'Get-GLMissingText',
+    'Send-GLWebhook',
     'Remove-GLConnection', 'Set-GLMemberEnabled', 'Test-GLConnectionsBulk', 'Get-GLRoleAssignmentsBulk',
     'Get-GLDatasourceDirectory', 'Resolve-GLHostAddress', 'ConvertTo-GLConnectionRows', 'ConvertTo-GLLocalTime',
-    'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'Get-GLDirectoryPrincipalIds', 'ConvertTo-GLPeopleLabels', 'Set-GLRowPeople',
+    'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'Get-GLDirectoryPrincipalIds', 'ConvertTo-GLPeopleLabels', 'Set-GLRowPeople', 'Set-GLReport',
     'Get-GLPrincipalLabel', 'Test-GLGuid', 'ConvertFrom-GLDownloadPage', 'ConvertFrom-GLReleasePage', 'Get-GLGatewayReleases', 'Split-GLList', 'ConvertTo-GLEncryptionSetting',
     'New-GLResult', 'Invoke-GLBulkGrant', 'Invoke-GLBulkRevoke', 'Invoke-GLBulkCredentials',
     'Backup-GLConnections', 'Invoke-GLBulkDelete',
@@ -3868,13 +4055,33 @@ function Invoke-GLSelfTest {
             # an authorisation or not-found error means the call itself is unusable
             $usable = $t.Ok -or ($t.Message -notmatch 'HTTP (401|403|404)')
             Add-Result 'Power BI: test connection' $usable "'$($gc.displayName)': $($t.Message)"
-            # read-only: what updating credentials like the portal needs - a key per member
-            try {
-                $pds  = Invoke-GLRequest -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources/$($gc.id)" -Token $pbi -MaxRetry 1
-                $mkey = @(if ($pds.memberGatewayPublicKeys) { $pds.memberGatewayPublicKeys.PSObject.Properties | Where-Object { $_.Value } })
-                if ($mkey.Count) { $null = ConvertFrom-GLRsaXmlKey -Base64Xml ([string]$mkey[0].Value) }
-                Add-Result 'Power BI v2: credentials like the portal (unofficial)' ($mkey.Count -gt 0) $(if ($mkey.Count) { "$($mkey.Count) member key(s) on '$($gc.displayName)' - the username stays visible after an update" } else { 'no member keys - updates use the documented way, and the Account can be empty afterwards' })
-            } catch { Add-Result 'Power BI v2: credentials like the portal (unofficial)' $false "$($_.Exception.Message) - updates use the documented way" }
+            # Read-only: what updating credentials like the portal needs - a key per
+            # member. Only someone who may manage a connection gets them, so connections
+            # on a gateway this account administers come first.
+            $check = 'Power BI v2: credentials like the portal (unofficial)'
+            $gwOnly = @($connections | Where-Object { $_.connectivityType -eq 'OnPremisesGateway' -and $_.gatewayId })
+            $cands  = @(@($gwOnly | Where-Object { $onprem -and $_.gatewayId -eq $onprem.id }) + $gwOnly | Where-Object { $_ } | Group-Object id | ForEach-Object { $_.Group[0] } | Select-Object -First 8)
+            $found = $false; $denied = 0; $other = ''
+            foreach ($cand in $cands) {
+                try {
+                    $pds  = Invoke-GLRequest -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources/$($cand.id)" -Token $pbi -MaxRetry 1
+                    $mkey = @(if ($pds.memberGatewayPublicKeys) { $pds.memberGatewayPublicKeys.PSObject.Properties | Where-Object { $_.Value } })
+                    if ($mkey.Count) {
+                        $null = ConvertFrom-GLRsaXmlKey -Base64Xml ([string]$mkey[0].Value)
+                        Add-Result $check $true "$($mkey.Count) member key(s) on '$($cand.displayName)' - the username stays visible after an update"
+                        $found = $true; break
+                    }
+                }
+                catch {
+                    if ($_.Exception.Message -match 'NotEnoughPermission|HTTP 40[13]') { $denied++; continue }
+                    $other = $_.Exception.Message; break
+                }
+            }
+            if (-not $found) {
+                if ($other) { Add-Result $check $false "$other - updates use the documented way" }
+                elseif ($denied) { Add-Result $check $true "the endpoint answers, but none of the $denied connection(s) tried is yours to manage - credentials need Owner, or Admin on the gateway, either way" }
+                else { Add-Result $check $false 'no member keys - updates use the documented way, and the Account can be empty afterwards' }
+            }
         }
     }
 
@@ -4048,6 +4255,12 @@ $script:MainXaml = @'
                       ToolTip="Checking a VNet gateway's status starts it if it has gone to sleep, and it then uses capacity until it sleeps again. Leave this on unless you want them woken."/>
             <TextBlock Text="Auto-refresh" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="CmbAutoRefresh" Width="80" MinHeight="26"/>
+            <Button Name="BtnAlerts" Margin="10,0,6,0" ToolTip="Be told when a gateway member goes down, and when it is back - a Windows notification, a sound, or a message in Teams. Off until you turn it on.">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="&#xE7ED;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="14" VerticalAlignment="Center" Margin="0,1,7,0"/>
+                <TextBlock Name="TxtAlerts" Text="Alerts" VerticalAlignment="Center"/>
+              </StackPanel>
+            </Button>
             <TextBlock Text="Filter" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="TxtGwFilter" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Width="180" MinHeight="26" VerticalContentAlignment="Center"/>
             <Button Name="BtnGwCopyAll" Content="Copy all" Margin="12,0,6,0"
@@ -4423,6 +4636,12 @@ $script:MainXaml = @'
 
     <Border Grid.Row="4" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Border}" BorderThickness="0,1,0,0" Padding="14,5" Margin="0,8,0,0">
       <DockPanel>
+        <StackPanel Name="MeterPanel" DockPanel.Dock="Right" Orientation="Horizontal" Margin="18,0,0,0">
+          <TextBlock Name="TxtMeter" Foreground="{DynamicResource InkFaint}" VerticalAlignment="Center"
+                     ToolTip="GatewayLens itself: its share of the CPU, the memory it uses, its background workers and threads - and the calls it made to Microsoft this session, with how many Microsoft slowed down (throttled)."/>
+          <Button Name="BtnErrors" Visibility="Collapsed" Margin="10,0,0,0" MinHeight="22" Padding="10,1" Style="{DynamicResource DangerButton}"
+                  ToolTip="Show only the errors in the activity log"/>
+        </StackPanel>
         <Button Name="BtnCancel" DockPanel.Dock="Right" Content="Cancel" Visibility="Collapsed" Margin="10,0,0,0" MinHeight="22" Padding="10,1"/>
         <ProgressBar Name="Busy" DockPanel.Dock="Right" Width="180" Height="8" Visibility="Collapsed"/>
         <TextBlock Name="TxtStatus" Text="Ready" Foreground="{DynamicResource InkMuted}" VerticalAlignment="Center"/>
@@ -4475,6 +4694,36 @@ $script:StartXaml = @'
       </StackPanel>
       <TextBlock Name="StartVersion" Foreground="{DynamicResource InkFaint}" VerticalAlignment="Center"/>
     </DockPanel>
+  </StackPanel>
+</Window>
+'@
+
+$script:AlertsXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Alerts" Width="600" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" Background="{DynamicResource WindowBg}"
+        FontFamily="Segoe UI" FontSize="12" Foreground="{DynamicResource Ink}">
+  <StackPanel Margin="22,18,22,16">
+    <TextBlock Text="Tell me when a gateway member goes down" FontSize="17" FontWeight="SemiBold"/>
+    <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource InkMuted}" Margin="0,6,0,14"
+               Text="A member counts as down when it is not online two checks in a row - one slow answer wakes nobody - and you hear when it is back. Alerts come while GatewayLens is open with auto-refresh on: on a wall screen in kiosk view, or on your own PC. Whatever you choose, the taskbar button turns yellow while a gateway is degraded and red while one is offline."/>
+    <CheckBox Name="AlDesktop" Content="Show a Windows notification" Margin="0,3"/>
+    <CheckBox Name="AlSound" Content="Play a sound" Margin="0,3"/>
+    <CheckBox Name="AlWebhook" Content="Post to a Teams channel, or start a Power Automate flow" Margin="0,3"/>
+    <TextBox Name="AlUrl" MinHeight="28" Margin="24,6,0,0" VerticalContentAlignment="Center" Padding="4,0"
+             ToolTip="The address of a Teams workflow or a Power Automate flow - it ends in logic.azure.com or api.powerplatform.com."/>
+    <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource InkFaint}" Margin="24,6,0,0"
+               Text="In Teams: on the channel, ... > Workflows > Post to a channel when a webhook request is received, and copy the address it gives you. A Power Automate flow started the same way can also send an email or open a ticket. The address is kept encrypted for your Windows account, and nothing else is sent anywhere."/>
+    <StackPanel Orientation="Horizontal" Margin="24,8,0,0">
+      <Button Name="AlTest" Content="Send a test"/>
+      <TextBlock Name="AlTestResult" VerticalAlignment="Center" Foreground="{DynamicResource InkMuted}" TextWrapping="Wrap" Margin="6,0,0,0"/>
+    </StackPanel>
+    <TextBlock Name="AlError" Visibility="Collapsed" TextWrapping="Wrap" Foreground="{DynamicResource Danger}" Margin="0,12,0,0"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+      <Button Name="AlCancel" Content="Cancel" IsCancel="True" MinWidth="80"/>
+      <Button Name="AlOk" Content="Save" Style="{DynamicResource PrimaryButton}" IsDefault="True" MinWidth="80" Margin="0"/>
+    </StackPanel>
   </StackPanel>
 </Window>
 '@
@@ -5210,6 +5459,7 @@ function New-GLState {
         Populating   = $false
         LastRefresh  = $null
         AccessRows   = @{ gateways = @(); connections = @() }   # what the access panels hold, before the Entra filter
+        AlertTrack   = @{}                                      # member id -> checks down in a row, told or not
     }
 }
 $script:State = New-GLState
@@ -5297,6 +5547,7 @@ function Write-GLLog {
     if ($script:UI.LstLog) {
         $entry = [pscustomobject]@{ Level = $Level; Line = $line; Time = $now.ToString('HH:mm:ss'); Text = "$tag$Text" }
         $script:LogEntries.Add($entry)
+        if ($Level -eq 'Error') { $script:ErrorCount = [int]$script:ErrorCount + 1 }
         if ($script:LogEntries.Count -gt 5000) { $script:LogEntries.RemoveRange(0, 1000); Update-GLLogView; return }
         # not "if ($script:LogView": an empty collection counts as false, and the first line would never show
         if ($null -ne $script:LogView -and (Test-GLLogVisible $entry)) {
@@ -5540,6 +5791,197 @@ function Invoke-GLStartPage {
     return $result
 }
 
+function Update-GLTaskbarState {
+    <#
+        The taskbar button says it without a sound: yellow while a gateway is
+        degraded, red while one is offline - seen with the window minimised or behind
+        others. The title says the same, for Alt+Tab.
+    #>
+    $w = $script:Window
+    if (-not $w) { return }
+    $st   = @($script:State.GatewayState.Values)
+    $off  = @($st | Where-Object { $_ -eq 'Offline' }).Count
+    $part = @($st | Where-Object { $_ -eq 'Partial' }).Count
+    $bits = @()
+    if ($off)  { $bits += "$off offline" }
+    if ($part) { $bits += "$part degraded" }
+    try {
+        if (-not $w.TaskbarItemInfo) { $w.TaskbarItemInfo = [System.Windows.Shell.TaskbarItemInfo]::new() }
+        $tb = $w.TaskbarItemInfo
+        if ($off) { $tb.ProgressState = 'Error'; $tb.ProgressValue = 1 }
+        elseif ($part) { $tb.ProgressState = 'Paused'; $tb.ProgressValue = 1 }
+        else { $tb.ProgressState = 'None' }
+        $tb.Description = if ($bits) { "Gateways: $($bits -join ', ')" } else { 'Gateways: all online' }
+        if ($script:BaseTitle) { $w.Title = if ($bits) { "($($bits -join ', ')) $($script:BaseTitle)" } else { $script:BaseTitle } }
+    } catch { }
+}
+
+function Invoke-GLAlerts {
+    <#
+        After each gateway refresh: who went down, who is back. The taskbar always;
+        then the alerts the user turned on. -OnlyClusterIds: only those were read
+        again. An alert that fails to go out is logged - never stops a refresh.
+    #>
+    param([string[]]$OnlyClusterIds)
+    try {
+        $res = Get-GLAlertEvents -Track $script:State.AlertTrack -Live $script:State.Live -OnlyClusterIds $OnlyClusterIds
+        $script:State.AlertTrack = $res.Track
+        Update-GLTaskbarState
+        $ev = @($res.Events)
+        if ($ev.Count -eq 0) { return }
+        $names = @{}
+        foreach ($r in @($script:State.GatewayRows)) { if ($r) { $names[([string]$r.Id).ToLowerInvariant()] = [string]$r.Name } }
+        $who = @{}
+        foreach ($k in @($script:State.Members.Keys)) { foreach ($m in @($script:State.Members[$k])) { if ($m) { $who[([string]$m.id).ToLowerInvariant()] = [string]$m.displayName } } }
+        $msg = Format-GLAlertText -Events $ev -Live $script:State.Live -ClusterNames $names -MemberNames $who
+        foreach ($l in $msg.Lines) { Write-GLLog "Alert: $l" $(if ($msg.Severity -eq 'Down') { 'Warn' } else { 'Ok' }) }
+        $a = $script:Settings.Alerts
+        if ($a.Desktop) { Show-GLDesktopAlert -Title $msg.Title -Text ($msg.Lines -join [Environment]::NewLine) -Severity $msg.Severity }
+        if ($a.Sound) { Invoke-GLAlertSound -Severity $msg.Severity }
+        $url = Unprotect-GLText $a.WebhookProtected
+        if ($url) { Send-GLAlertWebhook -Url $url -Card (New-GLAlertCard -Title $msg.Title -Lines $msg.Lines -Severity $msg.Severity -Version $script:AppVersion) }
+    }
+    catch { Write-GLLog "Alerts: $($_.Exception.Message)" 'Warn' }
+}
+
+function Send-GLAlertWebhook {
+    # In the background: a flow that is slow to answer must not hold up the window.
+    param([string]$Url, $Card)
+    Start-GLJob -Quiet -Name 'Sending the alert' -Arguments @{ U = $Url; B = $Card } -Work {
+        param($U, $B)
+        Send-GLWebhook -Url $U -Body $B
+        'sent'
+    } -OnDone {
+        param($r, $err, $ctx)
+        if (-not $err) { Write-GLLog 'Alert posted to Teams / Power Automate.' 'Ok' }
+    }
+}
+
+function Show-GLDesktopAlert {
+    # A Windows notification, from an icon in the notification area while alerts are on.
+    param([string]$Title, [string]$Text, [string]$Severity)
+    try {
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        if (-not $script:TrayIcon) {
+            $ni  = [System.Windows.Forms.NotifyIcon]::new()
+            $bmp = [System.Drawing.Bitmap]::new([System.IO.MemoryStream]::new([byte[]][Convert]::FromBase64String($script:IconPng)))
+            $ni.Icon    = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+            $ni.Text    = $script:AppName
+            $ni.Visible = $true
+            $ni.Add_BalloonTipClicked({ try { $script:Window.Activate() } catch { } })
+            $ni.Add_Click({ try { $script:Window.Activate() } catch { } })
+            $script:TrayIcon = $ni
+        }
+        $t = if ($Title.Length -gt 60) { $Title.Substring(0, 60) } else { $Title }
+        $x = if ($Text.Length -gt 250) { $Text.Substring(0, 247) + '...' } else { $Text }
+        $kind = if ($Severity -eq 'Down') { [System.Windows.Forms.ToolTipIcon]::Warning } else { [System.Windows.Forms.ToolTipIcon]::Info }
+        $script:TrayIcon.ShowBalloonTip(10000, $t, $x, $kind)
+    }
+    catch { Write-GLLog "The Windows notification could not be shown: $($_.Exception.Message)" 'Warn' }
+}
+
+function Remove-GLTrayIcon {
+    # Gone with the window - or Windows shows a dead icon until the mouse passes over it.
+    try { if ($script:TrayIcon) { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() } } catch { }
+    $script:TrayIcon = $null
+}
+
+function Invoke-GLAlertSound {
+    # One of Windows' own sounds: a warning when a member is down, a lighter one when back.
+    param([string]$Severity)
+    $want = if ($Severity -eq 'Down') { 'Windows Critical Stop.wav', 'Windows Exclamation.wav' } else { 'Windows Notify System Generic.wav', 'chimes.wav' }
+    foreach ($f in $want) {
+        $path = Join-Path $env:WINDIR "Media\$f"
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            $player = [System.Windows.Media.MediaPlayer]::new()
+            $player.Open([uri]$path)
+            $player.Play()
+            $script:AlertPlayer = $player      # kept, or it can be collected mid-sound
+        } catch { }
+        return
+    }
+}
+
+function Update-GLAlertsButton {
+    $a = $script:Settings.Alerts
+    $on = @()
+    if ($a.Desktop) { $on += 'notification' }
+    if ($a.Sound) { $on += 'sound' }
+    if ($a.WebhookProtected) { $on += 'Teams' }
+    if ($script:UI.TxtAlerts) { $script:UI.TxtAlerts.Text = if ($on) { "Alerts: $($on -join ', ')" } else { 'Alerts' } }
+}
+
+function Show-GLAlertsDialog {
+    # -NoShow: built and handed back, not shown - for the smoke test.
+    param([switch]$NoShow)
+    [xml]$x = $script:AlertsXaml
+    $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($x))
+    if ($script:Window) { $dlg.Owner = $script:Window }
+    Initialize-GLDialog -Dialog $dlg
+    $c = @{}
+    foreach ($n in 'AlDesktop', 'AlSound', 'AlWebhook', 'AlUrl', 'AlTest', 'AlTestResult', 'AlError', 'AlOk', 'AlCancel') { $c[$n] = $dlg.FindName($n) }
+    $a = $script:Settings.Alerts
+    $url = Unprotect-GLText $a.WebhookProtected
+    $c.AlDesktop.IsChecked = [bool]$a.Desktop
+    $c.AlSound.IsChecked   = [bool]$a.Sound
+    $c.AlWebhook.IsChecked = [bool]$url
+    $c.AlUrl.Text          = $url
+    $script:AlertDlg = @{ Dialog = $dlg; C = $c }
+    $c.AlTest.Add_Click({ Send-GLTestAlert })
+    $c.AlOk.Add_Click({ Save-GLAlertsDialog })
+    $c.AlCancel.Add_Click({ $script:AlertDlg.Dialog.Close() })
+    if ($NoShow) { return $dlg }
+    $null = $dlg.ShowDialog()
+    $script:AlertDlg = $null
+}
+
+function Send-GLTestAlert {
+    $c = $script:AlertDlg.C
+    $url = ([string]$c.AlUrl.Text).Trim()
+    $why = Test-GLWebhookUrl $url
+    if ($why) { $c.AlTestResult.Text = $why; return }
+    $c.AlTestResult.Text = 'Sending...'
+    $card = New-GLAlertCard -Title 'GatewayLens test alert' -Lines @('Alerts from GatewayLens reach this channel or flow.', "Sent by $($script:SignedInAs).") -Severity 'Up' -Version $script:AppVersion
+    Start-GLJob -Quiet -Name 'Sending a test alert' -Arguments @{ U = $url; B = $card } -Work {
+        param($U, $B)
+        Send-GLWebhook -Url $U -Body $B
+        'sent'
+    } -OnDone {
+        param($r, $err, $ctx)
+        $text = if ($err) { "Not sent - $err." } else { 'Sent. Look in the channel, or in the flow''s run history.' }
+        if ($script:AlertDlg) { $script:AlertDlg.C.AlTestResult.Text = $text }
+        if (-not $err) { Write-GLLog 'Test alert sent.' 'Ok' }
+    }
+}
+
+function Save-GLAlertsDialog {
+    $c = $script:AlertDlg.C
+    $url  = ([string]$c.AlUrl.Text).Trim()
+    $hook = [bool]$c.AlWebhook.IsChecked
+    if ($hook) {
+        $why = Test-GLWebhookUrl $url
+        if ($why) { $c.AlError.Text = $why; $c.AlError.Visibility = 'Visible'; return }
+    }
+    $script:Settings.Alerts = [ordered]@{ Desktop = [bool]$c.AlDesktop.IsChecked; Sound = [bool]$c.AlSound.IsChecked; WebhookProtected = $(if ($hook) { Protect-GLText $url } else { '' }) }
+    $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath
+    $on = @()
+    if ($c.AlDesktop.IsChecked) { $on += 'Windows notification' }
+    if ($c.AlSound.IsChecked) { $on += 'sound' }
+    if ($hook) { $on += 'Teams / Power Automate' }
+    if ($on) {
+        Write-GLLog "Alerts on: $($on -join ', '). A member counts as down after two checks in a row."
+        if ([string]$script:UI.CmbAutoRefresh.SelectedItem -eq 'Off') {
+            $script:UI.CmbAutoRefresh.SelectedItem = '5 min'
+            Write-GLLog 'Auto-refresh is now every 5 minutes - alerts come with each refresh.'
+        }
+        if (-not $script:UI.ChkLive.IsChecked) { Write-GLLog 'Alerts need Live member status, which is off - tick it, or nothing can be reported.' 'Warn' }
+    }
+    else { Write-GLLog 'Alerts are off.'; Remove-GLTrayIcon }
+    Update-GLAlertsButton
+    $script:AlertDlg.Dialog.Close()
+}
+
 function Show-GLInfo {
     # A small window: a title, a few lines, and buttons that open web pages.
     param([string]$Title, [string]$Subtitle, [string[]]$Lines, $Links)
@@ -5769,8 +6211,15 @@ function Start-GLJob {
         [hashtable]$Context = @{},
         [scriptblock]$OnDone,
         [switch]$Bulk,
-        [switch]$Quiet
+        [switch]$Quiet,
+        [switch]$Report,       # the Work block gets $Report - a stage and counts the status bar shows
+        [int]$ExpectConnections = 0
     )
+    $rep = $null
+    if ($Report) {
+        $rep = [hashtable]::Synchronized(@{ Stage = ''; Done = 0; Total = 0; Expect = 0; ExpectConnections = $ExpectConnections })
+        $Arguments['Report'] = $rep
+    }
     if ($Bulk) {
         if ($script:Progress.Active) {
             Write-GLLog "Wait for '$($script:Progress.Name)' to finish, or cancel it first." 'Warn'
@@ -5790,7 +6239,7 @@ function Start-GLJob {
     foreach ($k in $Arguments.Keys) { [void]$ps.AddParameter($k, $Arguments[$k]) }
     $script:Jobs.Add([pscustomobject]@{
         Name = $Name; PS = $ps; Handle = $ps.BeginInvoke(); OnDone = $OnDone
-        Context = $Context; Started = Get-Date; Bulk = [bool]$Bulk; Quiet = [bool]$Quiet
+        Context = $Context; Started = Get-Date; Bulk = [bool]$Bulk; Quiet = [bool]$Quiet; Report = $rep
     })
     if (-not $Quiet) { Write-GLLog "$Name..." }
     Update-GLBusy
@@ -5867,7 +6316,8 @@ function Reset-GLSession {
         Back to the start page: the window has closed, and the next one - in the demo
         or signed in, maybe as someone else - starts with nothing from this one.
     #>
-    foreach ($tm in $script:AutoTimer, $script:ClockTimer, $script:Timer) { try { if ($tm) { $tm.Stop() } } catch { } }
+    foreach ($tm in $script:AutoTimer, $script:ClockTimer, $script:Timer, $script:MeterTimer) { try { if ($tm) { $tm.Stop() } } catch { } }
+    $script:MeterTimer = $null; $script:MeterLast = $null; $script:ErrorCount = 0
     foreach ($tm in @($script:Debounce.Values)) { try { if ($tm) { $tm.Stop() } } catch { } }
     # a smoke test still judges what went wrong before
     foreach ($e in @($script:LogEntries | Where-Object { $_.Level -eq 'Error' })) { $script:EarlierErrors.Add($e) }
@@ -5877,12 +6327,76 @@ function Reset-GLSession {
     $script:LogEntries.Clear()
     $script:LogView = $null; $script:LogScroller = $null
     $script:Debounce = $null; $script:AutoTimer = $null; $script:ClockTimer = $null; $script:NextAutoRefresh = $null
-    $script:TileItemStyle = $null; $script:KioskSaved = $null
+    $script:TileItemStyle = $null; $script:KioskSaved = $null; $script:BaseTitle = $null; $script:AlertDlg = $null
+    Remove-GLTrayIcon
     foreach ($k in 'Active', 'Cancel') { $script:Progress[$k] = $false }
     $script:Progress.Total = 0; $script:Progress.Done = 0; $script:Progress.Name = ''
     $script:Jobs = [System.Collections.Generic.List[object]]::new()
     $script:Auth = $null; $script:SignedInAs = ''; $script:AuthMode = ''; $script:TenantShown = ''
     $script:LogReady = $false
+}
+
+function Get-GLWorkStatus {
+    <#
+        The status bar for the jobs running now, from what each one reports: its
+        stage, and how far - "1,500 of 3,200", "about 3,235" from the last time, or
+        "so far". Returns Text, and Max / Value for the bar (Max 0: no total known).
+    #>
+    param($Jobs)
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $max = 0; $val = 0
+    foreach ($j in @($Jobs | Where-Object { $_ })) {
+        $r = $j.Report
+        if (-not ($r -and $r.Stage)) { $parts.Add([string]$j.Name); continue }
+        $txt = "$($j.Name): $($r.Stage)"
+        $done = [int]$r.Done
+        if ([int]$r.Total -gt 0) {
+            $txt += ' - {0:N0} of {1:N0}' -f $done, [int]$r.Total
+            if (-not $max) { $max = [int]$r.Total; $val = [Math]::Min($done, $max) }
+        }
+        elseif ([int]$r.Expect -gt 0) {
+            $txt += $(if ($done) { ' - {0:N0} of about {1:N0}' -f $done, [int]$r.Expect } else { ' - about {0:N0}' -f [int]$r.Expect })
+            if (-not $max) { $max = [int]$r.Expect; $val = [Math]::Min($done, [int]($max * 0.99)) }
+        }
+        elseif ($done) { $txt += ' - {0:N0} so far' -f $done }
+        $parts.Add($txt)
+    }
+    return [pscustomobject]@{ Text = ($parts -join '   |   '); Max = $max; Value = $val }
+}
+
+function Get-GLMeterText {
+    # The meter at the bottom right: this process, its workers, and the calls to Microsoft.
+    param([double]$Cpu, [long]$MemoryBytes, [int]$Busy, [int]$Workers, [int]$Threads, [long]$Calls, [long]$Throttled)
+    $parts = @(
+        ('CPU {0:0}%' -f [Math]::Max(0, [Math]::Min(100, $Cpu)))
+        ('Memory {0:N0} MB' -f ($MemoryBytes / 1MB))
+        "Workers $([Math]::Min($Busy, $Workers)) of $Workers busy$(if ($Busy -gt $Workers) { ", $($Busy - $Workers) waiting" })"
+        "Threads $Threads"
+        ('API calls {0:N0}' -f $Calls)
+    )
+    if ($Throttled) { $parts += ('throttled {0:N0}' -f $Throttled) }
+    return ($parts -join '    ')
+}
+
+function Update-GLMeter {
+    if (-not $script:UI.TxtMeter) { return }
+    try {
+        $p   = [System.Diagnostics.Process]::GetCurrentProcess()
+        $now = [datetime]::UtcNow
+        $cpuTime = $p.TotalProcessorTime
+        $cpu = 0.0
+        if ($script:MeterLast) {
+            $wall = ($now - $script:MeterLast.At).TotalMilliseconds
+            if ($wall -gt 0) { $cpu = 100 * ($cpuTime - $script:MeterLast.Cpu).TotalMilliseconds / ($wall * [Environment]::ProcessorCount) }
+        }
+        $script:MeterLast = @{ At = $now; Cpu = $cpuTime }
+        $st = [System.AppDomain]::CurrentDomain.GetData('GatewayLens.Stats')
+        $script:UI.TxtMeter.Text = Get-GLMeterText -Cpu $cpu -MemoryBytes $p.WorkingSet64 -Busy @($script:Jobs).Count -Workers 4 -Threads $p.Threads.Count `
+            -Calls ([long]$st.Calls) -Throttled ([long]$st.Throttled)
+        $n = [int]$script:ErrorCount
+        $script:UI.BtnErrors.Visibility = $(if ($n) { 'Visible' } else { 'Collapsed' })
+        $script:UI.BtnErrors.Content = "$n error$(if ($n -ne 1) { 's' })"
+    } catch { }
 }
 
 function Update-GLBusy {
@@ -5902,10 +6416,19 @@ function Update-GLBusy {
         $script:UI.TxtStatus.Text = "$($p.Name): $($p.Done) of $($p.Total)$tail"
     }
     elseif ($n) {
+        $ws = Get-GLWorkStatus -Jobs $script:Jobs
         $script:UI.Busy.Visibility      = 'Visible'
-        $script:UI.Busy.IsIndeterminate = $true
         $script:UI.BtnCancel.Visibility = 'Collapsed'
-        $script:UI.TxtStatus.Text       = 'Working: ' + (($script:Jobs | ForEach-Object Name) -join ', ')
+        if ($ws.Max -gt 0) {
+            $script:UI.Busy.IsIndeterminate = $false
+            $script:UI.Busy.Maximum = $ws.Max
+            $script:UI.Busy.Value   = $ws.Value
+        }
+        else { $script:UI.Busy.IsIndeterminate = $true }
+        $script:UI.TxtStatus.Text = 'Working: ' + $ws.Text
+        # next to the list that is loading, too
+        $cn = @($script:Jobs | Where-Object { $_.Name -eq 'Loading connections' -and $_.Report -and $_.Report.Stage })[0]
+        if ($cn -and $script:UI.TxtCnCount) { $script:UI.TxtCnCount.Text = 'Loading - ' + ((Get-GLWorkStatus -Jobs @($cn)).Text -replace '^Loading connections: ', '') }
     }
     else {
         $script:UI.Busy.Visibility      = 'Collapsed'
@@ -6366,6 +6889,7 @@ function Invoke-GLClusterRefresh {
             foreach ($k in $r.Live.Keys) { $script:State.Live[$k] = $r.Live[$k] }
         }
         Update-GLGatewayRows
+        Invoke-GLAlerts -OnlyClusterIds @($ctx.Id)
         Show-GLGateways
         Update-GLGatewayDetail
         $on = @($r.Members | Where-Object { $_.enabled }).Count
@@ -6383,9 +6907,9 @@ function Invoke-GLGatewayRefresh {
     $skip = [bool]$script:UI.ChkSkipVnet.IsChecked
 
     Write-GLLog "Reading gateways: live member status $(if ($live) { 'on' } else { 'off' }), VNet gateways $(if ($skip) { 'skipped - not woken' } else { 'checked too' })."
-    Start-GLJob -Name 'Loading gateways' -Arguments @{ F = $fab; P = $pbi; L = $live; V = $skip } -Context @{ SkipVnet = $skip } -Work {
-        param($F, $P, $L, $V)
-        Get-GLGatewayData -FabricToken $F -PbiToken $P -LiveStatus:$L -CheckVnet:(-not $V)
+    Start-GLJob -Report -Name 'Loading gateways' -Arguments @{ F = $fab; P = $pbi; L = $live; V = $skip } -Context @{ SkipVnet = $skip } -Work {
+        param($F, $P, $L, $V, $Report)
+        Get-GLGatewayData -FabricToken $F -PbiToken $P -LiveStatus:$L -CheckVnet:(-not $V) -Report $Report
     } -OnDone {
         param($r, $err, $ctx)
         if ($err -or -not $r) { return }
@@ -6395,6 +6919,7 @@ function Invoke-GLGatewayRefresh {
         $script:State.Live        = $r.Live
         $script:State.VnetSkipped = $ctx.SkipVnet
         Update-GLGatewayRows
+        Invoke-GLAlerts
         Set-GLGatewayList $r.Gateways
         Show-GLGateways
         Update-GLGatewayDetail
@@ -6482,7 +7007,7 @@ function Enter-GLKiosk {
         Auto = [string]$script:UI.CmbAutoRefresh.SelectedItem
     }
     $script:UI.Tabs.SelectedItem = $script:UI.TabGateways
-    foreach ($n in 'HeaderBar', 'LogPanel', 'LogSplitter', 'GwToolbar', 'GwSplitter', 'GwDetail', 'TabConnections') { $script:UI[$n].Visibility = 'Collapsed' }
+    foreach ($n in 'HeaderBar', 'LogPanel', 'LogSplitter', 'GwToolbar', 'GwSplitter', 'GwDetail', 'TabConnections', 'MeterPanel') { $script:UI[$n].Visibility = 'Collapsed' }
     $script:UI.LogRow.Height      = [System.Windows.GridLength]::new(0)
     $script:UI.GwDetailRow.Height = [System.Windows.GridLength]::new(0)
     $script:UI.BtnKioskExit.Visibility = 'Visible'
@@ -6501,7 +7026,7 @@ function Exit-GLKiosk {
     Write-GLLog 'Kiosk view closed.'
     $script:KioskSaved = $null
     $w = $script:Window
-    foreach ($n in 'HeaderBar', 'LogPanel', 'LogSplitter', 'GwToolbar', 'GwSplitter', 'GwDetail', 'TabConnections') { $script:UI[$n].Visibility = 'Visible' }
+    foreach ($n in 'HeaderBar', 'LogPanel', 'LogSplitter', 'GwToolbar', 'GwSplitter', 'GwDetail', 'TabConnections', 'MeterPanel') { $script:UI[$n].Visibility = 'Visible' }
     $script:UI.LogRow.Height      = $k.Log
     $script:UI.GwDetailRow.Height = $k.Detail
     $script:UI.BtnKioskExit.Visibility = 'Collapsed'
@@ -6672,21 +7197,22 @@ function Invoke-GLConnectionRefresh {
     $pbi = if ($dir) { Get-GLTokenSafe PowerBI } else { $null }
     $gr  = if ($dir) { Get-GLTokenSafe Graph } else { $null }
     Write-GLLog "Reading connections: usernames and access from the unofficial API $(if ($dir) { 'on' } else { 'off' })."
-    Start-GLJob -Name 'Loading connections' -Arguments @{ F = $fab; P = $pbi; G = $gr; D = $dir; Known = $script:State.Names } -Work {
-        param($F, $P, $G, $D, $Known)
-        $data = Get-GLConnectionData -FabricToken $F
+    Start-GLJob -Report -ExpectConnections ([int]$script:Settings.LastConnectionCount) -Name 'Loading connections' -Arguments @{ F = $fab; P = $pbi; G = $gr; D = $dir; Known = $script:State.Names } -Work {
+        param($F, $P, $G, $D, $Known, $Report)
+        $data = Get-GLConnectionData -FabricToken $F -Report $Report
         $directory = $null; $warn = $null; $names = @{}; $namesWarn = ''
         if ($D -and $P) {
-            try { $directory = Get-GLDatasourceDirectory -PbiToken $P }
+            try { $directory = Get-GLDatasourceDirectory -PbiToken $P -Report $Report }
             catch { $warn = "Usernames and access are unavailable (unofficial API): $($_.Exception.Message)" }
         }
         if ($directory) {
             # the directory may give only object ids - the names come from Graph
             $ids = Get-GLDirectoryPrincipalIds -Directory $directory
-            try { $names = Get-GLPrincipalNames -Ids $ids -GraphToken $G -Known $Known } catch { $namesWarn = $_.Exception.Message }
+            try { $names = Get-GLPrincipalNames -Ids $ids -GraphToken $G -Known $Known -Report $Report } catch { $namesWarn = $_.Exception.Message }
             foreach ($k in $Known.Keys) { if (-not $names.ContainsKey($k)) { $names[$k] = $Known[$k] } }
         }
         # the rows are made here: thousands of them would hold up the window
+        Set-GLReport $Report 'making the rows' -Total @($data.Connections).Count
         $rows = ConvertTo-GLConnectionRows -Connections $data.Connections -GatewayNames (Get-GLGatewayNameMap -Gateways $data.Gateways)
         Add-GLDirectoryInfo -Rows $rows -Directory $directory -Names $names
         @{ Gateways = $data.Gateways; Connections = $data.Connections; Directory = $directory; Rows = $rows; Warn = $warn; Names = $names; NamesWarn = $namesWarn }
@@ -6695,6 +7221,7 @@ function Invoke-GLConnectionRefresh {
         if ($err -or -not $r) { return }
         if ($r.Warn) { Write-GLLog $r.Warn 'Warn' }
         if ($r.Names) { Add-GLNames $r.Names $r.NamesWarn }
+        $script:Settings.LastConnectionCount = @($r.Connections).Count      # "about how many" next time
         Set-GLGatewayList $r.Gateways
         $rows = @($r.Rows | Where-Object { $_ })
         $script:State.ConnRows  = $rows
@@ -7399,6 +7926,46 @@ function Get-GLScreenshotPlan {
     $plan.Add(@{ Kind = 'Theme'; Value = 'Light' })
     $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-gateways-light' })
+    $plan.Add(@{ Kind = 'Theme'; Value = 'Dark' })
+    $plan.Add(@{ Kind = 'OpenAlerts' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'ShotAlerts'; Value = 'screenshot-alerts' })
+    $plan.Add(@{ Kind = 'CloseAlerts' })
+    # the tour: a few frames the README plays as one moving picture
+    $plan.Add(@{ Kind = 'Size'; Value = @(1500, 960) })
+    $plan.Add(@{ Kind = 'Font'; Value = 14 })
+    $plan.Add(@{ Kind = 'Tab'; Value = 0 })
+    $plan.Add(@{ Kind = 'Tile'; Value = 'Contoso Prod Cluster' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Frame'; Value = 2600 })
+    $plan.Add(@{ Kind = 'Tab'; Value = 1 })
+    $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Frame'; Value = 1400 })
+    $plan.Add(@{ Kind = 'Account'; Value = 'svc_sales' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Frame'; Value = 2000 })
+    $plan.Add(@{ Kind = 'Run'; Value = 'Status' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Frame'; Value = 2600 })
+    $plan.Add(@{ Kind = 'Account'; Value = '' })
+    $plan.Add(@{ Kind = 'ShowGone'; Value = $true })
+    $plan.Add(@{ Kind = 'ShowView'; Value = 'Access by accounts not in Entra ID' })
+    $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Row'; Value = 'AP Archive' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Frame'; Value = 3000 })
+    $plan.Add(@{ Kind = 'ShowGone'; Value = $false })
+    $plan.Add(@{ Kind = 'ShowView'; Value = 'Duplicates' })
+    $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Frame'; Value = 2200 })
+    $plan.Add(@{ Kind = 'ShowView'; Value = 'All connections' })
+    $plan.Add(@{ Kind = 'Tab'; Value = 0 })
+    $plan.Add(@{ Kind = 'Font'; Value = 20 })
+    $plan.Add(@{ Kind = 'Kiosk' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Frame'; Value = 3200; Scale = 0.625 })
+    $plan.Add(@{ Kind = 'KioskOff' })
+    $plan.Add(@{ Kind = 'Font'; Value = 12 })
     $plan.Add(@{ Kind = 'Close' })
     return , $plan
 }
@@ -7406,14 +7973,31 @@ function Get-GLScreenshotPlan {
 function Save-GLWindowImage {
     # The window as a PNG, drawn by WPF itself - no screen capture, so nothing else
     # on the screen gets in, and it works with the window behind others.
-    param([Parameter(Mandatory)][string]$Path, $Window)
+    param([Parameter(Mandatory)][string]$Path, $Window, [double]$Scale = 1)
     $w = if ($Window) { $Window } else { $script:Window }
     # the window's own frame inside the title bar: background, margins and all
     $root = [System.Windows.Media.VisualTreeHelper]::GetChild($w, 0)
     $wd = [Math]::Max(1, [int]$root.ActualWidth); $ht = [Math]::Max(1, [int]$root.ActualHeight)
-    $bmp = [System.Windows.Media.Imaging.RenderTargetBitmap]::new($wd, $ht, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
-    $bmp.Render($root)
+    if ($Scale -eq 1) {
+        $bmp = [System.Windows.Media.Imaging.RenderTargetBitmap]::new($wd, $ht, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+        $bmp.Render($root)
+    }
+    else {
+        # smaller, drawn again rather than shrunk - the text stays sharp
+        $sw = [Math]::Max(1, [int][Math]::Round($wd * $Scale)); $sh = [Math]::Max(1, [int][Math]::Round($ht * $Scale))
+        $vb = [System.Windows.Media.VisualBrush]::new($root)
+        $vb.ViewboxUnits = [System.Windows.Media.BrushMappingMode]::Absolute
+        $vb.Viewbox = [System.Windows.Rect]::new(0, 0, $wd, $ht)
+        $vb.Stretch = [System.Windows.Media.Stretch]::Fill
+        $dv = [System.Windows.Media.DrawingVisual]::new()
+        $dc = $dv.RenderOpen()
+        $dc.DrawRectangle($vb, $null, [System.Windows.Rect]::new(0, 0, $sw, $sh))
+        $dc.Close()
+        $bmp = [System.Windows.Media.Imaging.RenderTargetBitmap]::new($sw, $sh, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+        $bmp.Render($dv)
+    }
     $enc = [System.Windows.Media.Imaging.PngBitmapEncoder]::new()
+    $enc.Interlace = [System.Windows.Media.Imaging.PngInterlaceOption]::Off     # the tour joins frames as they are
     $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
     $fs = [System.IO.File]::Create($Path)
     try { $enc.Save($fs) } finally { $fs.Dispose() }
@@ -7437,6 +8021,8 @@ function Get-GLSmokePlan {
     $plan.Add(@{ Kind = 'Tile'; Value = 'Contoso Prod Cluster' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'GoneCheck' })
+    $plan.Add(@{ Kind = 'AlertsCheck' })
+    $plan.Add(@{ Kind = 'MeterCheck' })
     $plan.Add(@{ Kind = 'Tab'; Value = 1 })
     $plan.Add(@{ Kind = 'HistoryPick' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
@@ -7512,6 +8098,15 @@ function Step-GLSmokeTest {
             Set-GLShowGone $false
             $sm.GoneOk = $hidden -and $shown
         }
+        'MeterCheck' { Update-GLMeter; $sm.MeterOk = [string]$script:UI.TxtMeter.Text -match '^CPU \d+%.*API calls \d' }
+        'AlertsCheck' {
+            $d = Show-GLAlertsDialog -NoShow
+            $sm.AlertsOk = [bool]($d -and $script:AlertDlg.C.AlUrl -and $script:AlertDlg.C.AlOk -and $script:AlertDlg.C.AlWebhook)
+            try { $d.Close() } catch { }
+            $script:AlertDlg = $null
+            $tb = $script:Window.TaskbarItemInfo
+            $sm.TaskbarOk = [bool]($tb -and [string]$tb.ProgressState -eq 'Error' -and $script:Window.Title -match '^\(1 offline')
+        }
         'Again' {
             $sm.AgainOk = (@($script:State.ConnRows).Count -eq 27) -and (@($script:State.GatewayRows).Count -eq 5) -and
                           (@($script:LogView).Count -gt 0) -and ($script:UI.BtnSignInReal.Visibility -eq 'Visible')
@@ -7549,6 +8144,28 @@ function Step-GLSmokeTest {
             try { Save-GLWindowImage -Path (Join-Path $script:ShotFolder "$($p.Value).png") }
             catch { Write-GLLog "Screenshot $($p.Value): $($_.Exception.Message)" 'Error' }
         }
+        'Frame' {
+            # the tour's frames are the same size: the kiosk fills the screen, so it is drawn smaller
+            $n = $script:TourFrames.Count + 1
+            $file = Join-Path $script:FrameFolder ('frame-{0:00}.png' -f $n)
+            $k = if ($p.Scale) { [double]$p.Scale } else { 0.8 }
+            try { Save-GLWindowImage -Path $file -Scale $k; $script:TourFrames.Add([pscustomobject]@{ File = $file; Delay = [int]$p.Value }) }
+            catch { Write-GLLog "Tour frame ${n}: $($_.Exception.Message)" 'Error' }
+        }
+        'Account' { $script:UI.TxtCnAccount.Text = [string]$p.Value }
+        'OpenAlerts' {
+            # a fictional address - the demo sends nothing anywhere
+            $sm.AlertsWin = Show-GLAlertsDialog -NoShow
+            $c = $script:AlertDlg.C
+            $c.AlDesktop.IsChecked = $true; $c.AlWebhook.IsChecked = $true
+            $c.AlUrl.Text = 'https://prod-00.westeurope.logic.azure.com:443/workflows/contoso-gateway-alerts/triggers/manual/paths/invoke'
+            $sm.AlertsWin.Show()
+        }
+        'ShotAlerts' {
+            try { Save-GLWindowImage -Path (Join-Path $script:ShotFolder "$($p.Value).png") -Window $sm.AlertsWin }
+            catch { Write-GLLog "Screenshot $($p.Value): $($_.Exception.Message)" 'Error' }
+        }
+        'CloseAlerts' { try { $sm.AlertsWin.Close() } catch { }; $script:AlertDlg = $null }
     }
 }
 
@@ -7564,6 +8181,9 @@ function Get-GLSmokeVerdict {
     if (-not ($script:State.Releases -and $script:State.Releases.Newest)) { $problems.Add('the newest gateway version was not read from the demo''s copy of Microsoft''s pages') }
     $st = @($script:State.Tiles | ForEach-Object Status | Sort-Object -Unique)
     if (@($script:State.Tiles).Count -ne 5 -or ($st -notcontains 'Offline') -or ($st -notcontains 'VNet')) { $problems.Add("gateway tiles: $(@($script:State.Tiles).Count) with $($st -join ', '), expected 5 including Offline and VNet") }
+    if ($script:Smoke -and -not $script:Smoke.MeterOk) { $problems.Add('the meter at the bottom right showed no numbers') }
+    if ($script:Smoke -and -not $script:Smoke.AlertsOk) { $problems.Add('the Alerts window did not load') }
+    if ($script:Smoke -and -not $script:Smoke.TaskbarOk) { $problems.Add('with a gateway offline, the taskbar button and the title did not say so') }
     if ($script:Smoke -and -not $script:Smoke.GoneOk) { $problems.Add('the gateway access list did not leave out the account that is not in Entra ID, or did not show it when asked') }
     if ($script:Smoke -and -not $script:Smoke.CountdownOk) { $problems.Add('with auto-refresh on, the Gateways tab did not count down to the next refresh') }
     if ($script:Smoke -and -not $script:Smoke.AgainOk) { $problems.Add('back to the start page and into the demo again did not give a working window') }
@@ -7651,6 +8271,8 @@ function Show-GLWindow {
     $script:UI.TxtApp.Text      = $script:AppName
     $script:UI.TxtVersion.Text  = "v$($script:AppVersion)"
     $script:UI.TxtIdentity.Text = "$($script:SignedInAs)   |   tenant $($script:TenantShown)   |   $($script:AuthMode)"
+    $script:BaseTitle = $script:Window.Title
+    Update-GLAlertsButton
 
     foreach ($g in $script:Grids) {
         $script:UI[$g].Add_AutoGeneratingColumn({
@@ -7745,6 +8367,7 @@ function Show-GLWindow {
     $script:UI.BtnKiosk.Add_Click({ Enter-GLKiosk })
     $script:UI.BtnKioskExit.Add_Click({ Exit-GLKiosk })
     $script:UI.BtnSignInReal.Add_Click({ $script:BackToStart = $true; $script:Window.Close() })
+    $script:UI.BtnAlerts.Add_Click({ Show-GLAlertsDialog })
     foreach ($c in 'ChkGwShowGone', 'ChkCnShowGone') { $script:UI[$c].Add_Click({ param($s, $e) Set-GLShowGone ([bool]$s.IsChecked) }) }
     Add-GLHelpMenu
     $script:UI.BtnGwCopyAll.Add_Click({ Copy-GLGateways })
@@ -7792,7 +8415,8 @@ function Show-GLWindow {
     $script:UI.BtnLogCopy.Add_Click({ Copy-GLLog })
     $script:UI.BtnLogSave.Add_Click({ Save-GLLog })
     $script:UI.BtnLogFolder.Add_Click({ Open-GLFolder $script:LogFolder })
-    $script:UI.BtnLogClear.Add_Click({ $script:LogEntries.Clear(); Update-GLLogView })
+    $script:UI.BtnLogClear.Add_Click({ $script:LogEntries.Clear(); $script:ErrorCount = 0; Update-GLLogView; Update-GLMeter })
+    $script:UI.BtnErrors.Add_Click({ $script:UI.CmbLogLevel.SelectedItem = 'Errors only' })
     Add-GLLogMenu
 
     $script:UI.BtnCancel.Add_Click({
@@ -7876,10 +8500,16 @@ function Show-GLWindow {
         try { $script:Timer.Stop() } catch { }
         try { if ($script:AutoTimer) { $script:AutoTimer.Stop() } } catch { }
         try { if ($script:ClockTimer) { $script:ClockTimer.Stop() } } catch { }
+        try { if ($script:MeterTimer) { $script:MeterTimer.Stop() } } catch { }
+        Remove-GLTrayIcon
         try { $script:Pool.Close(); $script:Pool.Dispose() } catch { }
     })
 
     Initialize-GLWorkers
+    $script:MeterTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:MeterTimer.Interval = [TimeSpan]::FromSeconds(2)
+    $script:MeterTimer.Add_Tick({ Update-GLMeter })
+    $script:MeterTimer.Start()
     [void]$script:Window.ShowDialog()
 }
 
@@ -7895,6 +8525,11 @@ if ($SmokeTest -or $Screenshots) {
 if ($Screenshots) {
     $script:ShotFolder = [System.IO.Path]::GetFullPath($Screenshots)
     if (-not (Test-Path -LiteralPath $script:ShotFolder)) { $null = New-Item -ItemType Directory -Path $script:ShotFolder -Force }
+    # the tour's frames wait outside the repository, for build/Make-Marketing.ps1 to join
+    $script:FrameFolder = Join-Path ([System.IO.Path]::GetTempPath()) 'gatewaylens-tour'
+    if (Test-Path -LiteralPath $script:FrameFolder) { Remove-Item -LiteralPath $script:FrameFolder -Recurse -Force }
+    $null = New-Item -ItemType Directory -Path $script:FrameFolder -Force
+    $script:TourFrames = [System.Collections.Generic.List[object]]::new()
 }
 
 function Stop-GL([string]$Message) {
@@ -8006,6 +8641,10 @@ if ($Screenshots) {
     Remove-Item -LiteralPath $script:SettingsPath -ErrorAction SilentlyContinue
     $made = @(Get-ChildItem -LiteralPath $script:ShotFolder -Filter '*.png' | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) })
     Write-Host "$($made.Count) screenshot(s) in $($script:ShotFolder)" -ForegroundColor Green
+    if ($script:TourFrames.Count) {
+        $script:TourFrames | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $script:FrameFolder 'frames.json') -Encoding utf8
+        Write-Host "$($script:TourFrames.Count) tour frame(s) in $($script:FrameFolder) - build/Make-Marketing.ps1 joins them" -ForegroundColor Green
+    }
     exit 0
 }
 if ($SmokeTest) {

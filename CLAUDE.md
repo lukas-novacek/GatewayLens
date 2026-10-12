@@ -41,7 +41,7 @@ pwsh -NoProfile -File tests/Run-Tests.ps1                # must pass before ever
 pwsh -NoProfile -File GatewayLens.ps1 -Demo -SelfTest    # end to end on fictional data, any OS
 pwsh -NoProfile -File GatewayLens.ps1 -Demo              # the window on fictional data (Windows)
 pwsh -NoProfile -File GatewayLens.ps1 -Demo -SmokeTest   # drives the real window and the start page (Windows)
-pwsh -NoProfile -File GatewayLens.ps1 -Screenshots assets   # the README pictures, from the demo
+pwsh -NoProfile -File build/Make-Marketing.ps1   # the README pictures, the tour and the social preview, from the demo
 pwsh -NoProfile -File build/Build-Exe.ps1                # needs the .NET SDK
 ```
 
@@ -88,7 +88,9 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
     dictionary loads inside a try, with the classic one as fallback.
 11. **Never log, record or store a password or a token.** Not in the log, the change
     record, a backup, the settings or history. Tokens and the refresh token live in
-    `$script:Auth`, in memory only. Tests check this.
+    `$script:Auth`, in memory only. Tests check this. A Teams or Power Automate alert
+    address works like a password: it is stored only DPAPI-encrypted
+    (`Protect-GLText`), and never in a message, an error or the log.
 12. **Unofficial endpoints** (Power BI v2) and **web pages** (`Get-GLGatewayReleases`)
     stay isolated in their own function, are optional, and degrade to empty columns -
     never to an error. Never send a token to a web page. The one unofficial change,
@@ -147,6 +149,12 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
 28. **Everything a window learns goes into `New-GLState`, or is cleared in
     `Reset-GLSession`.** The start page can come back - out of the demo, or to sign
     in again - and the next window must not see the last one's rows, names or timers.
+29. **Alerts never stop a refresh, and never alert on one check.** `Get-GLAlertEvents`
+    needs two checks in a row, and a refresh of one cluster leaves the others' counts
+    alone. An alert that fails to go out is logged as a warning.
+30. **The tests have their own variables.** `$ast`, `$text`, `$root`, `$s` and others
+    belong to the suite: a test that reuses one breaks the checks after it. Give a
+    test's variables names of their own.
 
 ## Versions and changes
 

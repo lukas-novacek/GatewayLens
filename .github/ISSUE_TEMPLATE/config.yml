@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: A security problem
+    url: https://github.com/lukas-novacek/GatewayLens/security/advisories/new
+    about: Please report it privately - not as a public issue.

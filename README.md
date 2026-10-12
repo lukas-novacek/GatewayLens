@@ -1,14 +1,16 @@
-<p align="center"><img src="assets/icon-256.png" width="112" alt="GatewayLens"></p>
+<p align="center"><img src="assets/icon-256.png" width="104" alt="GatewayLens logo"></p>
 
 <h1 align="center">GatewayLens</h1>
 
-<p align="center"><b>The missing admin console for Power BI and Fabric data gateways.</b><br>
-Hundreds of gateway connections? Do in minutes what takes days in the portal.</p>
+<p align="center"><b>The free admin console for Power BI and Microsoft Fabric on-premises data gateways.</b><br>
+Rotate a password on hundreds of gateway connections in one run, hand over a leaver's access,<br>
+find the access the portal hides, and watch every gateway cluster on one screen.</p>
 
 <p align="center">
   <a href="../../releases/latest"><b>Download GatewayLens.exe</b></a> &nbsp;|&nbsp;
-  <a href="#try-it-in-two-minutes"><b>Try the demo in two minutes</b></a> &nbsp;|&nbsp;
-  <a href="#what-it-does"><b>See everything it does</b></a>
+  <a href="#try-it-in-two-minutes"><b>Try the demo - no sign-in</b></a> &nbsp;|&nbsp;
+  <a href="#what-it-does"><b>Everything it does</b></a> &nbsp;|&nbsp;
+  <a href="#questions"><b>Questions</b></a>
 </p>
 
 <p align="center">
@@ -18,44 +20,58 @@ Hundreds of gateway connections? Do in minutes what takes days in the portal.</p
   <img src="https://img.shields.io/badge/licence-MIT-blue" alt="licence">
 </p>
 
-![The gateway wall: every cluster at a glance, problems first](assets/screenshot-gateways.png)
+![A tour of GatewayLens on Contoso, the built-in demo: the gateway wall, a filter by service account, a test run, access by deleted accounts, duplicates and the kiosk view](assets/screenshot-tour.png)
 
-- **A service account password changed?** Update every connection that uses it in
-  one run - and see straight away which ones work.
-- **Someone leaving?** Move all their access - every connection, every gateway, the
-  same roles - to their successor.
-- **Access nobody can see?** Find the roles still held by accounts that were deleted
-  from Microsoft Entra ID. The portal hides them; GatewayLens counts them, and shows
-  them when you ask.
-- **A cluster filling up?** Find the connections nobody has used for months, and the
-  duplicates, before you hit Microsoft's limit of 1,000.
-- **What is down right now?** A live wall of every gateway cluster, on any screen.
+## Why gateway admins use it
 
-Free and open source. One exe, nothing to install on the gateways, signs in as you.
+The portal's *Manage connections and gateways* page works one connection at a time.
+With dozens of gateway clusters and thousands of connections, everyday work turns
+into days of clicking. GatewayLens does the same work in bulk, safely:
+
+- **A service account password changed?** Filter by the account stored in the
+  credentials and update every connection that uses it in one run - each one is then
+  tested, and the username stays visible, just as when you use the portal.
+- **Someone is leaving?** Move all their access - every connection, every gateway
+  cluster, the same roles - to their successor. Nothing is ever left without an owner.
+- **Access nobody can see.** Accounts deleted from Microsoft Entra ID keep their roles
+  on gateways and connections, and the portal does not list them. GatewayLens counts
+  them, names them when Microsoft still can, and lets you remove them.
+- **A cluster filling up?** Microsoft allows 1,000 data sources per gateway cluster.
+  Find the connections nobody has used for months, and the duplicates.
+- **Is anything down?** A live wall of every gateway cluster, a kiosk view for a TV on
+  the wall, and a message in Teams when a member drops.
+
+Free and open source (MIT). One exe, nothing to install on the gateways, and it signs
+in as you - so it can do exactly what you can do in the portal, and nothing more.
+
+> [!TIP]
+> Look around before you sign in anywhere: start GatewayLens and choose **Try the
+> demo**. Contoso is a fictional company, every button works, and nothing leaves your
+> computer.
 
 ## Built for big tenants
 
-The portal's *Manage connections and gateways* page is fine for a handful of
-connections. With dozens of gateway clusters and hundreds or thousands of
-connections, everyday admin work turns into hours of clicking through one item at a
-time. GatewayLens does the same work in bulk, safely:
-
 | The job | In the portal | In GatewayLens |
 |---|---|---|
-| **Rotate a service account password** | Edit each connection's credentials, one by one | Filter by the account stored in the credentials, update every connection in one run - each one is then tested |
+| **Rotate a service account password** | Edit each connection's credentials, one by one | Filter by the account in the credentials, update every connection in one run, each one tested afterwards |
 | **Someone leaves the company** | Find each connection and gateway they can use, share it again, remove them | **Move access**: their successor gets exactly the same roles everywhere, then theirs are removed |
 | **Who can use what?** | Open each connection's list of users | Filter by person, by credential account, by server or database - and export an access report for the auditor |
-| **Make room on a cluster** | Check connections one by one | Connections counted per cluster against the 1,000 limit; *not used for 90 days*, *no use recorded*, *duplicates*, *failing* - then delete, with a backup written first |
-| **Is every gateway up, current and supported?** | Open each gateway | One coloured tile per cluster, a kiosk mode for a wall screen, versions checked against Microsoft's list of supported releases |
+| **Who still has access after leaving?** | Not shown - deleted accounts are left out of the lists | *Show N not in Entra ID*, and *Access by accounts not in Entra ID* across every connection |
+| **Make room on a cluster** | Check connections one by one | Connections counted against the 1,000 limit; *not used for 90 days*, *no use recorded*, *duplicates*, *failing* - then delete, with a backup written first |
+| **Is every gateway up, current and supported?** | Open each gateway | One coloured tile per cluster, versions checked against Microsoft's supported releases, a kiosk view and alerts |
 | **What changed, and who did it?** | - | Every change is recorded the moment it happens: who, when, what, and the result |
-| **Who still has access after leaving?** | Not shown - the portal leaves deleted accounts out | *Access by accounts not in Entra ID* lists every connection they can still use |
 
 ## See it
+
+**The gateway wall** - every cluster, problems first; members, versions, the 1,000
+limit and who can manage each one.
+
+![The gateway wall: one tile per cluster, members and access below](assets/screenshot-gateways.png)
 
 **Find any connection** - by who has access, the account in its credentials, the
 server or database - and see who can use it, by name.
 
-![Connections, filtered, with who has access to the selected one](assets/screenshot-connections.png)
+![Connections, with who has access to the selected one](assets/screenshot-connections.png)
 
 **Test hundreds at once** - every result in the log as it comes, in colour, with the
 gateway's own reason for each failure.
@@ -63,17 +79,19 @@ gateway's own reason for each failure.
 ![Verify status: the results in the log, failures in red](assets/screenshot-verify-status.png)
 
 **Find what the portal hides** - roles still held by accounts deleted from Microsoft
-Entra ID.
+Entra ID, by name when it is recent.
 
 ![Access by accounts not in Entra ID](assets/screenshot-deleted-accounts.png)
 
 **A wall screen** - the kiosk view: full screen, nothing that changes anything,
-refreshing every minute.
+counting down to the next refresh.
 
 ![The kiosk view](assets/screenshot-kiosk.png)
 
 <details>
-<summary>More: the start page, and the light theme</summary>
+<summary>More: alerts, the start page, and the light theme</summary>
+
+![Alerts: a Windows notification, a sound, or Teams and Power Automate](assets/screenshot-alerts.png)
 
 ![The start page: sign in, or try the demo](assets/screenshot-start.png)
 
@@ -85,7 +103,7 @@ Every picture is the built-in demo - Contoso is fictional.
 
 ## What it does
 
-### Monitor every gateway
+### Watch every gateway - and hear when one drops
 - **One coloured tile per gateway cluster** - on-premises and virtual network: green
   online, amber degraded, red offline. Problems come first, so they are seen from
   across the room.
@@ -98,21 +116,24 @@ Every picture is the built-in demo - Contoso is fictional.
   [Learn](https://learn.microsoft.com/en-us/data-integration/gateway/service-gateway-monthly-updates).
   Badges say **UNSUPPORTED VERSION**, **UPDATE AVAILABLE**, **MIXED VERSIONS**,
   **NEAR CONNECTION LIMIT** or **AT CONNECTION LIMIT**.
+- **Alerts** - when a member goes down, and when it is back: a Windows notification, a
+  sound, or a message in a Teams channel - or a Power Automate flow, which can send an
+  email or open a ticket. A member counts as down only after two checks in a row, so
+  one slow answer wakes nobody. Off until you turn them on.
+- **The taskbar button turns yellow** while a gateway is degraded and **red** while one
+  is offline - seen even with the window minimised.
 - **Kiosk view** - full screen, tiles only, nothing that changes anything, refreshing
-  every minute. The **Kiosk view** button, `-Kiosk` or F11; Esc leaves it.
+  every minute with a countdown. The **Kiosk view** button, `-Kiosk` or F11; Esc
+  leaves it.
 - **VNet gateways are never woken up.** A status check starts a VNet gateway that has
   gone to sleep, and it then uses capacity - so *Skip VNet status* is on by default.
 - Enable or disable one member or several at once, with a warning before the last
-  one - only that cluster is read again. Copy a cluster as tab-separated text for
-  Excel or a ticket. Resolve member machines to IP addresses.
-- The tiles follow the text size, so a wall screen can fit all of them or show them large.
+  one. Copy a cluster as tab-separated text for Excel or a ticket. Resolve member
+  machines to IP addresses.
 
 ### Find any connection
 Filters you can combine, which the portal does not have:
-- **who has access** - one person, a group, anyone whose name or email contains a
-  word. Fabric gives only object ids; GatewayLens shows the names, from Microsoft Graph
-- **access by accounts that no longer exist** - deleted from Microsoft Entra ID, but
-  still holding their roles
+- **who has access** - one person, a group, anyone whose name or email contains a word
 - **the account stored in the credentials** - every connection that uses `svc_sales`
 - **the server, database or path** - several values at once: `sql01; sql02; ora-prd`
 - gateway, connectivity, type, and whether the connection's gateway is online
@@ -127,8 +148,9 @@ a long path.
 ### Change hundreds of connections at once
 Everything acts on every listed connection - filter first, exclude what you want to
 leave alone, then press one button:
-- **Update credentials** - Windows, Basic, Anonymous or Key - and **test them
-  afterwards**, so you know at once which ones still fail.
+- **Update credentials** - Windows, Basic, Anonymous or Key - the way the portal does
+  it, so the username stays visible, and **tested afterwards**, so you know at once
+  which ones still fail.
 - **Grant** or **remove** access for any number of people and groups. Someone who
   already has the role is left alone, a lower role is raised, and the list is read
   again afterwards, so it shows what really happened.
@@ -142,8 +164,10 @@ leave alone, then press one button:
 For someone leaving, or a new owner of a team's connections. Name who hands over and
 who takes over. **Copy access** gives the successor exactly the same roles on every
 listed connection - and, with *Gateway clusters too*, on every gateway cluster -
-raising a lower role where they already have one. **Move access** does that, then removes the old roles - but
-only where the successor has them by then, so nothing is ever left without an owner.
+raising a lower role where they already have one. **Move access** does that, then
+removes the old roles - but only where the successor has them by then, so nothing is
+ever left without an owner. It works for an account that is already deleted, too: by
+the object id the access lists show.
 
 ### Clean up before you hit the limit
 Microsoft allows
@@ -155,16 +179,20 @@ ones to remove:
 - **Duplicates** - the same gateway, type, path and account, side by side
 - **Failing tests** - after Verify status
 - **Skip test connection on** - connections whose test always passes
-- **Access by accounts not in Entra ID** - roles still held by deleted accounts,
-  which the portal does not show
+- **Access by accounts not in Entra ID** - roles still held by deleted accounts
 
-Connection recency is also in the connections export and the access report: when
-each connection was created, last linked to an item, and last used at run time.
+### Find access the portal hides
+Fabric keeps the roles of accounts that were deleted from Microsoft Entra ID, and the
+portal leaves them out of its lists. GatewayLens lists the same people as the portal,
+and counts the others apart: tick **Show N not in Entra ID** to see them. What it says
+about each one comes from Microsoft Graph, and only from there - an account deleted
+in the last 30 days by name, with the day it went; one gone for good as a *Deleted
+account*; and when Graph will not say, *Not found* - never a guess.
 
 ### Prove it to an auditor
-- **Access report** - one row per connection or gateway and person, with the role,
-  read fresh from Fabric. With the User filter set: everything that one person can
-  access.
+- **Access report** - one row per connection or gateway and person, with the role and
+  whether the account still exists, read fresh from Fabric. With the User filter set:
+  everything that one person can access.
 - **Change record** - every change GatewayLens makes, one row each, as it happens:
   who, when, what, the person and role, the result, and Microsoft's reason for
   anything that failed. If the record cannot be written, the change is not made.
@@ -172,27 +200,33 @@ each connection was created, last linked to an item, and last used at run time.
 
 ## Try it in two minutes
 
+Start `GatewayLens.exe` and choose **Try the demo** - or from PowerShell:
+
 ```powershell
 .\GatewayLens.ps1 -Demo
 ```
 
-Demo mode opens the real application on Contoso, a fictional company: gateways
-online, offline and slow, connections that fail for different reasons, a stale
-duplicate, people and groups. Every button works, nothing leaves your computer, and
-no sign-in is needed. Things to try:
+The demo opens the real application on Contoso, a fictional company: gateways online,
+offline and slow, connections that fail for different reasons, a stale duplicate, an
+account that left the company, people and groups. Every button works, nothing leaves
+your computer, and no sign-in is needed. **Sign in to your tenant** in its top bar
+takes you to the start page. Things to try:
 
 1. **Kiosk view** (F11) - the wall screen.
-2. **Connections > Verify status** - five connections fail, and the *StatusDetail* column
-   says why: a login, an expired password, a gateway that is offline.
-3. **Joe Smith is leaving**: set *User* to `joe.smith`, press *Verify users*, then in
-   *Hand over access* set *To* to `ana.novak@contoso.com` and press *Move access*.
-4. **Show > Duplicates** - a stale copy of Sales DW is taking a slot on the Prod cluster.
+2. **Connections > Verify status** - five connections fail, and the *StatusDetail*
+   column says why: a login, an expired password, a gateway that is offline.
+3. **Joe Smith is leaving**: set *User* to `joe.smith`, then in *Hand over access* set
+   *To* to `ana.novak@contoso.com` and press *Move access*.
+4. **Show > Access by accounts not in Entra ID** - Tom Wright left, and still owns a
+   connection.
+5. **Show > Duplicates** - a stale copy of Sales DW is taking a slot on the Prod cluster.
 
 ## Use it on your tenant
 
 **The exe** - download `GatewayLens.exe` from [Releases](../../releases) and run it.
 It carries the script inside it and starts it in PowerShell 7; if PowerShell 7 is
-missing, it says how to install it.
+missing, it says how to install it. It opens on a start page: sign in when you are
+ready - with an admin account, if you keep one - or try the demo first.
 
 **Or the script:**
 
@@ -201,9 +235,6 @@ Unblock-File .\GatewayLens.ps1      # allow the downloaded script to run
 .\GatewayLens.ps1 -SelfTest         # what works for your account - read-only, changes nothing
 .\GatewayLens.ps1                   # the console
 ```
-
-It opens on a start page: sign in when you are ready - with an admin account, if
-you keep one - or try the demo first.
 
 Run the self-test first - `GatewayLens.exe -SelfTest` works too. It signs you in,
 calls every API once and reports what your account can and cannot do, so a missing
@@ -257,16 +288,19 @@ built to make mistakes hard:
   the count to confirm.
 - **Move access never leaves a connection without an owner** - the old role is only
   removed where the new person has it.
-- **Names are never guessed** - a name that matches more than one person is refused.
+- **Names are never guessed** - a name that matches more than one person is refused,
+  and an account is only called deleted when Microsoft Graph says so.
 - **No passwords or tokens are stored** - you sign in on Microsoft's own page, and
-  tokens live in memory only. Password boxes are never remembered.
+  tokens live in memory only. Password boxes are never remembered. A Teams alert
+  address is kept encrypted for your Windows account.
 - **Nothing is sent anywhere but Microsoft** - no telemetry, no server of ours.
 - **VNet gateways are not woken up** unless you ask.
-- **Open source**, with over 400 automated tests - and a demo mode to try every
+- **Open source**, with over 500 automated tests - and a demo mode to try every
   button first.
 
 Exported CSV files contain your tenant's gateway, connection and user names - treat
-them accordingly.
+them accordingly. [SECURITY.md](SECURITY.md) says what GatewayLens touches, and how to
+report a security problem.
 
 ## What you will see
 
@@ -284,17 +318,19 @@ role on it - [docs/permissions.md](docs/permissions.md).
 | Gateways, members, connections, access, recency, delete | Fabric REST API | Documented (recency is in preview) |
 | Connection test, update credentials | Power BI REST API | Documented |
 | **Update credentials like the portal** - keeps the username readable | Power BI v2 `credentialsV2` | **Unofficial** - the documented call is used if it is refused |
-| Names of who has access, name lookup when granting access | Microsoft Graph | Documented |
+| Names of who has access, deleted accounts, name lookup when granting access | Microsoft Graph | Documented |
 | **Live member status** | Power BI v2 `gatewayClusters` | **Unofficial** |
 | **Usernames and access in one call** | Power BI v2 `gatewayClusterDatasources` | **Unofficial** |
+| Alerts in Teams or a flow - only if you turn them on | Your own Teams workflow or Power Automate flow | Documented |
 | Newest gateway version, supported releases | Microsoft Download Center and Learn pages | Public web pages - read once a session, no sign-in, nothing about your tenant is sent |
 
-**About the unofficial parts.** Two things are not available from the documented APIs
-at a reasonable cost, so GatewayLens takes them from the endpoints the portal itself
-uses: whether each member is online right now, and the account stored in each
-connection's credentials with its users, in one call. Each is isolated in a single
-function with its own checkbox. If Microsoft changes one, the only effect is empty
-columns - everything else keeps working.
+**About the unofficial parts.** A few things are not available from the documented
+APIs at a reasonable cost, so GatewayLens takes them from the endpoints the portal
+itself uses: whether each member is online right now, the account stored in each
+connection's credentials with its users, and updating credentials so that account
+stays visible. Each is isolated in a single function, with its own checkbox. If
+Microsoft changes one, the only effect is empty columns, or the documented way -
+everything else keeps working.
 
 **About credentials.** Credentials sent to a gateway must be encrypted with that
 gateway's public key, in exactly the format the gateway expects. GatewayLens uses a
@@ -306,45 +342,77 @@ format byte for byte.
 
 - The **log panel** says what happens as it happens, in colour - green done, amber
   warnings, red failures: every item of a bulk run with its result, how long each
-  load took, what the list shows after a filter changes.
-  It filters by text or level, and copies or saves what it shows. Everything in it
-  also goes to a daily log file, kept for 30 days. The change record is kept for good.
-- Both live in `%LOCALAPPDATA%\GatewayLens\logs` - **Open folder** takes you there.
-  With `-LogFolder \\server\share\gatewaylens` a whole team's records sit in one
-  place; each person writes only to files with their own name in them.
+  load took, what the list shows after a filter changes. It filters by text or level,
+  and copies or saves what it shows. Everything in it also goes to a daily log file,
+  kept for 30 days. The change record is kept for good.
+- The **status bar** says what is running and how far it is - "reading the
+  connections - 1,500 of about 3,200" - and shows what GatewayLens uses: CPU, memory,
+  its workers, and the calls it made to Microsoft, with how many were throttled.
+- Both records live in `%LOCALAPPDATA%\GatewayLens\logs` - **Open folder** takes you
+  there. With `-LogFolder \\server\share\gatewaylens` a whole team's records sit in
+  one place; each person writes only to files with their own name in them.
 - **Themes**: Light, Dark, Midnight and Contrast. **Text size**: A- and A+, Ctrl + mouse
   wheel, or Ctrl + plus and minus - Ctrl + 0 goes back to the default. Rows and tiles
-  follow the text size, and rows stay compact, so more of a long list fits on the screen.
-  Drag the grips between the panels to give the list or the actions more room - the
-  sizes are kept.
+  follow the text size. Drag the grips between the panels to give the list or the
+  actions more room - the sizes are kept.
 - **Help is one click away**: the **?** button (or F1) - the guide, what each action
-  needs, what is new, and where to report a problem. The
-  search and name boxes remember their last 20 entries; password boxes never do.
+  needs, what is new, and where to report a problem. The search and name boxes
+  remember their last 20 entries; password boxes never do.
 
 ## Questions
 
-**Is it really free?** Yes - MIT licence, for any use, including at work.
+### How do I update the credentials of many gateway connections at once?
+Filter the Connections list to the ones you mean - by the account stored in their
+credentials, a server, a gateway - then **Update credentials** below it. Every listed
+connection gets the new username and password, encrypted for its gateway, and is
+tested afterwards. The username stays visible in the portal, as if you had typed it
+there.
 
-**Is it from Microsoft?** No. It is an independent tool that uses Microsoft's own
-APIs, with your own sign-in and permissions.
+### How do I find every connection a service account is used in?
+Type the account into **Account**: every connection whose credentials use it is
+listed, on every gateway you can see. **Export CSV** gives you the list.
 
-**Does it need admin rights on my PC, or anything on the gateways?** No. It runs as
-you, and the gateways are only reached through Microsoft's APIs.
+### How do I hand over a leaver's connections and gateways?
+Set **User** to them, then in **Hand over access** set **To** to their successor and
+press **Move access**. Tick *Gateway clusters too* for the gateway roles. The
+successor gets exactly their roles; theirs are removed only where the successor has
+them by then.
 
-**Can it see every gateway in the tenant?** It sees what your account can see - the
-same as the portal. See [What you will see](#what-you-will-see).
+### Why does GatewayLens list accounts the portal does not show?
+The portal leaves out accounts that were deleted from Microsoft Entra ID - but they
+still hold their roles. GatewayLens lists the same people as the portal, and counts
+those apart: tick **Show N not in Entra ID** to see them, then remove them.
 
-**Will it wake up my VNet gateways?** Not unless you untick *Skip VNet status*.
+### Can I get an alert when a gateway member goes offline?
+Yes: **Alerts** on the Gateways tab - a Windows notification, a sound, or a message in
+a Teams channel or a Power Automate flow. They come while GatewayLens is open with
+auto-refresh on - on a wall screen in kiosk view, for example.
 
-**What does "Show 8 not in Entra ID" mean?** The portal leaves out accounts that
-were deleted from Microsoft Entra ID - but they still hold their role on the gateway
-or connection. GatewayLens lists the same people as the portal, and counts those
-apart. Tick the box to see them - an account deleted in the last 30 days by name,
-with the day it went - and remove them.
+### How close am I to the 1,000 data source limit?
+Every tile counts its cluster's connections against it, with a badge when it gets
+near. **Show > Last used over 90 days ago**, *No use recorded* and *Duplicates* find
+what to remove.
 
-**Does it send my data anywhere?** Only to Microsoft's APIs, which it needs to do its
-job, and it reads two public Microsoft pages for the newest gateway version. There is
-no telemetry and no server of ours.
+### Does it work with Microsoft Fabric and VNet data gateways?
+Yes. It uses the Fabric REST API for gateways and connections, and shows on-premises
+and virtual network gateways alike - without waking a sleeping VNet gateway.
+
+### Is it really free, and is it from Microsoft?
+Free - MIT licence, for any use, including at work. It is not from Microsoft: it is an
+independent tool that uses Microsoft's own APIs, with your sign-in and permissions.
+
+### Does it need admin rights on my PC, or anything on the gateways?
+No. It runs as you, and the gateways are only reached through Microsoft's APIs.
+
+### Can it see every gateway in the tenant?
+It sees what your account can see - the same as the portal. See
+[What you will see](#what-you-will-see).
+
+### Does it send my data anywhere?
+Only to Microsoft's APIs, which it needs to do its job, and it reads two public
+Microsoft pages for the newest gateway version. Alerts go to a Teams workflow or
+Power Automate flow of yours, if you turn them on. There is no telemetry and no
+server of ours.
 
 ## Troubleshooting
 
@@ -372,6 +440,9 @@ answer: it reached the gateway, and the gateway could not reach the data source.
 
 ## Roadmap
 
+- A gateway health report - one page to send to your manager: versions, the 1,000
+  limit, deleted accounts with access, unused connections
+- Alerts without the window open, for a server or a scheduled task
 - Local snapshots, to show what changed and what was deleted since a given day
 - Sign-in as a service principal, for unattended reports
 - Credentials for virtual network gateway connections
@@ -380,23 +451,25 @@ Ideas and bug reports are welcome as [issues](../../issues).
 
 ## About
 
-GatewayLens is made by **Lukas Novacek**. <!-- one line about you: what you do, and what people can contact you for -->
-
+GatewayLens is made by **Lukas Novacek**, a BI infrastructure engineer who runs Power
+BI and Fabric at enterprise scale - and writes about the things the docs do not tell
+you at [lukeweaves.hashnode.dev](https://lukeweaves.hashnode.dev).
 <!-- - LinkedIn: add the link to your profile here -->
-- If GatewayLens saves you time, **star the repository** and share it with a
-  colleague who runs gateways - that is what keeps it going.
+
+If GatewayLens saves you time, **star the repository** and share it with a colleague
+who runs gateways - that is what keeps it going.
 
 ## Development
 
 ```powershell
-.\tests\Run-Tests.ps1          # the test suite - no tenant, no sign-in
-.\build\Build-Exe.ps1          # builds dist\GatewayLens.exe (needs the .NET SDK)
-.\GatewayLens.ps1 -Screenshots assets   # the pictures in this README, from the demo
+.\tests\Run-Tests.ps1             # the test suite - no tenant, no sign-in
+.\build\Build-Exe.ps1             # builds dist\GatewayLens.exe (needs the .NET SDK)
+.\build\Make-Marketing.ps1        # the pictures in this README, all from the demo
 ```
 
 The tests replace every call to Microsoft with a stand-in, so they run on every push
 via GitHub Actions - which also builds the exe; download it from the run's
-**Artifacts**. Pushing a tag such as `v0.6.0` publishes a release with the exe and
+**Artifacts**. Pushing a tag such as `v0.9.0` publishes a release with the exe and
 the script attached. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence

@@ -38,6 +38,16 @@ jobs:
           $m = [regex]::Match($c, "(?s)## \[$([regex]::Escape($v))\][^\n]*\n(.*?)(?=\n## \[|\z)")
           ($m.Success ? $m.Groups[1].Value.Trim() : "GatewayLens $v") | Set-Content notes.md
 
+      - name: Checksums, so anyone can check what they downloaded
+        shell: pwsh
+        run: |
+          $lines = foreach ($f in 'dist/GatewayLens.exe', 'GatewayLens.ps1') {
+            '{0}  {1}' -f (Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path $f -Leaf)
+          }
+          $lines | Set-Content SHA256SUMS.txt
+          $fence = [string]::new([char]96, 3)
+          Add-Content notes.md ("`n`n### SHA-256`n`nCheck a download with ``Get-FileHash <file>``:`n`n$fence`n" + ($lines -join "`n") + "`n$fence")
+
       - uses: softprops/action-gh-release@v2
         with:
           name: GatewayLens ${{ github.ref_name }}
@@ -45,3 +55,4 @@ jobs:
           files: |
             dist/GatewayLens.exe
             GatewayLens.ps1
+            SHA256SUMS.txt

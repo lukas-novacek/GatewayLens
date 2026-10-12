@@ -46,6 +46,11 @@ it publicly.
       the recent ones by name with the day. Look one up in the Entra admin center
       (Users > Deleted users) to be sure.
 - [ ] Auto-refresh 1 min: the Gateways tab counts down to the next refresh.
+- [ ] **Alerts**: tick *Windows notification* and *Post to Teams*, paste a Teams
+      workflow address, *Send a test* - it arrives in the channel. With a gateway
+      degraded or offline, the taskbar button is yellow or red.
+- [ ] Refresh connections: the status bar says what it is reading and how far it is.
+      The meter at the bottom right shows CPU, memory and the API calls.
 - [ ] **Text size** (Ctrl + mouse wheel): the tiles grow and shrink with the text.
 - [ ] **Kiosk view** (F11) on a second screen; Esc leaves it. Auto-refresh is back to
       what it was afterwards.

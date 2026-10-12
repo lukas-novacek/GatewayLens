@@ -4,6 +4,43 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-10-12
+
+### Added
+- **Alerts** when a gateway member goes down, and when it is back - *Alerts* on the
+  Gateways tab, every way off until you turn it on:
+  - a **Windows notification**, from an icon in the notification area
+  - a **sound** - one of Windows' own
+  - a message in a **Teams channel**, or a **Power Automate flow** that can send an
+    email or open a ticket: an Adaptive Card, posted to a workflow address on
+    logic.azure.com or api.powerplatform.com - nowhere else. The address works like a
+    password, so it is kept encrypted for your Windows account (DPAPI), and never
+    shown in a message or the log. *Send a test* tries it.
+  A member counts as down when it is not online two checks in a row, so one slow
+  answer wakes nobody. Members an admin disabled are left out. Alerts come while
+  GatewayLens is open with auto-refresh on; turning one on sets auto-refresh to 5
+  minutes if it was off.
+- **The taskbar button says it without a sound**: yellow while a gateway is degraded,
+  red while one is offline. The window title says the same, for Alt+Tab.
+- **Progress for loading**: the status bar says what each load is doing and how far it
+  is - "reading the connections - 1,500 of about 3,235", from the last load's count -
+  with a bar that fills. The connection count above the list says the same.
+- **A meter** at the bottom right: GatewayLens's CPU and memory, its busy workers and
+  threads, and the calls it made to Microsoft this session - with how many Microsoft
+  throttled. An *errors* button shows only the errors in the log.
+- `build/Make-Marketing.ps1`: the README's pictures, a moving tour and the social
+  preview image - all from the demo.
+- `SECURITY.md` - what GatewayLens touches, and how to report a problem privately -
+  issue templates, and SHA-256 checksums with every release.
+
+### Fixed
+- **The self-test said credentials like the portal failed** when the first connection
+  it tried was not yours to manage. It now tries connections on a gateway you
+  administer first, and a permission answer is not a failure.
+- **Update credentials did not fall back** to the documented call when the portal's
+  own lookup of the connection failed. That lookup only reads, so whatever it answers,
+  the documented way is now tried - and gives its own answer.
+
 ## [0.8.2] - 2026-10-12
 
 ### Changed

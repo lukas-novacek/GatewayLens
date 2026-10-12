@@ -155,8 +155,8 @@ foreach ($f in $spf) { if ($defs.ContainsKey($f)) { $spNeed += @($defs[$f].Body.
 $spMissing = @($spNeed | Sort-Object -Unique | Where-Object { $spf -notcontains $_ })
 Assert ($spf.Count -ge 4 -and -not $spMissing) "every function the start page calls is given to its thread $(if ($spMissing) { '- missing: ' + ($spMissing -join ', ') })"
 
-$hereStrings = [regex]::Matches($text, "(?s)\`$script:(MainXaml|StartXaml|InfoXaml|DialogXaml|PromptXaml|ModernStylesXaml|ClassicStylesXaml) = @'\r?\n(.*?)\r?\n'@")
-Assert ($hereStrings.Count -eq 7 -and $hereStrings[0].Groups[1].Value -eq 'MainXaml') 'all seven XAML blocks found (five windows, two style sets), the main window first'
+$hereStrings = [regex]::Matches($text, "(?s)\`$script:(MainXaml|StartXaml|InfoXaml|AlertsXaml|DialogXaml|PromptXaml|ModernStylesXaml|ClassicStylesXaml) = @'\r?\n(.*?)\r?\n'@")
+Assert ($hereStrings.Count -eq 8 -and $hereStrings[0].Groups[1].Value -eq 'MainXaml') 'all eight XAML blocks found (six windows, two style sets), the main window first'
 foreach ($m in $hereStrings) {
     $ok = $true
     try { [void][xml]$m.Groups[2].Value } catch { $ok = $false }
@@ -1124,6 +1124,84 @@ $txt = Format-GLClusterText -GatewayName 'Cluster A' -MemberRows @([pscustomobje
 Assert ($txt -eq "Cluster A`tn1`tH1`t1`tTrue`tLive") 'copied cluster text is tab-separated, one line per member'
 
 # ============================================================================
+Section 'Progress and the meter'
+# ============================================================================
+$repTest = [hashtable]::Synchronized(@{ Stage = ''; Done = 0; Total = 0; Expect = 0 })
+Reset-Calls
+$script:Rules = @{ 'pages/one' = [pscustomobject]@{ value = @(1, 2, 3); continuationUri = 'https://x/pages/two' }; 'pages/two' = [pscustomobject]@{ value = @(4, 5) } }
+$pg = Get-GLPaged -Uri 'https://x/pages/one' -Token 't' -Report $repTest
+Assert ($pg.Count -eq 5 -and $repTest.Done -eq 5) 'paging reports how many it has so far'
+$jobsNow = @(
+    [pscustomobject]@{ Name = 'Loading connections'; Report = @{ Stage = 'reading the connections'; Done = 1500; Total = 0; Expect = 3235 } }
+    [pscustomobject]@{ Name = 'Loading gateways'; Report = @{ Stage = 'reading the members of each gateway'; Done = 4; Total = 11; Expect = 0 } }
+    [pscustomobject]@{ Name = 'Access for x'; Report = $null })
+$ws = Get-GLWorkStatus -Jobs $jobsNow
+Assert ($ws.Text -match 'Loading connections: reading the connections - 1\D?500 of about 3\D?235' -and $ws.Text -match 'reading the members of each gateway - 4 of 11' -and $ws.Text -match 'Access for x' -and $ws.Max -eq 3235 -and $ws.Value -eq 1500) "the status bar says what each job is doing, and how far ($($ws.Text))"
+$ws2 = Get-GLWorkStatus -Jobs @([pscustomobject]@{ Name = 'Loading connections'; Report = @{ Stage = 'reading the connections'; Done = 4000; Total = 0; Expect = 3235 } })
+Assert ($ws2.Value -lt $ws2.Max) 'more than expected: the bar never claims to be finished before it is'
+$mt = Get-GLMeterText -Cpu 3.4 -MemoryBytes 420MB -Busy 6 -Workers 4 -Threads 41 -Calls 1284 -Throttled 3
+Assert ($mt -match '^CPU 3%' -and $mt -match 'Memory 420 MB' -and $mt -match 'Workers 4 of 4 busy, 2 waiting' -and $mt -match 'Threads 41' -and $mt -match 'API calls 1\D?284' -and $mt -match 'throttled 3') "the meter: CPU, memory, workers, threads, calls and throttling ($mt)"
+
+# ============================================================================
+Section 'Alerts - a member down, a member back'
+# ============================================================================
+$t0 = Get-Date '2026-10-12 10:00:00'
+$liveAt = {
+    param([string]$S1, [string]$S2)
+    @{ m1 = [pscustomobject]@{ Status = $S1; Cluster = 'C1'; Machine = 'GW-01'; Enabled = $true }
+       m2 = [pscustomobject]@{ Status = $S2; Cluster = 'C1'; Machine = 'GW-02'; Enabled = $true }
+       m3 = [pscustomobject]@{ Status = 'Offline'; Cluster = 'C2'; Machine = 'GW-03'; Enabled = $false } }
+}
+$a1 = Get-GLAlertEvents -Track @{} -Live (& $liveAt 'Live' 'Timeout') -Now $t0
+$a2 = Get-GLAlertEvents -Track $a1.Track -Live (& $liveAt 'Live' 'Offline') -Now $t0.AddMinutes(1)
+$a3 = Get-GLAlertEvents -Track $a2.Track -Live (& $liveAt 'Live' 'Offline') -Now $t0.AddMinutes(2)
+$a4 = Get-GLAlertEvents -Track $a3.Track -Live (& $liveAt 'Live' 'Live') -Now $t0.AddMinutes(12)
+Assert (@($a1.Events).Count -eq 0) 'one check without an answer is not an outage - nobody is woken'
+Assert (@($a2.Events).Count -eq 1 -and $a2.Events[0].Kind -eq 'Down' -and $a2.Events[0].MemberId -eq 'm2' -and $a2.Events[0].Since -eq $t0) 'two checks in a row: the member is reported down, from when it was first seen down'
+Assert (@($a3.Events).Count -eq 0) 'still down: not reported again'
+Assert (@($a4.Events).Count -eq 1 -and $a4.Events[0].Kind -eq 'Up' -and [int]$a4.Events[0].DownFor.TotalMinutes -eq 12) 'online again: reported back, with how long it was down'
+Assert (-not ($a2.Events | Where-Object MemberId -eq 'm3')) 'a member an admin disabled is never reported'
+$aOther = Get-GLAlertEvents -Track $a1.Track -Live @{ m9 = [pscustomobject]@{ Status = 'Offline'; Cluster = 'C9'; Enabled = $true } } -OnlyClusterIds @('C9') -Now $t0
+Assert ($aOther.Track['m2'].DownChecks -eq 1 -and @($aOther.Events).Count -eq 0) 'one cluster read again: the others keep their count - a member is not called down without being asked again'
+$aNone = Get-GLAlertEvents -Track $a1.Track -Live $null
+Assert (@($aNone.Events).Count -eq 0) 'no live status: nothing is reported'
+$txt = Format-GLAlertText -Events $a2.Events -Live (& $liveAt 'Live' 'Offline') -ClusterNames @{ c1 = 'Contoso Prod Cluster' } -MemberNames @{ m2 = 'CTSGW-PRD02' }
+Assert ($txt.Title -eq 'A gateway member is down' -and $txt.Lines[0] -eq 'CTSGW-PRD02 in Contoso Prod Cluster is offline since 10:00 - 1 of 2 members online' -and $txt.Severity -eq 'Down') "the alert names the member, its cluster and what is left ($($txt.Lines[0]))"
+$txtUp = Format-GLAlertText -Events $a4.Events -Live (& $liveAt 'Live' 'Live') -ClusterNames @{ c1 = 'Contoso Prod Cluster' } -MemberNames @{ m2 = 'CTSGW-PRD02' }
+Assert ($txtUp.Title -eq 'A gateway member is back online' -and $txtUp.Lines[0] -match 'back online, after 12 min - 2 of 2 members online') "and when it is back ($($txtUp.Lines[0]))"
+$allDown = Format-GLAlertText -Events @([pscustomobject]@{ Kind = 'Down'; MemberId = 'm1'; ClusterId = 'c1'; Machine = 'GW-01'; Status = 'Timeout'; Since = $t0 }) -Live (& $liveAt 'Timeout' 'Offline')
+Assert ($allDown.Lines[0] -match 'does not answer' -and $allDown.Lines[0] -match 'no member of the cluster is online') 'a cluster with no member left says so'
+$card = New-GLAlertCard -Title $txt.Title -Lines $txt.Lines -Severity 'Down' -Version '9.9.9'
+$cardJson = $card | ConvertTo-Json -Depth 20 -Compress
+Assert ($cardJson -match '"contentType":"application/vnd.microsoft.card.adaptive"' -and $cardJson -match '"type":"AdaptiveCard"' -and $cardJson -match '"color":"Attention"' -and $cardJson -match 'CTSGW-PRD02 in Contoso Prod Cluster') 'Teams and Power Automate get an Adaptive Card, red for down'
+foreach ($ok in 'https://prod-12.westeurope.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?sig=x',
+                'https://default1234.ab.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/abc/triggers/manual/paths/invoke?sig=x') {
+    Assert (-not (Test-GLWebhookUrl $ok)) "a Microsoft workflow address is taken ($(([uri]$ok).Host))"
+}
+foreach ($bad in 'http://prod-12.westeurope.logic.azure.com/x', 'https://logic.azure.com.evil.example/x', 'https://evil.example/?u=logic.azure.com',
+                 'https://user@prod-1.logic.azure.com/x', 'not a url', '') {
+    Assert ([bool](Test-GLWebhookUrl $bad)) "anything else is refused, with the reason: '$bad'"
+}
+if ($IsWindows) {
+    $hook = 'https://prod-12.westeurope.logic.azure.com/workflows/abc?sig=SECRET123'
+    $prot = Protect-GLText $hook
+    Assert ($prot -and $prot -notmatch 'SECRET123' -and $prot -match '^[0-9a-f]+$' -and (Unprotect-GLText $prot) -eq $hook) 'the webhook address is kept encrypted for this Windows account, and read back'
+    $alPath = Join-Path ([System.IO.Path]::GetTempPath()) ('gl-alerts-' + [guid]::NewGuid().ToString('N') + '.json')
+    $alSet = New-GLDefaultSettings
+    $alSet.Alerts = [ordered]@{ Desktop = $true; Sound = $false; WebhookProtected = $prot }
+    $null = Save-GLSettings -Settings $alSet -Path $alPath
+    $araw = Get-Content -Raw -LiteralPath $alPath
+    $aback = Read-GLSettings -Path $alPath
+    Assert ($araw -notmatch 'SECRET123' -and $araw -notmatch 'logic\.azure' -and $aback.Alerts.Desktop -and -not $aback.Alerts.Sound -and (Unprotect-GLText $aback.Alerts.WebhookProtected) -eq $hook) 'the settings file never holds the address readable; the choices come back'
+    Remove-Item -LiteralPath $alPath -ErrorAction SilentlyContinue
+    Assert ((Unprotect-GLText 'deadbeef') -eq '') 'an address that cannot be read back is as if none was set'
+}
+Enable-GLDemo
+Send-GLWebhook -Url 'https://prod-1.logic.azure.com/x' -Body $card
+Assert ((Get-GLDemoStore).WebhookPosts.Count -eq 1) 'in the demo an alert is kept, not sent - nothing leaves the computer'
+Disable-GLDemo
+
+# ============================================================================
 Section 'Usernames and users (unofficial bulk endpoint)'
 # ============================================================================
 Reset-Calls
@@ -1376,6 +1454,9 @@ Enable-GLDemo
 $s = Get-GLDemoStore
 $s.Fast = $true
 $T = 'demo-token'
+$st0 = [long]([System.AppDomain]::CurrentDomain.GetData('GatewayLens.Stats').Calls)
+$null = Invoke-GLRequest -Uri 'https://api.fabric.microsoft.com/v1/gateways' -Token $T
+Assert ([long]([System.AppDomain]::CurrentDomain.GetData('GatewayLens.Stats').Calls) -eq $st0 + 1) 'every call to Microsoft is counted, for the meter - in the demo too'
 Assert ($s.Users.Count -eq 6 -and $s.Connections.Count -eq 27 -and $s.Gateways.Count -eq 6) "the company is built: 6 people, 6 gateways, 27 connections ($($s.Users.Count), $($s.Gateways.Count), $($s.Connections.Count))"
 $allIds = @($s.Connections | ForEach-Object id) + @($s.Gateways | ForEach-Object id) + @($s.Users | ForEach-Object id)
 Assert (@($allIds | Sort-Object -Unique).Count -eq $allIds.Count) 'every id is unique'
@@ -1655,7 +1736,7 @@ foreach ($name in $script:Themes.Keys) {
     $miss = @($brushesUsed | Where-Object { -not $script:Themes[$name].Contains($_) })
     Assert (-not $miss) "theme '$name' defines all $($brushesUsed.Count) brushes the windows use $(if ($miss) { '- missing: ' + ($miss -join ', ') })"
 }
-$windowsXaml = $xamlBy.MainXaml + $xamlBy.StartXaml + $xamlBy.InfoXaml + $xamlBy.DialogXaml + $xamlBy.PromptXaml
+$windowsXaml = $xamlBy.MainXaml + $xamlBy.StartXaml + $xamlBy.InfoXaml + $xamlBy.AlertsXaml + $xamlBy.DialogXaml + $xamlBy.PromptXaml
 $asked = @([regex]::Matches($windowsXaml, 'Style="\{DynamicResource (\w+)\}"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 foreach ($set in 'ModernStylesXaml', 'ClassicStylesXaml') {
     $have = @([regex]::Matches($xamlBy[$set], 'x:Key="(\w+)"') | ForEach-Object { $_.Groups[1].Value })
@@ -1751,7 +1832,7 @@ $script:AuthMode = $keepReset.Mode; $script:TenantShown = $keepReset.Tenant; $sc
 $keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
 $keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
 $script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
-$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true; GoneOk = $true; CountdownOk = $true; AgainOk = $true }
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true; GoneOk = $true; CountdownOk = $true; AgainOk = $true; AlertsOk = $true; TaskbarOk = $true; MeterOk = $true }
 $keepStart = $script:StartPageResult; $script:StartPageResult = 'Demo'
 $keepTiles = $script:State.Tiles
 $script:State.GatewayRows = @(1..5); $script:State.ConnRows = @(1..27)
@@ -1771,7 +1852,7 @@ Assert (((Get-GLSmokeVerdict) -join ' ') -match 'kiosk view') 'smoke verdict: a 
 $script:Smoke.KioskOk = $true; $script:Smoke.GridChecks = 'a cell wrote its text back into the row'
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'grids: a cell wrote') 'smoke verdict: a grid that sorts, opens or copies wrongly fails'
 $script:Smoke.GridChecks = ''
-foreach ($k in 'GoneOk', 'CountdownOk', 'AgainOk') {
+foreach ($k in 'GoneOk', 'CountdownOk', 'AgainOk', 'AlertsOk', 'TaskbarOk', 'MeterOk') {
     $script:Smoke[$k] = $false
     Assert ((Get-GLSmokeVerdict).Count -ge 1) "smoke verdict: $k false fails"
     $script:Smoke[$k] = $true
