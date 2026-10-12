@@ -745,6 +745,28 @@ Assert ($f -is [array] -and $f.Count -eq 0) 'no match is an empty array'
 $d = Get-GLDistinct -Rows $crows -Property Type
 Assert ($d[0] -eq '(all)' -and ($d -join ',') -eq '(all),Oracle,SQL,Web') "dropdown values: (all) first, sorted, distinct ($($d -join ','))"
 
+# ---- enabling or disabling several members ----
+$cm = @([pscustomobject]@{ id = 'N1'; enabled = $true }, [pscustomobject]@{ id = 'N2'; enabled = $true }, [pscustomobject]@{ id = 'N3'; enabled = $false })
+$cr = @([pscustomobject]@{ Id = 'N1'; Member = 'n1'; Enabled = $true }, [pscustomobject]@{ Id = 'N2'; Member = 'n2'; Enabled = $true }, [pscustomobject]@{ Id = 'N3'; Member = 'n3'; Enabled = $false })
+$mp = Get-GLMemberPlan -Members $cm -Selected @($cr[0], $cr[2]) -Enabled $false
+Assert (@($mp.Change).Count -eq 1 -and $mp.Change[0].Id -eq 'N1' -and $mp.Already -eq 1 -and $mp.EnabledAfter -eq 1) 'disable two selected, one already off: one changes, one member stays enabled'
+$mp = Get-GLMemberPlan -Members $cm -Selected @($cr[0], $cr[1]) -Enabled $false
+Assert ($mp.EnabledAfter -eq 0) 'disabling every enabled member is seen - the confirmation warns that refreshes stop'
+$mp = Get-GLMemberPlan -Members $cm -Selected $cr -Enabled $true
+Assert (@($mp.Change).Count -eq 1 -and $mp.Change[0].Id -eq 'N3' -and $mp.Already -eq 2 -and $mp.EnabledAfter -eq 3) 'enable all three: only the disabled one changes'
+
+# ---- a test result, as the Status column and the log show it ----
+$o1 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'OK'; Detail = '' }) -SkipTest $false -Name 'Sales'
+$o2 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'OK'; Detail = '' }) -SkipTest $true -Name 'Sandbox'
+$o3 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'Failed'; Detail = 'Login failed' }) -SkipTest $true -Name 'HR'
+$o4 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'Timeout'; Detail = '' }) -SkipTest $false -Name 'Slow'
+Assert ($o1.Status -eq 'OK' -and $o1.Level -eq 'Info' -and $o1.Text -eq '    Sales: OK') 'a working connection: OK'
+Assert ($o2.Status -eq 'Unverified' -and $o2.Level -eq 'Warn' -and $o2.Text -match 'not verified' -and $o2.Detail -match 'Skip test connection') 'Skip test connection on: an OK is Unverified - the gateway may not have tried'
+Assert ($o3.Status -eq 'Failed' -and $o3.Level -eq 'Error' -and $o3.Text -match 'failed - Login failed') 'a failure stays a failure, with its reason, whatever the flag'
+Assert ($o4.Status -eq 'Timeout' -and $o4.Text -match 'did not answer') 'no answer in time says so'
+$skipRows = @([pscustomobject]@{ Id = 'S1'; Name = 'a'; Connectivity = 'OnPremisesGateway'; SkipTest = $true; UserList = @() }, [pscustomobject]@{ Id = 'S2'; Name = 'b'; Connectivity = 'OnPremisesGateway'; SkipTest = $false; UserList = @() })
+Assert ((Select-GLConnections -Rows $skipRows -Show 'Skip test connection on').Id -eq 'S1') 'Show > Skip test connection on lists only the flagged ones'
+
 # ---- copying rows: what Excel gets ----
 $cols = @([pscustomobject]@{ Header = 'Name'; Property = 'Name' }, [pscustomobject]@{ Header = 'Path'; Property = 'Path' }, [pscustomobject]@{ Header = 'Users'; Property = 'UserList' })
 $crs = @(
@@ -1149,7 +1171,7 @@ $bb = [System.IO.File]::ReadAllBytes($bk)
 Assert ($bb[0] -eq 0xEF -and $bb[1] -eq 0xBB -and $bb[2] -eq 0xBF) 'backup: UTF-8 with a BOM, so Excel shows accented names correctly'
 $back = @(Import-Csv $bk)
 Assert ($back.Count -eq 2 -and $back[0].Id -eq 'C1' -and $back[0].GatewayId -eq 'G1' -and $back[1].Privacy -eq 'Private') 'backup: one row per connection, with its details'
-Assert ($back[0].Access -eq 'jane@contoso.com (User, Owner)') "backup: who had access, and in which role ($($back[0].Access))"
+Assert ($back[0].Access -eq 'jane@contoso.com (User, Owner) [P1]') "backup: who had access, in which role, and their object id - for an account deleted later ($($back[0].Access))"
 Assert ($back[1].Access -eq 'bob@contoso.com') 'backup: falls back to the users already loaded when access could not be read'
 $def = $back[0].DefinitionJson | ConvertFrom-Json
 Assert ($def.connectionDetails.path -eq 's;d') 'backup: the full connection definition survives as JSON'
@@ -1394,7 +1416,7 @@ Assert ($err -match "No User found for 'nobody@contoso.com'") 'someone who does 
 $two = @($byN['Product Catalog'], $byN['Sales DW'])
 $who = @([pscustomobject]@{ Id = $jane.Id; DisplayName = $jane.DisplayName; Type = 'User' })
 $g1 = Invoke-GLBulkGrant -Items $two -Principals $who -Role 'User' -FabricToken $T -Progress @{ Cancel = $false } -Audit $au
-Assert ($g1[0].Message -like 'granted User*' -and $g1[1].Message -like '*already has access') 'grant: new access, and "already has access" where she had it'
+Assert ($g1[0].Message -like 'granted User*' -and $g1[1].Message -like '*already has User') 'grant: new access, and "already has User" where she had it - checked before anything is sent'
 $v1 = Invoke-GLBulkRevoke -Items $two -Principals $who -FabricToken $T -Progress @{ Cancel = $false } -Audit $au
 $ras  = Get-GLRoleAssignments -Kind connections -Id $byN['Sales DW'].Id -FabricToken $T
 $left = @($ras | Where-Object { $_.principal.id -eq $jane.Id })
@@ -1406,6 +1428,14 @@ foreach ($o in $owners) { try { Remove-GLRoleAssignment -Kind connections -Id $b
 Assert ($err -match 'LastOwnerCannotBeRemoved') 'the last owner of a connection cannot be removed'
 
 $prodGw = $cd.Gateways | Where-Object displayName -eq 'Contoso Prod Cluster'
+$pm = @($s.Members[$prodGw.id])
+$mrw = ConvertTo-GLMemberRows -GatewayName $prodGw.displayName -Members $pm -Live $null
+$bm = Invoke-GLBulkMembers -Gateway ([pscustomobject]@{ Id = $prodGw.id; Name = $prodGw.displayName }) -Members @($mrw[0], $mrw[2]) -Enabled $false -FabricToken $T -Progress @{ Cancel = $false } -Audit $au
+Assert (@($bm | Where-Object Ok).Count -eq 2 -and -not $pm[0].enabled -and $pm[1].enabled -and -not $pm[2].enabled) 'several members disabled in one run, the one not chosen left alone'
+$bm = Invoke-GLBulkMembers -Gateway ([pscustomobject]@{ Id = $prodGw.id; Name = $prodGw.displayName }) -Members @($mrw[0], $mrw[2]) -Enabled $true -FabricToken $T -Progress @{ Cancel = $false } -Audit $au
+Assert ($pm[0].enabled -and $pm[2].enabled) 'and enabled again'
+$one = Get-GLLiveStatus -PbiToken $T -OnlyClusterIds @($prodGw.id)
+Assert ($one.Count -eq $pm.Count -and -not ($one.Values | Where-Object { $_.Cluster -ne ([string]$prodGw.id).ToLowerInvariant() })) "live status for one cluster asks only its members ($($one.Count))"
 $m2 = $s.Members[$prodGw.id][1]
 Set-GLMemberEnabled -GatewayId $prodGw.id -MemberId $m2.id -Enabled $false -FabricToken $T
 Assert ($m2.enabled -eq $false) 'a member is disabled'
@@ -1445,10 +1475,11 @@ $vnetG = $cd.Gateways | Where-Object type -eq 'VirtualNetwork' | Select-Object -
 $nobody = Get-GLRoleAssignmentsBulk -Ids @($vnetG.id) -FabricToken $T -Kind gateways
 Assert ($null -ne $nobody[$vnetG.id] -and $nobody[$vnetG.id] -is [array] -and $nobody[$vnetG.id].Count -eq 0) 'nobody has access is an empty list, not "could not be read"'
 
-$fromMail = Resolve-GLHandoverFrom -Value 'joe.smith@contoso.com' -GraphToken $null
-Assert ($fromMail.Id -eq '' -and $fromMail.Names -contains 'joe.smith@contoso.com') 'without Graph - say the account is already deleted - the one handing over is matched by the email their roles carry'
+$err = $null; try { $null = Resolve-GLHandoverFrom -Value 'joe.smith@contoso.com' -GraphToken $null } catch { $err = $_.Exception.Message }
+Assert ($err -match 'object id') 'without Graph an email cannot be matched - role assignments carry only object ids - so the object id is asked for'
 $err = $null; try { $null = Resolve-GLHandoverFrom -Value 'joe' -GraphToken $T } catch { $err = $_.Exception.Message }
-Assert ($err -match 'was not found' -and $err -match 'email') 'a name that is found nowhere is refused - it would match nobody'
+Assert ($err -match 'was not found' -and $err -match 'object id') 'someone Graph does not know - a deleted account - is refused, with the object id as the way out'
+$fromMail = Resolve-GLHandoverFrom -Value 'joe.smith@contoso.com' -GraphToken $T
 $h1 = Invoke-GLAccessHandover -Targets ($allGw + $allConn) -From $fromMail -To $toAna -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha
 $given = @($h1 | Where-Object { $_.Message -like 'gave Ana Novak*' })
 Assert ($given.Count -eq 2 -and (Get-DemoRole connections $byN['Sales DW'].Id $anaU.id) -eq 'User' -and (Get-DemoRole connections $byN['Sales Staging'].Id $joeU.id) -eq 'User') "Copy access: Ana gets Joe's User role on both his connections, and Joe keeps his ($($given.Count) given)"
@@ -1487,9 +1518,9 @@ $rt = @(
     [pscustomobject]@{ Kind = 'gateways';    Id = $prodG.id; Name = $prodG.displayName; Gateway = $prodG.displayName; Type = 'OnPremises'; Path = ''; Account = ''; LastUsed = '' }
     [pscustomobject]@{ Kind = 'connections'; Id = $byN['Sales DW'].Id; Name = 'Sales DW'; Gateway = 'Contoso Prod Cluster'; Type = 'SQL'; Path = $byN['Sales DW'].Path; Account = $byN['Sales DW'].Account; LastUsed = $byN['Sales DW'].LastUsed }
 )
-$rep = Get-GLAccessReport -Targets $rt -FabricToken $T -Progress @{ Cancel = $false }
+$rep = Get-GLAccessReport -Targets $rt -FabricToken $T -Progress @{ Cancel = $false } -GraphToken $T
 Assert (@($rep | Where-Object { $_.Target -eq 'Sales DW' -and $_.Email -eq 'demo.user@contoso.com' -and $_.Role -eq 'Owner' }).Count -eq 1 -and @($rep | Where-Object { $_.Kind -eq 'Gateway' -and $_.Role -eq 'Admin' }).Count -ge 1) "access report from the demo: gateways and connections, each person with their role ($($rep.Count) rows)"
-$repAna = Get-GLAccessReport -Targets $rt -Who 'ana.novak' -FabricToken $T -Progress @{ Cancel = $false }
+$repAna = Get-GLAccessReport -Targets $rt -Who 'ana.novak' -FabricToken $T -Progress @{ Cancel = $false } -GraphToken $T
 Assert ($repAna.Count -eq 2 -and -not ($repAna | Where-Object { $_.Email -ne 'ana.novak@contoso.com' })) "access report for one person: Ana's gateway role and her connection, nothing else ($($repAna.Count))"
 
 $s.VnetWoken = 0
@@ -1620,7 +1651,7 @@ Assert ($newObj.Count -eq 0) "no New-Object in the script - it wraps objects, an
 $keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
 $keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
 $script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
-$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = '' }
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true }
 $keepTiles = $script:State.Tiles
 $script:State.GatewayRows = @(1..5); $script:State.ConnRows = @(1..27)
 $script:State.Tiles = @('Offline', 'Degraded', 'Online', 'Online', 'VNet' | ForEach-Object { [pscustomobject]@{ Status = $_ } })
@@ -1639,6 +1670,12 @@ Assert (((Get-GLSmokeVerdict) -join ' ') -match 'kiosk view') 'smoke verdict: a 
 $script:Smoke.KioskOk = $true; $script:Smoke.GridChecks = 'a cell wrote its text back into the row'
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'grids: a cell wrote') 'smoke verdict: a grid that sorts, opens or copies wrongly fails'
 $script:Smoke.GridChecks = ''
+$script:Smoke.FilterOk = $false
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'search box') 'smoke verdict: a search box that does not filter fails'
+$script:Smoke.FilterOk = $true
+$script:Smoke.TileScale = 1.0
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'tiles at text size 16') 'smoke verdict: tiles that do not follow the text size fail'
+$script:Smoke.TileScale = 16 / 12
 $script:Smoke.KioskOk = $true; $script:State.Releases = $null
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'newest gateway version') 'smoke verdict: the newest gateway version not read fails'
 $script:StyleMode = $keepStyle; $script:StyleError = $keepErr; $script:Smoke = $keepSmoke; $script:LogEntries.Clear()
@@ -1821,7 +1858,7 @@ $r = Invoke-Worker "Read-GLChanges -Folder '$wf'"
 Assert ($r.Count -eq 8 -and $r[0].Action -and $r[0].User -and $r[0].When -is [datetime]) 'the change record arrives from a worker whole - every change, every field'
 $cid = (Get-GLDemoStore).Connections[0].id
 $r = Invoke-Worker "Get-GLRoleAssignments -Kind connections -Id '$cid' -FabricToken 'demo-token'"
-Assert ($r.Count -ge 2 -and $r[0].role -and $r[0].principal.displayName) 'who has access arrives from a worker whole'
+Assert ($r.Count -ge 2 -and $r[0].role -and $r[0].principal.id -and $r[0].principal.type) 'who has access arrives from a worker whole - the id and type a real tenant gives'
 $r = Invoke-Worker ('$s = Get-GLDemoStore; $c = $s.Connections | Where-Object displayName -eq ''Customer 360''; $u = $s.Users[3]; ' +
     'Invoke-GLBulkGrant -Items @([pscustomobject]@{ Id = $c.id; Name = $c.displayName }) ' +
     '-Principals @([pscustomobject]@{ Id = $u.id; DisplayName = $u.displayName; Type = "User" }) -Role User -FabricToken demo-token -Progress @{ Cancel = $false }')
@@ -1855,6 +1892,7 @@ for ($i = 0; $i -lt 200 -and $script:Jobs.Count; $i++) { Start-Sleep -Millisecon
 $tested = @($script:State.ConnRows | Where-Object { $_.Status })
 $bad = @($tested | Where-Object Status -eq 'Failed')
 Assert ($tested.Count -eq 20 -and $bad.Count -ge 3) "Verify status from the window tests every gateway connection ($($tested.Count) of 20 tested, $($bad.Count) failed)"
+Assert ((@($script:State.ConnRows | Where-Object Name -eq 'Web API Sandbox'))[0].Status -eq 'Unverified') 'a connection made with Skip test connection: its OK is Unverified'
 foreach ($r in $script:State.ConnRows) { $r.Users = '' }
 Invoke-GLBulkUsersUi 6>$null
 for ($i = 0; $i -lt 200 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
@@ -1906,6 +1944,7 @@ foreach ($g in $cdw.Gateways) { if ($g.publicKey) { $script:State.PublicKeys[([s
 Invoke-GLBulkCredentialsUi 6>$null
 for ($i = 0; $i -lt 300 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
 $retested = @($sales | Where-Object { $_.Status -eq 'OK' })
+Assert ($logBox.Text -match 'Testing 1-3 of 3' -and $logBox.Text -match '    Sales DW: OK' -and $logBox.Text.IndexOf('    Sales DW: OK') -lt $logBox.Text.IndexOf('Tested after the credential update')) 'each test result is in the log as it comes, before the summary'
 Assert ($retested.Count -eq 3 -and $logBox.Text -match 'Tested after the credential update: 3 of 3 work' -and $pwBox.Password -eq '') "Test them afterwards: the 3 updated connections are tested at once and all 3 work - and the password box is emptied ($($retested.Count))"
 Set-Item -Path function:Confirm-GL -Value $keepConfirm
 $script:Settings = $keepSettings; $script:LogFolder = $keepLogDir; $script:SignedInAs = $keepWho

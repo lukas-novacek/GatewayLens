@@ -36,14 +36,19 @@ it publicly.
 - [ ] VNet tiles say *Not checked, so it is not woken up* - and a sleeping VNet
       gateway stays asleep.
 - [ ] Each tile counts its connections. Compare one cluster with the portal.
-- [ ] **Kiosk view** (F11) on a second screen; Esc leaves it.
+- [ ] **Gateway access:** select a tile - the access list shows names and emails, not ids.
+- [ ] **Text size** (Ctrl + mouse wheel): the tiles grow and shrink with the text.
+- [ ] **Kiosk view** (F11) on a second screen; Esc leaves it. Auto-refresh is back to
+      what it was afterwards.
 - [ ] **Connections tab:** gateway connections only; *Include cloud connections* adds
       the cloud ones.
 - [ ] Filters: *User* (a colleague), *Account* (a service account), *Search* (a server
-      name, then two separated by `;`).
+      name, then two separated by `;`). Type and delete quickly - the window keeps up,
+      and the log says what the list shows once you stop.
+- [ ] *Refresh connections* - while it loads, the change buttons are greyed out.
 - [ ] Recency: compare *LastUsed* on two or three connections with the portal.
 - [ ] **Show:** each view - *Last used over 90 days ago*, *No use recorded*,
-      *Duplicates*, *Failing tests* (after step 3).
+      *Duplicates*, *Skip test connection on*, *Failing tests* (after step 3).
 - [ ] **Export CSV**, and **Access report...** - with and without the User filter.
       Both open cleanly in Excel, accents included.
 
@@ -51,14 +56,18 @@ it publicly.
 
 Each test makes a gateway contact its data source, so start small.
 
-- [ ] Filter to five connections, **Verify status**. Failing ones say why.
-- [ ] **Verify users** on the same five - the Users column fills in.
+- [ ] Filter to five connections, **Verify status**. The log shows each one as it is
+      tested; failing ones say why. One with *SkipTest* on says *Unverified*.
+- [ ] **Verify users** on the same five - the Users column fills in with names, and
+      the log lists each connection with its users.
 
 ## 4. Changes - on the scratch connection only
 
 Search for `GatewayLens TEST`, so the list holds that one connection and nothing else.
 
-- [ ] **Grant** the colleague *User*, then **Remove** them. Check both in the portal.
+- [ ] **Grant** the colleague *User*, then **Remove** them. After each, the log reads
+      the connection again and the access panel shows the change. Check both in
+      the portal. Grant *User* twice - the second time says they already have it.
 - [ ] **Hand over access:** From = you, To = the colleague, **Copy access**. The
       colleague now has your role on it; you still have yours.
 - [ ] Then From = the colleague, To = you, **Move access**. The colleague is gone and
@@ -68,7 +77,8 @@ Search for `GatewayLens TEST`, so the list holds that one connection and nothing
 - [ ] Again with a wrong password - the log says it still fails, and *Show > Failing
       tests* lists it. Then put the right credentials back.
 - [ ] Only on the test cluster, with two or more members: **Disable** a member, then
-      **Enable** it again.
+      **Enable** it again. Only that cluster is read again. Select two members and
+      Disable - the confirmation names both, and warns if none would be left.
 - [ ] Last: **Delete all listed connections** with the scratch connection alone in the
       list. A backup CSV is written first, and the log names it.
 

@@ -62,12 +62,15 @@ time. GatewayLens does the same work in bulk, safely:
   every minute. The **Kiosk view** button, `-Kiosk` or F11; Esc leaves it.
 - **VNet gateways are never woken up.** A status check starts a VNet gateway that has
   gone to sleep, and it then uses capacity - so *Skip VNet status* is on by default.
-- Enable or disable members, with a warning before the last one. Copy a cluster as
-  tab-separated text for Excel or a ticket. Resolve member machines to IP addresses.
+- Enable or disable one member or several at once, with a warning before the last
+  one - only that cluster is read again. Copy a cluster as tab-separated text for
+  Excel or a ticket. Resolve member machines to IP addresses.
+- The tiles follow the text size, so a wall screen can fit all of them or show them large.
 
 ### Find any connection
 Filters you can combine, which the portal does not have:
-- **who has access** - one person, a group, anyone whose email contains a word
+- **who has access** - one person, a group, anyone whose name or email contains a
+  word. Fabric gives only object ids; GatewayLens shows the names, from Microsoft Graph
 - **the account stored in the credentials** - every connection that uses `svc_sales`
 - **the server, database or path** - several values at once: `sql01; sql02; ora-prd`
 - gateway, connectivity, type, and whether the connection's gateway is online
@@ -84,16 +87,20 @@ Everything acts on every listed connection - filter first, exclude what you want
 leave alone, then press one button:
 - **Update credentials** - Windows, Basic, Anonymous or Key - and **test them
   afterwards**, so you know at once which ones still fail.
-- **Grant** or **remove** access for any number of people and groups.
-- **Verify status** - the gateway's own reason for every failing connection.
-- **Verify users** - who has access to each one.
+- **Grant** or **remove** access for any number of people and groups. Someone who
+  already has the role is left alone, a lower role is raised, and the list is read
+  again afterwards, so it shows what really happened.
+- **Verify status** - the gateway's own reason for every failing connection, each one
+  in the log as it is tested. A connection with *Skip test connection* on is marked
+  **Unverified**: its test passes whatever the data source says.
+- **Verify users** - who has access to each one, by name, in the list and the log.
 - **Delete** - only after typing the count, and only after a backup is written.
 
 ### Hand over access
 For someone leaving, or a new owner of a team's connections. Name who hands over and
 who takes over. **Copy access** gives the successor exactly the same roles on every
-listed connection - and on every gateway, if you want - raising a lower role where
-they already have one. **Move access** does that, then removes the old roles - but
+listed connection - and, with *Gateway clusters too*, on every gateway cluster -
+raising a lower role where they already have one. **Move access** does that, then removes the old roles - but
 only where the successor has them by then, so nothing is ever left without an owner.
 
 ### Clean up before you hit the limit
@@ -105,6 +112,7 @@ ones to remove:
   Microsoft's connection recency *(preview in Fabric)*
 - **Duplicates** - the same gateway, type, path and account, side by side
 - **Failing tests** - after Verify status
+- **Skip test connection on** - connections whose test always passes
 
 Connection recency is also in the connections export and the access report: when
 each connection was created, last linked to an item, and last used at run time.
@@ -191,8 +199,10 @@ GatewayLens can change access and credentials on hundreds of connections, so it 
 built to make mistakes hard:
 - **Nothing changes until you press a button that says so** - and every one of them
   asks first, naming exactly what it will do and to how many items.
-- **One item at a time**, cancellable at any point, with a report of every item that
-  did not succeed and why.
+- **One item at a time**, cancellable at any point, with every item and its result
+  in the log - and the reason for each one that did not succeed.
+- **One thing at a time** - while a change or a reload runs, the buttons that would
+  clash with it wait.
 - **No record, no change** - every change is written to the change record as it
   happens, and is not made at all if the record cannot be written.
 - **Delete writes a backup first** - everything needed to recreate each connection
@@ -226,7 +236,7 @@ role on it - [docs/permissions.md](docs/permissions.md).
 | Sign-in | Microsoft Entra ID (OAuth 2.0) | Documented |
 | Gateways, members, connections, access, recency, delete | Fabric REST API | Documented (recency is in preview) |
 | Connection test, update credentials | Power BI REST API | Documented |
-| Name lookup when granting access | Microsoft Graph | Documented |
+| Names of who has access, name lookup when granting access | Microsoft Graph | Documented |
 | **Live member status** | Power BI v2 `gatewayClusters` | **Unofficial** |
 | **Usernames and access in one call** | Power BI v2 `gatewayClusterDatasources` | **Unofficial** |
 | Newest gateway version, supported releases | Microsoft Download Center and Learn pages | Public web pages - read once a session, no sign-in, nothing about your tenant is sent |
@@ -246,15 +256,16 @@ format byte for byte.
 
 ## Log, change record and look
 
-- The **log panel** filters by text or level, and copies or saves what it shows.
-  Everything in it, and every item of every bulk run, also goes to a daily log file,
-  kept for 30 days. The change record is kept for good.
+- The **log panel** says what happens as it happens: every item of a bulk run with
+  its result, how long each load took, what the list shows after a filter changes.
+  It filters by text or level, and copies or saves what it shows. Everything in it
+  also goes to a daily log file, kept for 30 days. The change record is kept for good.
 - Both live in `%LOCALAPPDATA%\GatewayLens\logs` - **Open folder** takes you there.
   With `-LogFolder \\server\share\gatewaylens` a whole team's records sit in one
   place; each person writes only to files with their own name in them.
 - **Themes**: Light, Dark, Midnight and Contrast. **Text size**: A- and A+, Ctrl + mouse
-  wheel, or Ctrl + plus and minus - Ctrl + 0 goes back to the default. Rows stay
-  compact and follow the text size, so more of a long list fits on the screen. The
+  wheel, or Ctrl + plus and minus - Ctrl + 0 goes back to the default. Rows and tiles
+  follow the text size, and rows stay compact, so more of a long list fits on the screen. The
   search and name boxes remember their last 20 entries; password boxes never do.
 
 ## Questions

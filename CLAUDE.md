@@ -91,7 +91,8 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
     and records each item with `Write-GLChange` as it happens.
 14. **Bulk runs act on every listed row**, never on the selection, one item at a
     time, and can be cancelled. Delete always writes a backup first and refuses
-    without one.
+    without one. The one exception: Enable and Disable act on the selected members
+    of one cluster - a handful, each named in the confirmation.
 15. **Demo mode must answer every endpoint the app calls.** A new API call needs a
     route in `Invoke-GLDemoHttp` and a demo test.
 16. **WPF events bubble.** `SelectionChanged` on the tab control also fires for every
@@ -111,8 +112,19 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
     leaves `$x` empty-handed - "nobody has access" turned into "could not be read".
     Assign inside the branch, or wrap the result again with `@()`.
 21. **Move access removes the old role only where the new principal has it** - never
-    leave a connection without its owner. Match principals by id, UPN or email,
-    never by display name.
+    leave a connection without its owner. Match principals by object id (or the UPN
+    or email an assignment carries, which the real API leaves out), never by display
+    name. Who hands over is turned into an object id first - through Graph, or given
+    as one.
+22. **Fabric role assignments carry only the principal's id and type** - no name, no
+    email. Names come from Graph (`Get-GLPrincipalNames`, getByIds), and the demo
+    answers the same way, so code that expects a name in an assignment fails in the
+    tests, not on a real tenant.
+23. **OnDone runs on the window's thread.** Work on thousands of rows belongs in the
+    job's Work block; filter boxes go through `Start-GLDebounce`, never straight to
+    a redraw on every keystroke.
+24. **A button that changes something or reloads a list goes into `Update-GLActions`**,
+    which switches it off while a change or a load runs.
 
 ## Versions and changes
 

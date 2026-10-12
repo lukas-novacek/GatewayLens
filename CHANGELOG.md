@@ -4,6 +4,64 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-10-12
+
+From the first run on a real tenant with thousands of connections.
+
+### Fixed
+- **Access lists showed object ids, not names.** Fabric's role assignments carry
+  only each principal's id and type. GatewayLens now asks Microsoft Graph for the
+  names - up to 1,000 in one call - and remembers them for the session. Gateway
+  access, connection access, the Users column, the User filter, the access report
+  and the delete backup show names and emails. If Graph refuses, the lists show the
+  ids, and the log says so once.
+- **The window froze for half a minute** when a filter was typed in or cleared:
+  every keystroke filtered and redrew thousands of rows. The filter boxes now wait
+  until typing stops, and the connection rows are made in the background, not on
+  the window's thread.
+- **Auto-refresh stayed on after the kiosk view**, and redrew the connections every
+  minute. Leaving the kiosk view now sets auto-refresh back to what it was. It is
+  off by default.
+- **Disabling one member read every gateway cluster again.** Now only that cluster
+  is read again, and the connections are redrawn only if a gateway's state changed.
+- **Granting access looked as if it did not work**: the access panel was not read
+  again, and showed ids. After every grant, removal or handover, the connections
+  concerned are read again, and the panel shows the result.
+- While the connections were loading, the old list could still be changed - and
+  then the window froze. While a change or a load runs, the buttons that would clash
+  with it now wait. Looking, filtering and copying stay open.
+
+### Added
+- **Several members at once**: select them, then Enable or Disable. The
+  confirmation names each one, and warns before the last enabled member of a
+  cluster is disabled.
+- **SkipTest column**, and *Show > Skip test connection on*. Verify status marks
+  such a connection **Unverified** instead of OK: with the flag on, a test says
+  nothing about it.
+- **Verify status reports as it goes**: each connection and its outcome go to the
+  log while the run is still testing, ten at a time.
+- **Verify users logs every connection with its users**, by name - or why it could
+  not be read.
+- **Grant access looks first**: someone who already has the role, or a higher one,
+  is left alone, and a lower role is raised.
+- **The tiles follow the text size** - A-, A+ and Ctrl + mouse wheel make them
+  smaller or larger, text and all.
+- **A fuller log**: every item of a bulk run, not only the failures (the first
+  1,000 in the panel, all of them in the file); how long each load and run took;
+  what each load reads; what the list shows after a filter changes; each automatic
+  refresh; theme changes.
+- Self-test: **Graph: names in access lists** checks that names can be read.
+
+### Changed
+- *Gateways too* in Hand over access is now **Gateway clusters too**, and off by
+  default.
+- Hand over access needs the object id of who hands over when Microsoft Graph is
+  not available, or when their account has been deleted - the access lists show it.
+  A name is never guessed.
+- The built-in app registration also asks for `Directory.Read.All` (delegated), for
+  the names in access lists.
+- The demo answers like a real tenant: its role assignments carry only ids.
+
 ## [0.6.1] - 2026-10-12
 
 ### Fixed

@@ -130,7 +130,7 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.6.1'
+$script:AppVersion = '0.7.0'
 
 $script:GatewayRoles    = @('Admin', 'ConnectionCreator', 'ConnectionCreatorWithResharing')
 $script:ConnectionRoles = @('Owner', 'User', 'UserWithReshare')
@@ -385,12 +385,15 @@ function Get-GLLiveStatus {
         [Parameter(Mandatory)][string]$PbiToken,
         [int]$TimeoutSec = 30,
         [int]$MaxClusters = 0,
-        [string[]]$SkipClusterIds = @()
+        [string[]]$SkipClusterIds = @(),
+        [string[]]$OnlyClusterIds = @()        # after a change to one cluster: just that one
     )
     $skip     = @($SkipClusterIds | ForEach-Object { ([string]$_).ToLowerInvariant() })
+    $only     = @($OnlyClusterIds | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() })
     $base     = 'https://api.powerbi.com/v2.0/myorg/me/gatewayClusters'
     $r        = Invoke-GLRequest -Uri $base -Token $PbiToken
     $clusters = @($r.value | Where-Object { $_ -and $skip -notcontains ([string]$_.id).ToLowerInvariant() })
+    if ($only.Count) { $clusters = @($clusters | Where-Object { $only -contains ([string]$_.id).ToLowerInvariant() }) }
     if ($MaxClusters -gt 0) { $clusters = @($clusters | Select-Object -First $MaxClusters) }
 
     $members = foreach ($c in $clusters) {
@@ -785,6 +788,30 @@ function Get-GLGatewayCounts {
     }
 }
 
+function ConvertTo-GLTestOutcome {
+    <#
+        One connection's test result as the Status column and the log show it. With
+        "Skip test connection" on, the gateway may answer OK without trying the data
+        source at all - so an OK there is Unverified, not OK.
+    #>
+    param($Result, [bool]$SkipTest, [string]$Name)
+    $status = [string]$Result.Status
+    $detail = [string]$Result.Detail
+    if ($status -eq 'OK' -and $SkipTest) {
+        $status = 'Unverified'
+        $detail = 'Skip test connection is on - the gateway may answer OK without trying the data source'
+    }
+    $level = @{ OK = 'Info'; Failed = 'Error'; Timeout = 'Warn'; Unverified = 'Warn' }[$status]
+    if (-not $level) { $level = 'Warn' }
+    $said = switch ($status) {
+        'OK'         { 'OK' }
+        'Timeout'    { 'did not answer in time' }
+        'Unverified' { "OK, but not verified - $detail" }
+        default      { "failed - $detail" }
+    }
+    return [pscustomobject]@{ Status = $status; Detail = $detail; Level = $level; Text = "    ${Name}: $said" }
+}
+
 function Get-GLConnectionCounts {
     <#
         Connections per gateway, against the 1,000 data sources Microsoft allows on
@@ -858,7 +885,7 @@ function ConvertTo-GLAccessReportRows {
         way the User filter does: part of the name, email, UPN or object id.
         A target whose access could not be read gets one row that says so.
     #>
-    param($Targets, [hashtable]$Assignments, [string]$Who)
+    param($Targets, [hashtable]$Assignments, [string]$Who, [hashtable]$Names)
     $w  = if ($Who) { $Who.Trim() } else { '' }
     $ic = [System.StringComparison]::OrdinalIgnoreCase
     $rows = [System.Collections.Generic.List[object]]::new()
@@ -880,9 +907,9 @@ function ConvertTo-GLAccessReportRows {
         }
         foreach ($as in $ras) {
             $p = $as.principal
-            $email = @($p.userDetails.userPrincipalName, $p.groupDetails.email) | Where-Object { $_ } | Select-Object -First 1
-            if ($w -and ("$($p.displayName)|$email|$($p.id)").IndexOf($w, $ic) -lt 0) { continue }
-            $rows.Add((& $row $t $p.displayName $email $p.type $as.role $p.id))
+            $label = Get-GLPrincipalLabel -Principal $p -Names $Names
+            if ($w -and ("$($label.Name)|$($label.Email)|$($p.id)").IndexOf($w, $ic) -lt 0) { continue }
+            $rows.Add((& $row $t $label.Name $label.Email $p.type $as.role $p.id))
         }
     }
     return , $rows.ToArray()
@@ -910,6 +937,21 @@ function ConvertTo-GLClipboardText {
         $lines.Add((@($Columns | ForEach-Object { $pr = $r.PSObject.Properties[[string]$_.Property]; & $clean $(if ($pr) { $pr.Value }) }) -join "`t"))
     }
     return ($lines.ToArray() -join "`r`n")
+}
+
+function Get-GLMemberPlan {
+    <#
+        Enabling or disabling the selected members of one cluster: the ones that
+        would change, how many are already as asked, and how many members of the
+        cluster are enabled afterwards - none left means no refreshes at all.
+    #>
+    param($Members, $Selected, [bool]$Enabled)
+    $sel    = @($Selected | Where-Object { $_ })
+    $change = @($sel | Where-Object { [bool]$_.Enabled -ne $Enabled })
+    $ids    = @($change | ForEach-Object { [string]$_.Id })
+    $on     = @($Members | Where-Object { $_ -and $_.enabled })
+    $after  = if ($Enabled) { $on.Count + $change.Count } else { @($on | Where-Object { $ids -notcontains [string]$_.id }).Count }
+    return [pscustomobject]@{ Change = $change; Already = $sel.Count - $change.Count; EnabledAfter = $after }
 }
 
 function Get-GLGatewayNameMap {
@@ -970,12 +1012,14 @@ function ConvertTo-GLConnectionRows {
             Path         = [string]$c.connectionDetails.path
             Account      = ''
             Users        = ''
+            UserNames    = ''
             Status       = ''
             StatusDetail = ''
             Credential   = [string]$c.credentialDetails.credentialType
             SingleSignOn = [string]$c.credentialDetails.singleSignOnType
             Privacy      = [string]$c.privacyLevel
             Encryption   = [string]$c.credentialDetails.connectionEncryption
+            SkipTest     = [bool]$c.credentialDetails.skipTestConnection
             Created      = & $fmt $created
             LastLinked   = & $fmt $linked
             LastUsed     = & $fmt $used
@@ -1001,44 +1045,90 @@ function Set-GLRoleAssignment {
     $null = Invoke-GLRequest -Method PATCH -Uri "https://api.fabric.microsoft.com/v1/$Kind/$Id/roleAssignments/$AssignmentId" -Token $FabricToken -Body @{ role = $Role }
 }
 
+function Get-GLPrincipalNames {
+    <#
+        Names for object ids, from Microsoft Graph - Fabric's role assignments carry
+        only each principal's id and type. One call answers up to 1,000 ids.
+        Returns a hashtable keyed by lower-case id: Name, and Email (the UPN or mail,
+        or an app id). Ids in -Known are not asked again. An id Graph does not know -
+        an account that is deleted - is left out, and callers show the id instead.
+        Throws if Graph refuses: callers carry on without names.
+    #>
+    param([string[]]$Ids, [string]$GraphToken, [hashtable]$Known = @{})
+    $out  = @{}
+    $want = @($Ids | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Sort-Object -Unique |
+              Where-Object { -not $Known.ContainsKey($_) })
+    if (-not $GraphToken -or $want.Count -eq 0) { return $out }
+    for ($i = 0; $i -lt $want.Count; $i += 1000) {
+        $chunk = @($want[$i..([Math]::Min($i + 1000, $want.Count) - 1)])
+        $r = Invoke-GLRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/directoryObjects/getByIds' -Token $GraphToken `
+                -Body @{ ids = $chunk; types = @('user', 'group', 'servicePrincipal') } -MaxRetry 2
+        foreach ($o in @($r.value)) {
+            if (-not $o -or -not $o.id) { continue }
+            $mail = @($o.userPrincipalName, $o.mail) | Where-Object { $_ } | Select-Object -First 1
+            if (-not $mail -and $o.appId) { $mail = "app $($o.appId)" }
+            $out[([string]$o.id).ToLowerInvariant()] = [pscustomobject]@{ Name = [string]$o.displayName; Email = [string]$mail }
+        }
+    }
+    return $out
+}
+
 function Resolve-GLHandoverFrom {
     <#
-        The principal handing over. Matched in role assignments by object id, or by
-        the UPN or email the assignments carry - so someone whose account is already
-        gone from Microsoft Entra ID can still be handed over by their email.
+        The principal handing over, as an object id: role assignments carry only the
+        id, so an email or a name is looked up in Microsoft Graph first. Someone
+        whose account is already deleted is not in Graph any more - their object id,
+        which the access lists show, still works.
     #>
     param([Parameter(Mandatory)][string]$Value, [string]$GraphToken)
     $v = $Value.Trim()
     if (Test-GLGuid $v) { return [pscustomobject]@{ Id = $v; DisplayName = $v; Names = @() } }
-    $id = ''; $display = $v
-    if ($GraphToken) {
-        foreach ($kind in 'User', 'Group') {
-            try {
-                $p = Resolve-GLPrincipal -Value $v -Type $kind -GraphToken $GraphToken
-                $id = [string]$p.Id; $display = [string]$p.DisplayName
-                break
-            } catch { }
-        }
+    if (-not $GraphToken) { throw "Looking up '$v' needs Microsoft Graph, which is not available. Use their object id - the access lists show it." }
+    foreach ($kind in 'User', 'Group') {
+        try {
+            $p = Resolve-GLPrincipal -Value $v -Type $kind -GraphToken $GraphToken
+            return [pscustomobject]@{ Id = [string]$p.Id; DisplayName = [string]$p.DisplayName; Names = @($v) }
+        } catch { }
     }
-    if (-not $id -and $v -notmatch '@') {
-        # matching falls back to the email the roles carry - a name alone matches nothing
-        throw "'$v' was not found. Use their email, or their object id."
+    throw "'$v' was not found in Microsoft Entra ID. If the account has been deleted, use its object id - the access lists show it."
+}
+
+function Get-GLPrincipalLabel {
+    <#
+        How a principal is shown: its name and email from -Names (Graph), else what
+        the assignment carries, else the object id. Key is what lists and filters
+        use: the email, else the name, else the id.
+    #>
+    param($Principal, [hashtable]$Names)
+    $id = ([string]$Principal.id).ToLowerInvariant()
+    $n  = if ($Names -and $id -and $Names.ContainsKey($id)) { $Names[$id] } else { $null }
+    $app = if ($Principal.servicePrincipalDetails.aadAppId) { "app $($Principal.servicePrincipalDetails.aadAppId)" } else { '' }
+    $name  = @($n.Name, $Principal.displayName) | Where-Object { $_ } | Select-Object -First 1
+    $email = @($n.Email, $Principal.userDetails.userPrincipalName, $Principal.groupDetails.email, $app) | Where-Object { $_ } | Select-Object -First 1
+    return [pscustomobject]@{
+        Name  = $(if ($name) { [string]$name } else { [string]$Principal.id })
+        Email = [string]$email
+        Key   = $(if ($email) { [string]$email } elseif ($name) { [string]$name } else { [string]$Principal.id })
     }
-    return [pscustomobject]@{ Id = $id; DisplayName = $display; Names = @($v) }
+}
+
+function Format-GLAccessList {
+    # One line for the log: who has access, each with the role.
+    param($Rows)
+    $all = @($Rows | Where-Object { $_ })
+    if ($all.Count -eq 0) { return 'nobody' }
+    return (@($all | ForEach-Object { "$(if ($_.Detail) { $_.Detail } else { $_.Principal }) ($($_.Role))" }) -join ', ')
 }
 
 function ConvertTo-GLRoleRows {
-    param($Assignments)
+    param($Assignments, [hashtable]$Names)
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($a in $Assignments) {
         $p = $a.principal
-        $detail = ''
-        if     ($p.userDetails.userPrincipalName)      { $detail = [string]$p.userDetails.userPrincipalName }
-        elseif ($p.groupDetails.email)                 { $detail = [string]$p.groupDetails.email }
-        elseif ($p.servicePrincipalDetails.aadAppId)   { $detail = "app $($p.servicePrincipalDetails.aadAppId)" }
+        $label = Get-GLPrincipalLabel -Principal $p -Names $Names
         $rows.Add([pscustomobject]@{
-            Principal   = if ($p.displayName) { [string]$p.displayName } else { [string]$p.id }
-            Detail      = $detail
+            Principal   = $label.Name
+            Detail      = $label.Email
             Type        = [string]$p.type
             Role        = [string]$a.role
             Id          = [string]$a.id
@@ -1063,6 +1153,7 @@ function Select-GLConnections {
                           'Duplicates'                 same gateway, type, path and account as
                                                        another - listed side by side
                           'Failing tests'              failed or did not answer in Verify status
+                          'Skip test connection on'    a test of these may say OK without trying
     #>
     param($Rows, [string]$Text, [string]$Gateway, [string]$Connectivity, [string]$Type,
           [string]$User, [string]$Account, [string[]]$States, $Excluded,
@@ -1105,6 +1196,7 @@ function Select-GLConnections {
         if ($Show -eq 'No use recorded' -and $r.LastUsed) { continue }
         if ($seen -and $seen[(& $dupKey $r)] -lt 2) { continue }
         if ($Show -eq 'Failing tests' -and $r.Status -notin 'Failed', 'Timeout') { continue }
+        if ($Show -eq 'Skip test connection on' -and -not $r.SkipTest) { continue }
         $r
     }
     if ($seen) { $out = @($out | Sort-Object { & $dupKey $_ }, Name) }
@@ -1129,24 +1221,24 @@ function Add-GLDirectoryInfo {
     foreach ($r in $Rows) {
         $d = $Directory[([string]$r.Id).ToLowerInvariant()]
         if (-not $d) { continue }
-        $r.Account  = [string]$d.Account
-        $r.UserList = @($d.Users | ForEach-Object { [string]$_.Principal } | Where-Object { $_ })
-        $r.Users    = [string]$r.UserList.Count
+        $r.Account   = [string]$d.Account
+        $r.UserList  = @($d.Users | ForEach-Object { [string]$_.Principal } | Where-Object { $_ })
+        $r.Users     = [string]$r.UserList.Count
+        $r | Add-Member -NotePropertyName UserNames -NotePropertyValue ($r.UserList -join '; ') -Force    # rows made elsewhere may not have it
     }
 }
 
 function Set-GLRowUsers {
-    # Users from Fabric role assignments (Verify users). $Assignments: id -> list, or $null on failure.
-    param($Rows, [hashtable]$Assignments)
+    # Users from Fabric role assignments (Verify users), named through -Names.
+    # $Assignments: id -> list, or $null when it could not be read.
+    param($Rows, [hashtable]$Assignments, [hashtable]$Names)
     foreach ($r in $Rows) {
         if (-not $Assignments.ContainsKey([string]$r.Id)) { continue }
         $list = $Assignments[[string]$r.Id]
         if ($null -eq $list) { $r.Users = 'error'; continue }
-        $r.UserList = @($list | ForEach-Object {
-            $p = $_.principal
-            @($p.userDetails.userPrincipalName, $p.groupDetails.email, $p.displayName, $p.id) | Where-Object { $_ } | Select-Object -First 1
-        } | Where-Object { $_ })
-        $r.Users = [string]$r.UserList.Count
+        $r.UserList  = @($list | ForEach-Object { (Get-GLPrincipalLabel -Principal $_.principal -Names $Names).Key } | Where-Object { $_ })
+        $r.Users     = [string]$r.UserList.Count
+        $r | Add-Member -NotePropertyName UserNames -NotePropertyValue ($r.UserList -join '; ') -Force    # rows made elsewhere may not have it
     }
 }
 
@@ -1406,7 +1498,7 @@ function Get-GLRoleAssignmentsBulk {
     # Who has access to many connections - or gateways - one documented Fabric call
     # each, in parallel. A target that could not be read maps to $null.
     param([Parameter(Mandatory)][string[]]$Ids, [Parameter(Mandatory)][string]$FabricToken,
-          [ValidateSet('gateways', 'connections')][string]$Kind = 'connections')
+          [ValidateSet('gateways', 'connections')][string]$Kind = 'connections', [hashtable]$Errors)
     $map = @{}
     foreach ($id in $Ids) { $map["https://api.fabric.microsoft.com/v1/$Kind/$id/roleAssignments"] = $id }
     $out = @{}
@@ -1416,7 +1508,13 @@ function Get-GLRoleAssignmentsBulk {
         $r = $res[$u]
         # assigned directly: an empty list that comes out of an if-statement becomes
         # $null, and "nobody has access" would read as "could not be read"
-        if ($r -and $r.Ok -and $r.Body) { $out[$map[$u]] = @($r.Body.value) } else { $out[$map[$u]] = $null }
+        if ($r -and $r.Ok -and $r.Body) { $out[$map[$u]] = @($r.Body.value) }
+        else {
+            $out[$map[$u]] = $null
+            if ($null -ne $Errors) {
+                $Errors[$map[$u]] = if (-not $r) { 'no answer' } elseif ($r.Body) { "HTTP $($r.Status): $(ConvertFrom-GLApiError $r.Body)" } else { [string]$r.Error }
+            }
+        }
     }
     return $out
 }
@@ -1641,17 +1739,34 @@ function Invoke-GLBulkGrant {
     )
     $Progress.Total = @($Items).Count * @($Principals).Count
     $Progress.Done  = 0
-    $out = [System.Collections.Generic.List[object]]::new()
+    $out  = [System.Collections.Generic.List[object]]::new()
+    $rank = @{ User = 1; UserWithReshare = 2; Owner = 3 }
     foreach ($it in $Items) {
+        # who has access now: a role they already have is not given again, a lower one is raised
+        $now = $null
+        try { $now = Get-GLRoleAssignments -Kind connections -Id $it.Id -FabricToken $FabricToken } catch { }
         foreach ($p in $Principals) {
             if ($Progress.Cancel) { return , $out.ToArray() }
             $rec = @{ Audit = $Audit; Action = 'Grant access'; TargetType = 'Connection'; Target = $it.Name; TargetId = $it.Id
                       Gateway = $it.Gateway; GatewayId = $it.GatewayId; Principal = $p.DisplayName; PrincipalId = $p.Id
                       PrincipalType = $p.Type; Role = $Role }
+            $has = @($now | Where-Object { $_ -and ([string]$_.principal.id) -ieq [string]$p.Id }) | Select-Object -First 1
             try {
-                $null = Add-GLRoleAssignment -Kind connections -Id $it.Id -PrincipalId $p.Id -PrincipalType $p.Type -Role $Role -FabricToken $FabricToken
-                Write-GLChange @rec -Result Done
-                $out.Add((New-GLResult $it.Name $it.Id $true "granted $Role to $($p.DisplayName)"))
+                if ($has -and [int]$rank[[string]$has.role] -ge [int]$rank[$Role]) {
+                    Write-GLChange @rec -Result NoChange -Message "already had access as $($has.role)"
+                    $out.Add((New-GLResult $it.Name $it.Id $true "$($p.DisplayName) already has $($has.role)"))
+                }
+                elseif ($has) {
+                    Set-GLRoleAssignment -Kind connections -Id $it.Id -AssignmentId $has.id -Role $Role -FabricToken $FabricToken
+                    $rec.Action = 'Change role'; $rec.Details = "From $($has.role) to $Role"
+                    Write-GLChange @rec -Result Done
+                    $out.Add((New-GLResult $it.Name $it.Id $true "raised $($p.DisplayName) from $($has.role) to $Role"))
+                }
+                else {
+                    $null = Add-GLRoleAssignment -Kind connections -Id $it.Id -PrincipalId $p.Id -PrincipalType $p.Type -Role $Role -FabricToken $FabricToken
+                    Write-GLChange @rec -Result Done
+                    $out.Add((New-GLResult $it.Name $it.Id $true "granted $Role to $($p.DisplayName)"))
+                }
             }
             catch {
                 $m = $_.Exception.Message
@@ -1695,7 +1810,8 @@ function Invoke-GLBulkRevoke {
                 $out.Add((New-GLResult $it.Name $it.Id $true 'none of them had access'))
             }
             foreach ($h in $hits) {
-                $who = if ($h.principal.displayName) { $h.principal.displayName } else { $h.principal.id }
+                $given = @($Principals | Where-Object { ([string]$_.Id) -ieq [string]$h.principal.id }) | Select-Object -First 1
+                $who = if ($given.DisplayName) { $given.DisplayName } elseif ($h.principal.displayName) { $h.principal.displayName } else { $h.principal.id }
                 $rec = $base + @{ Principal = $who; PrincipalId = [string]$h.principal.id; PrincipalType = [string]$h.principal.type; Role = [string]$h.role }
                 try {
                     Remove-GLRoleAssignment -Kind connections -Id $it.Id -AssignmentId $h.id -FabricToken $FabricToken
@@ -1711,6 +1827,39 @@ function Invoke-GLBulkRevoke {
         catch {
             Write-GLChange @base -Result Failed -Message $_.Exception.Message
             $out.Add((New-GLResult $it.Name $it.Id $false $_.Exception.Message))
+        }
+        $Progress.Done++
+    }
+    return , $out.ToArray()
+}
+
+function Invoke-GLBulkMembers {
+    # Enables or disables gateway members one at a time, each recorded as it happens.
+    param(
+        [Parameter(Mandatory)]$Gateway,        # Id, Name
+        [Parameter(Mandatory)]$Members,        # Id, Member, Machine
+        [Parameter(Mandatory)][bool]$Enabled,
+        [Parameter(Mandatory)][string]$FabricToken,
+        [Parameter(Mandatory)][hashtable]$Progress,
+        $Audit
+    )
+    $verb = if ($Enabled) { 'Enable' } else { 'Disable' }
+    $list = @($Members)
+    $Progress.Total = $list.Count
+    $Progress.Done  = 0
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($m in $list) {
+        if ($Progress.Cancel) { return , $out.ToArray() }
+        $rec = @{ Audit = $Audit; Action = "$verb member"; TargetType = 'Gateway member'; Target = [string]$m.Member; TargetId = [string]$m.Id
+                  Gateway = [string]$Gateway.Name; GatewayId = [string]$Gateway.Id; Details = "Machine=$($m.Machine)" }
+        try {
+            Set-GLMemberEnabled -GatewayId $Gateway.Id -MemberId $m.Id -Enabled $Enabled -FabricToken $FabricToken
+            Write-GLChange @rec -Result Done
+            $out.Add((New-GLResult $m.Member $m.Id $true "$($verb.ToLower())d"))
+        }
+        catch {
+            Write-GLChange @rec -Result Failed -Message $_.Exception.Message
+            $out.Add((New-GLResult $m.Member $m.Id $false $_.Exception.Message))
         }
         $Progress.Done++
     }
@@ -1838,7 +1987,8 @@ function Invoke-GLAccessHandover {
 
 function Get-GLAccessReport {
     # Who has access to every target, read 25 at a time in parallel, as report rows.
-    param([Parameter(Mandatory)]$Targets, [string]$Who, [Parameter(Mandatory)][string]$FabricToken, [Parameter(Mandatory)][hashtable]$Progress)
+    param([Parameter(Mandatory)]$Targets, [string]$Who, [Parameter(Mandatory)][string]$FabricToken, [Parameter(Mandatory)][hashtable]$Progress,
+          [string]$GraphToken, [hashtable]$Known = @{})
     $list = @($Targets)
     $Progress.Total = $list.Count
     $Progress.Done  = 0
@@ -1855,7 +2005,9 @@ function Get-GLAccessReport {
         }
         $Progress.Done = [Math]::Min($c + 25, $list.Count)
     }
-    $rows = ConvertTo-GLAccessReportRows -Targets $list -Assignments $read -Who $Who
+    $names = @{} + $Known
+    try { $names += Get-GLPrincipalNames -Ids @($read.Values | Where-Object { $_ } | ForEach-Object { $_ } | ForEach-Object { [string]$_.principal.id }) -GraphToken $GraphToken -Known $Known } catch { }
+    $rows = ConvertTo-GLAccessReportRows -Targets $list -Assignments $read -Who $Who -Names $names
     return , $rows
 }
 
@@ -1918,7 +2070,8 @@ function Backup-GLConnections {
         [Parameter(Mandatory)]$Items,
         [hashtable]$Raw = @{},            # id -> the connection object from the API
         [hashtable]$Assignments = @{},    # id -> role assignments, or $null
-        [Parameter(Mandatory)][string]$Path
+        [Parameter(Mandatory)][string]$Path,
+        [hashtable]$Names = @{}           # principal id -> Name, Email (Graph)
     )
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop }
@@ -1929,8 +2082,8 @@ function Backup-GLConnections {
                   else {
                       (@($ras | ForEach-Object {
                           $pr  = $_.principal
-                          $who = @($pr.userDetails.userPrincipalName, $pr.groupDetails.email, $pr.displayName, $pr.id) | Where-Object { $_ } | Select-Object -First 1
-                          "$who ($($pr.type), $($_.role))"
+                          $who = (Get-GLPrincipalLabel -Principal $pr -Names $Names).Key
+                          "$who ($($pr.type), $($_.role)) [$($pr.id)]"
                       }) -join '; ')
                   }
         $json = if ($Raw.ContainsKey($id)) { $Raw[$id] | ConvertTo-Json -Depth 10 -Compress } else { '' }
@@ -2421,7 +2574,8 @@ function New-GLDemoStore {
             connectionDetails = [pscustomobject]@{ type = $d[2]; path = $d[3] }
             privacyLevel = $(if ($d[0] -like 'HR*' -or $d[0] -like 'Finance*') { 'Private' } else { 'Organizational' })
             credentialDetails = [pscustomobject]@{ credentialType = $d[4]; singleSignOnType = 'None'
-                connectionEncryption = $(if ($d[2] -in 'SQL', 'PostgreSql') { 'Encrypted' } elseif ($d[2] -eq 'Oracle') { 'Any' } else { 'NotEncrypted' }); skipTestConnection = $false }
+                connectionEncryption = $(if ($d[2] -in 'SQL', 'PostgreSql') { 'Encrypted' } elseif ($d[2] -eq 'Oracle') { 'Any' } else { 'NotEncrypted' })
+                skipTestConnection = ($d[0] -eq 'Web API Sandbox') }
             connectionRecency = [pscustomobject]@{ createdDateTime = (& $iso $made); lastBoundDateTime = (& $iso $made.AddDays(2))
                 lastCredentialUsedDateTime = (& $iso $used) }
         })
@@ -2559,12 +2713,14 @@ function Invoke-GLDemoHttp {
                     $key = "$($Matches[1])/$($Matches[2])"; $rid = $Matches[3]
                     if (-not $s.Roles.ContainsKey($key)) { $s.Roles[$key] = [System.Collections.Generic.List[object]]::new() }
                     $list = $s.Roles[$key]
-                    if ($M -eq 'GET') { return New-GLDemoReply 200 ([pscustomobject]@{ value = @($list) }) }
+                    # as a real tenant answers: each principal's id and type, no name - names come from Graph
+                    $bare = { param($A) [pscustomobject]@{ id = $A.id; role = $A.role; principal = [pscustomobject]@{ id = $A.principal.id; type = $A.principal.type } } }
+                    if ($M -eq 'GET') { return New-GLDemoReply 200 ([pscustomobject]@{ value = @($list | ForEach-Object { & $bare $_ }) }) }
                     if ($M -eq 'POST') {
                         $p = Get-GLDemoPrincipal $s ([string]$Body.principal.id)
                         if (-not $p) { return New-GLDemoFabricError 400 'PrincipalNotFound' 'The principal could not be found in the directory.' }
                         if ($list | Where-Object { $_.principal.id -eq $p.id }) { return New-GLDemoFabricError 409 'PrincipalAlreadyHasRole' 'The principal already has a role on this item.' }
-                        return [pscustomobject]@{ Status = 201; Body = (Add-GLDemoRole $s $key $p ([string]$Body.role)) }
+                        return [pscustomobject]@{ Status = 201; Body = (& $bare (Add-GLDemoRole $s $key $p ([string]$Body.role))) }
                     }
                     if ($M -eq 'PATCH') {
                         $a = $list | Where-Object id -eq $rid | Select-Object -First 1
@@ -2682,6 +2838,17 @@ function Invoke-GLDemoHttp {
             # -------------------------------------------------------------- Graph
             'graph\.microsoft\.com' {
                 $notFound = New-GLDemoReply 404 ([pscustomobject]@{ error = [pscustomobject]@{ code = 'Request_ResourceNotFound'; message = 'The object does not exist.' } })
+                if ($M -eq 'POST' -and $path -eq '/v1.0/directoryObjects/getByIds') {
+                    $found = foreach ($id in @($Body.ids)) {
+                        $u = $s.Users | Where-Object id -eq $id | Select-Object -First 1
+                        if ($u) { [pscustomobject]@{ '@odata.type' = '#microsoft.graph.user'; id = $u.id; displayName = $u.displayName; userPrincipalName = $u.userPrincipalName; mail = $u.mail }; continue }
+                        $g = $s.Groups | Where-Object id -eq $id | Select-Object -First 1
+                        if ($g) { [pscustomobject]@{ '@odata.type' = '#microsoft.graph.group'; id = $g.id; displayName = $g.displayName; mail = $g.mail }; continue }
+                        $a = $s.Sps | Where-Object id -eq $id | Select-Object -First 1
+                        if ($a) { [pscustomobject]@{ '@odata.type' = '#microsoft.graph.servicePrincipal'; id = $a.id; displayName = $a.displayName; appId = $a.appId } }
+                    }
+                    return New-GLDemoReply 200 ([pscustomobject]@{ value = @($found) })
+                }
                 if ($M -eq 'GET' -and $path -eq '/v1.0/me') {
                     $me = $s.Users | Where-Object userPrincipalName -eq $s.Me | Select-Object -First 1
                     return New-GLDemoReply 200 ([pscustomobject]@{ id = $me.id; userPrincipalName = $me.userPrincipalName })
@@ -2717,12 +2884,14 @@ $script:WorkerFunctions = @(
     'Invoke-GLParallelGet', 'Get-GLLiveStatus', 'Get-GLGatewayData', 'Get-GLConnectionData', 'Get-GLRoleAssignments',
     'New-GLRoleAssignmentBody', 'Add-GLRoleAssignment', 'Remove-GLRoleAssignment', 'Set-GLRoleAssignment',
     'Test-GLPrincipalMatch', 'Get-GLHandoverStep', 'Resolve-GLHandoverFrom', 'Invoke-GLAccessHandover',
+    'Get-GLPrincipalNames', 'Get-GLPrincipalLabel', 'ConvertTo-GLRoleRows', 'ConvertTo-GLTestOutcome',
     'ConvertTo-GLAccessReportRows', 'Get-GLAccessReport',
     'Resolve-GLPrincipal', 'Test-GLConnection',
     'ConvertTo-GLCredentialJson', 'ConvertTo-GLEncryptedCredential', 'New-GLCredentialDetails',
-    'Set-GLConnectionCredential',
+    'Set-GLConnectionCredential', 'Invoke-GLBulkMembers',
     'Remove-GLConnection', 'Set-GLMemberEnabled', 'Test-GLConnectionsBulk', 'Get-GLRoleAssignmentsBulk',
-    'Get-GLDatasourceDirectory', 'Resolve-GLHostAddress', 'ConvertFrom-GLDownloadPage', 'ConvertFrom-GLReleasePage', 'Get-GLGatewayReleases', 'Split-GLList', 'ConvertTo-GLEncryptionSetting',
+    'Get-GLDatasourceDirectory', 'Resolve-GLHostAddress', 'ConvertTo-GLConnectionRows', 'ConvertTo-GLLocalTime',
+    'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'ConvertFrom-GLDownloadPage', 'ConvertFrom-GLReleasePage', 'Get-GLGatewayReleases', 'Split-GLList', 'ConvertTo-GLEncryptionSetting',
     'New-GLResult', 'Invoke-GLBulkGrant', 'Invoke-GLBulkRevoke', 'Invoke-GLBulkCredentials',
     'Backup-GLConnections', 'Invoke-GLBulkDelete',
     'Get-GLSafeName', 'Get-GLChangePath', 'Write-GLChange', 'Read-GLChanges',
@@ -3223,6 +3392,7 @@ function Invoke-GLSelfTest {
     Add-Result 'Token: Microsoft Graph' ([bool]$gr) $(if ($gr) { 'issued' } else { 'not available - name lookups need an object id' })
 
     $gateways = @(); $connections = @()
+    $who = [System.Collections.Generic.List[string]]::new()      # ids in the access lists, for the Graph check
     if ($fab) {
         try {
             $gateways = Get-GLPaged -Uri 'https://api.fabric.microsoft.com/v1/gateways' -Token $fab
@@ -3244,6 +3414,7 @@ function Invoke-GLSelfTest {
             } catch { Add-Result 'Fabric: gateway members' $false $_.Exception.Message }
             try {
                 $ra = Get-GLRoleAssignments -Kind gateways -Id $onprem.id -FabricToken $fab
+                foreach ($a in @($ra)) { if ($a.principal.id) { $who.Add([string]$a.principal.id) } }
                 Add-Result 'Fabric: gateway access' $true "$($ra.Count) assignment(s)"
             } catch { Add-Result 'Fabric: gateway access' $false $_.Exception.Message }
         } else {
@@ -3259,6 +3430,7 @@ function Invoke-GLSelfTest {
         if ($c1) {
             try {
                 $ra = Get-GLRoleAssignments -Kind connections -Id $c1.id -FabricToken $fab
+                foreach ($a in @($ra)) { if ($a.principal.id) { $who.Add([string]$a.principal.id) } }
                 Add-Result 'Fabric: connection access' $true "$($ra.Count) assignment(s) on '$($c1.displayName)'"
             } catch { Add-Result 'Fabric: connection access' $false $_.Exception.Message }
         }
@@ -3298,6 +3470,14 @@ function Invoke-GLSelfTest {
             $me = Invoke-GLRequest -Uri 'https://graph.microsoft.com/v1.0/me?$select=id,userPrincipalName' -Token $gr -MaxRetry 1
             Add-Result 'Graph: read own profile' $true $me.userPrincipalName
         } catch { Add-Result 'Graph: read own profile' $false $_.Exception.Message }
+        # Fabric gives only the ids of who has access - the names come from Graph
+        $ids = @($who | Sort-Object -Unique)
+        if ($ids.Count) {
+            try {
+                $n = Get-GLPrincipalNames -Ids $ids -GraphToken $gr
+                Add-Result 'Graph: names in access lists' ($n.Count -gt 0) "$($n.Count) of $($ids.Count) id(s) named$(if ($n.Count -eq 0) { ' - access lists will show object ids' })"
+            } catch { Add-Result 'Graph: names in access lists' $false "$($_.Exception.Message) - access lists will show object ids" }
+        }
     }
 
     # public web pages, not the tenant - no token is sent
@@ -3681,8 +3861,8 @@ $script:MainXaml = @'
                                 ToolTip="Who takes over - an email, a group name or an object id."/>
                       <TextBlock Grid.Row="1" Grid.Column="0" Text="Type" Style="{DynamicResource LabelText}" Margin="0,6,6,0"/>
                       <ComboBox Name="CmbMoveToType" Grid.Row="1" Grid.Column="1" MinHeight="26" Margin="0,6,0,0" ToolTip="What the one taking over is."/>
-                      <CheckBox Name="ChkMoveGateways" Grid.Row="1" Grid.Column="2" Grid.ColumnSpan="2" Content="Gateways too" IsChecked="True" VerticalAlignment="Center" Margin="10,6,0,0"
-                                ToolTip="Also the roles on every gateway shown on the Gateways tab - admin and connection creator."/>
+                      <CheckBox Name="ChkMoveGateways" Grid.Row="1" Grid.Column="2" Grid.ColumnSpan="2" Content="Gateway clusters too" IsChecked="False" VerticalAlignment="Center" Margin="10,6,0,0"
+                                ToolTip="Also the roles on every gateway cluster on the Gateways tab - admin and connection creator. Off unless you tick it."/>
                       <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="4" Orientation="Horizontal" Margin="0,8,0,0">
                         <Button Name="BtnCopyAccess" Content="Copy access" ToolTip="To gets exactly the same roles. From keeps theirs."/>
                         <Button Name="BtnMoveAccess" Content="Move access" Style="{DynamicResource DangerButton}"
@@ -4414,6 +4594,9 @@ $script:State = @{
     VnetSkipped  = $true
     Releases     = $null
     Directory    = $null
+    Names        = @{}         # principal id -> Name, Email - from Graph, kept for the session
+    NamesWarned  = $false
+    CnAccessFor  = ''
     GatewayState = @{}
     PublicKeys   = @{}
     ConnRows     = @()
@@ -4473,7 +4656,7 @@ function Open-GLFolder([string]$Path) {
 $script:HistoryFields = @('TxtGwFilter', 'TxtCnSearch', 'TxtCnUser', 'TxtCnAccount', 'TxtBulkPrincipals', 'TxtCredUser', 'TxtLogFind', 'TxtMoveFrom', 'TxtMoveTo')
 # the Show views on the Connections tab - Select-GLConnections knows each by its words
 $script:ShowViews = @('All connections', 'Last used over 30 days ago', 'Last used over 90 days ago', 'Last used over 180 days ago',
-                      'Last used over 365 days ago', 'No use recorded', 'Duplicates', 'Failing tests')
+                      'Last used over 365 days ago', 'No use recorded', 'Duplicates', 'Failing tests', 'Skip test connection on')
 
 function New-GLBrush([string]$Hex) {
     $c = ConvertTo-GLColorValue $Hex
@@ -4568,6 +4751,26 @@ function Set-GLFontSize([int]$Size) {
         $grid = $script:UI[$g]
         if ($grid) { $grid.RowHeight = $h.Row; $grid.ColumnHeaderHeight = $h.Header }
     }
+    # The tiles grow and shrink with the text, all of a tile at once - it is drawn
+    # for text size 12. A layout transform, so the rows of tiles still wrap.
+    $tiles = $script:UI.LstGwTiles
+    if ($tiles) {
+        if (-not $script:TileItemStyle) { $script:TileItemStyle = $tiles.ItemContainerStyle }
+        $k  = $Size / 12.0
+        $sc = [System.Windows.Media.ScaleTransform]::new($k, $k)
+        $sc.Freeze()
+        $st = [System.Windows.Style]::new([System.Windows.Controls.ListBoxItem], $script:TileItemStyle)
+        $st.Setters.Add([System.Windows.Setter]::new([System.Windows.FrameworkElement]::LayoutTransformProperty, $sc.psobject.BaseObject))
+        $tiles.ItemContainerStyle = $st
+    }
+}
+
+function Get-GLTileScale {
+    # How large the tiles are drawn, against their size at text size 12.
+    $st = $script:UI.LstGwTiles.ItemContainerStyle
+    $s  = @($st.Setters | Where-Object { $_.Property -eq [System.Windows.FrameworkElement]::LayoutTransformProperty }) | Select-Object -First 1
+    if ($s) { return [double]$s.Value.ScaleX }
+    return 1.0
 }
 
 function Save-GLFieldHistory([string]$Field) {
@@ -4591,6 +4794,34 @@ function Initialize-GLHistory {
         $box.Add_LostKeyboardFocus({ param($s, $e) if (-not $s.IsKeyboardFocusWithin) { Save-GLFieldHistory $s.Name } })
         $box.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { Save-GLFieldHistory $s.Name } })
     }
+}
+
+function Start-GLDebounce {
+    <#
+        A filter box asks for its list to be shown again only once typing stops:
+        every keystroke used to filter and redraw thousands of rows, and deleting a
+        word froze the window for half a minute.
+    #>
+    param([ValidateSet('Connections', 'Gateways', 'Log')][string]$What)
+    if (-not $script:Debounce) { $script:Debounce = @{} }
+    $tm = $script:Debounce[$What]
+    if (-not $tm) {
+        $tm = [System.Windows.Threading.DispatcherTimer]::new()
+        $tm.Interval = [TimeSpan]::FromMilliseconds(400)
+        $tm.Tag = $What
+        $tm.Add_Tick({
+            param($s, $e)
+            $s.Stop()
+            switch ([string]$s.Tag) {
+                'Connections' { Show-GLConnections -Say }
+                'Gateways'    { Show-GLGateways -Say }
+                'Log'         { Update-GLLogView }
+            }
+        })
+        $script:Debounce[$What] = $tm
+    }
+    $tm.Stop()
+    $tm.Start()
 }
 
 function Add-GLTextChanged {
@@ -4639,6 +4870,7 @@ function Start-GLJob {
         $script:Progress.Total  = 0
         $script:Progress.Done   = 0
         $script:Progress.Cancel = $false
+        $script:Progress.Said   = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()   # Text, Level
         $Arguments['Progress']  = $script:Progress
     }
     $ps = [powershell]::Create()
@@ -4647,13 +4879,22 @@ function Start-GLJob {
     foreach ($k in $Arguments.Keys) { [void]$ps.AddParameter($k, $Arguments[$k]) }
     $script:Jobs.Add([pscustomobject]@{
         Name = $Name; PS = $ps; Handle = $ps.BeginInvoke(); OnDone = $OnDone
-        Context = $Context; Started = Get-Date; Bulk = [bool]$Bulk
+        Context = $Context; Started = Get-Date; Bulk = [bool]$Bulk; Quiet = [bool]$Quiet
     })
     if (-not $Quiet) { Write-GLLog "$Name..." }
     Update-GLBusy
 }
 
+function Write-GLJobSaid {
+    # What a running bulk job queued for the log, in the order it happened.
+    $q = $script:Progress.Said
+    if (-not $q) { return }
+    $m = $null
+    while ($q.TryDequeue([ref]$m)) { Write-GLLog ([string]$m.Text) $(if ($m.Level) { [string]$m.Level } else { 'Info' }) }
+}
+
 function Receive-GLJobs {
+    Write-GLJobSaid
     if (-not $script:Jobs -or $script:Jobs.Count -eq 0) { return }
     foreach ($job in $script:Jobs.ToArray()) {
         if (-not $job.Handle.IsCompleted) { continue }
@@ -4673,6 +4914,7 @@ function Receive-GLJobs {
         finally { $job.PS.Dispose() }
 
         $cancelled = $false
+        if ($job.Bulk) { Write-GLJobSaid }      # its last lines before its summary
         if ($job.Bulk) {
             $cancelled = [bool]$script:Progress.Cancel
             $script:Progress.Active = $false
@@ -4680,6 +4922,7 @@ function Receive-GLJobs {
         $secs = [math]::Round(((Get-Date) - $job.Started).TotalSeconds, 1)
         if ($err) { Write-GLLog "$($job.Name) failed after ${secs}s: $err" 'Error' }
         elseif ($cancelled) { Write-GLLog "$($job.Name) was cancelled after ${secs}s - the items already done stay done." 'Warn' }
+        elseif (-not $job.Quiet) { Write-GLLog "$($job.Name) - finished in ${secs}s." }
         if ($job.OnDone) {
             try { & $job.OnDone $result $err $job.Context }
             catch { Write-GLLog "$($job.Name): $($_.Exception.Message)" 'Error' }
@@ -4688,7 +4931,28 @@ function Receive-GLJobs {
     Update-GLBusy
 }
 
+function Update-GLActions {
+    <#
+        While a change runs, or a list is being loaded again, the buttons that would
+        clash with it wait: a change to a list that is about to be replaced, a second
+        change at once, a second load. Looking, filtering and copying stay open.
+    #>
+    $changing = [bool]$script:Progress.Active
+    $loadingCn = [bool]($script:Jobs | Where-Object { $_.Name -eq 'Loading connections' })
+    $loadingGw = [bool]($script:Jobs | Where-Object { $_.Name -like 'Loading gateway*' })
+    $cn = -not ($changing -or $loadingCn)
+    $gw = -not ($changing -or $loadingGw)
+    foreach ($b in 'BtnCnRefresh', 'BtnBulkStatus', 'BtnBulkUsers', 'BtnBulkGrant', 'BtnBulkRevoke', 'BtnBulkCredentials', 'BtnBulkDelete',
+                   'BtnCopyAccess', 'BtnMoveAccess', 'BtnCnAccessAdd', 'BtnCnAccessRemove', 'BtnCnTest', 'BtnCnAccessReport') {
+        if ($script:UI[$b]) { $script:UI[$b].IsEnabled = $cn }
+    }
+    foreach ($b in 'BtnGwRefresh', 'BtnMemberEnable', 'BtnMemberDisable', 'BtnGwAccessAdd', 'BtnGwAccessRemove') {
+        if ($script:UI[$b]) { $script:UI[$b].IsEnabled = $gw }
+    }
+}
+
 function Update-GLBusy {
+    Update-GLActions
     $p = $script:Progress
     $n = $script:Jobs.Count
     if ($p.Active) {
@@ -4730,14 +4994,20 @@ function Get-GLTokenSafe {
 }
 
 function Write-GLResults {
+    # A run's outcome, then every item with what happened to it - the failures in
+    # red. Past 1,000 items the rest go to the log file only, so the panel stays quick.
     param([string]$What, $Results)
     $all = @($Results)
     $bad = @($all | Where-Object { -not $_.Ok })
     $ok  = $all.Count - $bad.Count
     Write-GLLog "${What}: $ok done, $($bad.Count) not done." $(if ($bad.Count) { 'Warn' } else { 'Info' })
-    foreach ($b in ($bad | Select-Object -First 60)) { Write-GLLog "    $($b.Name): $($b.Message)" 'Error' }
-    if ($bad.Count -gt 60) { Write-GLLog "    ... and $($bad.Count - 60) more." 'Error' }
-    foreach ($g in ($all | Where-Object Ok)) { Write-GLLog "    $($g.Name): $($g.Message)" -FileOnly }
+    $n = 0
+    foreach ($r in $all) {
+        $n++
+        $line = "    $($r.Name): $($r.Message)"
+        if ($n -le 1000) { Write-GLLog $line $(if ($r.Ok) { 'Info' } else { 'Error' }) } else { Write-GLLog $line -FileOnly }
+    }
+    if ($n -gt 1000) { Write-GLLog "    ... and $($n - 1000) more - all of them are in the log file (Open folder)." }
 }
 
 function Get-GLRunAudit {
@@ -5014,6 +5284,8 @@ function Test-GLGridBehaviour {
 # ---- gateways ------------------------------------------------------------------
 function Show-GLGateways {
     # Rebuilt on every refresh, so "down for" moves on even when nothing else changed.
+    # -Say: the user changed the filter - the log says what is shown now.
+    param([switch]$Say)
     $selId = if ($script:UI.LstGwTiles.SelectedItem) { $script:UI.LstGwTiles.SelectedItem.Id } else { $null }
     $counts = if (@($script:State.ConnRows).Count) { Get-GLConnectionCounts -Rows $script:State.ConnRows -Directory $script:State.Directory } else { $null }
     $tiles = ConvertTo-GLGatewayTiles -Rows $script:State.GatewayRows -Members $script:State.Members -DownSince $script:State.DownSince -VnetSkipped:([bool]$script:State.VnetSkipped) -Live $script:State.Live -Releases $script:State.Releases -ConnectionCounts $counts
@@ -5025,6 +5297,7 @@ function Show-GLGateways {
         if ($again) { $script:UI.LstGwTiles.SelectedItem = $again }
     }
     Update-GLGatewaySummary
+    if ($Say -and @($tiles).Count) { Write-GLLog "Gateways shown: $(@($shown).Count) of $(@($tiles).Count)." }
 }
 
 function Update-GLGatewaySummary {
@@ -5093,6 +5366,60 @@ function Set-GLGatewayList {
     }
 }
 
+function Update-GLGatewayRows {
+    <#
+        Gateway rows, their states and the down times, from what the state holds -
+        after a full refresh or after one cluster was read again. The connections
+        are drawn again only when a gateway's state changed: redrawing thousands of
+        rows takes seconds, and the auto-refresh used to do it every minute.
+    #>
+    $script:State.GatewayRows = ConvertTo-GLGatewayRows -Gateways $script:State.Gateways -Members $script:State.Members -Live $script:State.Live
+    $before = $script:State.GatewayState
+    $now = @{}
+    foreach ($row in $script:State.GatewayRows) { $now[([string]$row.Id).ToLowerInvariant()] = Get-GLGatewayState $row.Online }
+    $script:State.GatewayState = $now
+    $script:State.LastRefresh  = Get-Date
+    $script:State.DownSince    = Update-GLDownSince -DownSince $script:State.DownSince -Live $script:State.Live -Now $script:State.LastRefresh
+    $changed = (-not $before) -or $before.Count -ne $now.Count -or @($now.Keys | Where-Object { $before[$_] -ne $now[$_] }).Count
+    if ($changed -and @($script:State.ConnRows).Count) { Show-GLConnections }
+}
+
+function Invoke-GLClusterRefresh {
+    # One gateway cluster read again - its members and their live status - after a
+    # change to it. The other clusters are left as they are.
+    param([Parameter(Mandatory)][string]$GatewayId, [string]$Name)
+    $fab = Get-GLTokenSafe Fabric
+    if (-not $fab) { return }
+    $live = [bool]$script:UI.ChkLive.IsChecked
+    $pbi  = if ($live) { Get-GLTokenSafe PowerBI } else { $null }
+    Start-GLJob -Name "Loading gateway '$Name'" -Arguments @{ F = $fab; P = $pbi; G = $GatewayId } -Context @{ Id = $GatewayId; Name = $Name } -Work {
+        param($F, $P, $G)
+        $mem = Get-GLPaged -Uri "https://api.fabric.microsoft.com/v1/gateways/$G/members" -Token $F
+        $state = $null; $warn = ''
+        if ($P) {
+            try { $state = Get-GLLiveStatus -PbiToken $P -OnlyClusterIds @($G) }
+            catch { $warn = "Live status is unavailable (unofficial API): $($_.Exception.Message)" }
+        }
+        @{ Members = @($mem); Live = $state; Warn = $warn }
+    } -OnDone {
+        param($r, $err, $ctx)
+        if ($err -or -not $r) { return }
+        if ($r.Warn) { Write-GLLog $r.Warn 'Warn' }
+        $script:State.Members[$ctx.Id] = $r.Members
+        if ($r.Live) {
+            if (-not $script:State.Live) { $script:State.Live = @{} }
+            foreach ($m in $r.Members) { $script:State.Live.Remove(([string]$m.id).ToLowerInvariant()) }
+            foreach ($k in $r.Live.Keys) { $script:State.Live[$k] = $r.Live[$k] }
+        }
+        Update-GLGatewayRows
+        Show-GLGateways
+        Update-GLGatewayDetail
+        $on = @($r.Members | Where-Object { $_.enabled }).Count
+        $up = if ($r.Live) { @($r.Live.Values | Where-Object Status -eq 'Live').Count } else { 'n/a' }
+        Write-GLLog "Loaded gateway '$($ctx.Name)' again: $(@($r.Members).Count) member(s), $on enabled, $up online. The other gateways are as they were."
+    }
+}
+
 function Invoke-GLGatewayRefresh {
     if (Test-GLJobRunning 'Loading gateways') { return }
     $fab = Get-GLTokenSafe Fabric
@@ -5101,6 +5428,7 @@ function Invoke-GLGatewayRefresh {
     $pbi  = if ($live) { Get-GLTokenSafe PowerBI } else { $null }
     $skip = [bool]$script:UI.ChkSkipVnet.IsChecked
 
+    Write-GLLog "Reading gateways: live member status $(if ($live) { 'on' } else { 'off' }), VNet gateways $(if ($skip) { 'skipped - not woken' } else { 'checked too' })."
     Start-GLJob -Name 'Loading gateways' -Arguments @{ F = $fab; P = $pbi; L = $live; V = $skip } -Context @{ SkipVnet = $skip } -Work {
         param($F, $P, $L, $V)
         Get-GLGatewayData -FabricToken $F -PbiToken $P -LiveStatus:$L -CheckVnet:(-not $V)
@@ -5111,20 +5439,13 @@ function Invoke-GLGatewayRefresh {
         $script:State.Gateways    = $r.Gateways
         $script:State.Members     = $r.Members
         $script:State.Live        = $r.Live
-        $script:State.GatewayRows = ConvertTo-GLGatewayRows -Gateways $r.Gateways -Members $r.Members -Live $r.Live
-        $script:State.GatewayState = @{}
-        foreach ($row in $script:State.GatewayRows) {
-            $script:State.GatewayState[([string]$row.Id).ToLowerInvariant()] = Get-GLGatewayState $row.Online
-        }
-        $script:State.LastRefresh = Get-Date
-        $script:State.DownSince   = Update-GLDownSince -DownSince $script:State.DownSince -Live $r.Live -Now $script:State.LastRefresh
         $script:State.VnetSkipped = $ctx.SkipVnet
+        Update-GLGatewayRows
         Set-GLGatewayList $r.Gateways
         Show-GLGateways
         Update-GLGatewayDetail
-        if ($script:State.ConnRows.Count) { Show-GLConnections }   # connections take the new states
         $members = ($r.Members.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-        Write-GLLog "Loaded $(@($script:State.GatewayRows).Count) gateway(s) with $([int]$members) member(s). $($script:UI.TxtGwSummary.Text)"
+        Write-GLLog "Loaded all $(@($script:State.GatewayRows).Count) gateway(s) with $([int]$members) member(s). $($script:UI.TxtGwSummary.Text)"
         Invoke-GLReleaseCheck
     }
 }
@@ -5152,8 +5473,13 @@ function Update-GLGatewayDetail {
 function Set-GLAutoRefresh {
     if (-not $script:AutoTimer) {
         $script:AutoTimer = [System.Windows.Threading.DispatcherTimer]::new()
-        $script:AutoTimer.Add_Tick({ if (-not $script:Progress.Active) { Invoke-GLGatewayRefresh } })
+        $script:AutoTimer.Add_Tick({
+            if ($script:Progress.Active) { Write-GLLog 'Auto-refresh skipped - a run is still going.'; return }
+            Write-GLLog 'Auto-refresh: loading the gateways again.'
+            Invoke-GLGatewayRefresh
+        })
     }
+    $was = $script:AutoTimer.IsEnabled
     $script:AutoTimer.Stop()
     $choice = [string]$script:UI.CmbAutoRefresh.SelectedItem
     if ($choice -match '^(\d+) min') {
@@ -5161,6 +5487,7 @@ function Set-GLAutoRefresh {
         $script:AutoTimer.Start()
         Write-GLLog "Gateways refresh automatically every $($Matches[1]) minute(s)."
     }
+    elseif ($was) { Write-GLLog 'Auto-refresh is off.' }
 }
 
 function Get-GLGatewayExport {
@@ -5187,6 +5514,7 @@ function Enter-GLKiosk {
     $script:KioskSaved = @{
         State = $w.WindowState; Style = $w.WindowStyle; Resize = $w.ResizeMode
         Tab = $script:UI.Tabs.SelectedIndex; Log = $script:UI.LogRow.Height; Detail = $script:UI.GwDetailRow.Height
+        Auto = [string]$script:UI.CmbAutoRefresh.SelectedItem
     }
     $script:UI.Tabs.SelectedItem = $script:UI.TabGateways
     foreach ($n in 'HeaderBar', 'LogPanel', 'LogSplitter', 'GwToolbar', 'GwSplitter', 'GwDetail', 'TabConnections') { $script:UI[$n].Visibility = 'Collapsed' }
@@ -5217,44 +5545,47 @@ function Exit-GLKiosk {
     $w.ResizeMode  = $k.Resize
     $w.WindowState = $k.State
     $script:UI.Tabs.SelectedIndex = $k.Tab
+    # the kiosk view turned auto-refresh on - it goes back to what it was
+    if ($k.Auto -and [string]$script:UI.CmbAutoRefresh.SelectedItem -ne $k.Auto) { $script:UI.CmbAutoRefresh.SelectedItem = $k.Auto }
 }
 
 function Invoke-GLMemberEnabled {
+    # Enable or disable the selected members of one gateway cluster - several at a
+    # time, each named in the confirmation. Only that cluster is read again after.
     param([bool]$Enabled)
-    $gw = $script:UI.LstGwTiles.SelectedItem
-    $m  = $script:UI.GridMembers.SelectedItem
-    if (-not $gw -or -not $m) { Write-GLLog 'Select a gateway and one of its members first.' 'Warn'; return }
-    if (@($script:UI.GridMembers.SelectedItems).Count -gt 1) { Write-GLLog 'Enable and Disable take one member at a time - select just one.' 'Warn'; return }
-    if ([bool]$m.Enabled -eq $Enabled) { Write-GLLog "'$($m.Member)' is already $(if ($Enabled) { 'enabled' } else { 'disabled' })." 'Warn'; return }
+    $gw  = $script:UI.LstGwTiles.SelectedItem
+    $sel = @($script:UI.GridMembers.SelectedItems | Where-Object { $_ })
+    if (-not $gw -or $sel.Count -eq 0) { Write-GLLog 'Select a gateway and one or more of its members first (Ctrl or Shift for several).' 'Warn'; return }
+    $state = if ($Enabled) { 'enabled' } else { 'disabled' }
+    $plan  = Get-GLMemberPlan -Members $script:State.Members[$gw.Id] -Selected $sel -Enabled $Enabled
+    if (@($plan.Change).Count -eq 0) { Write-GLLog "The selected member(s) are already $state." 'Warn'; return }
 
     $verb  = if ($Enabled) { 'Enable' } else { 'Disable' }
-    $extra = ''
+    $names = (@($plan.Change | ForEach-Object { "    $($_.Member)$(if ($_.Machine) { " ($($_.Machine))" })" }) -join "`n")
+    $msg   = "$verb $(@($plan.Change).Count) member(s) of gateway '$($gw.Name)'?`n`n$names"
+    if ($plan.Already) { $msg += "`n`n$($plan.Already) selected member(s) are already $state and are left alone." }
     if (-not $Enabled) {
-        $on = @($script:State.Members[$gw.Id] | Where-Object { $_.enabled }).Count
-        $extra = if ($on -le 1) { "`n`nThis is the LAST enabled member - the gateway will stop serving refreshes entirely." }
-                 else { "`n`nRefreshes will be served by the other $($on - 1) enabled member(s)." }
+        $msg += if ($plan.EnabledAfter -le 0) { "`n`nThis disables EVERY enabled member - the gateway stops serving refreshes entirely." }
+                else { "`n`nRefreshes will be served by the $($plan.EnabledAfter) member(s) still enabled." }
     }
-    $where = if ($m.Machine) { " ($($m.Machine))" } else { '' }
-    if (-not (Confirm-GL "$verb member '$($m.Member)'$where of gateway '$($gw.Name)'?$extra" "$verb member")) { return }
+    if (-not (Confirm-GL $msg "$verb members")) { return }
 
     $audit = Get-GLRunAudit
     if (-not $audit) { return }
     $fab = Get-GLTokenSafe Fabric
     if (-not $fab) { return }
-    $rec = @{ Action = "$verb member"; TargetType = 'Gateway member'; Target = [string]$m.Member; TargetId = [string]$m.Id
-              Gateway = [string]$gw.Name; GatewayId = [string]$gw.Id; Details = "Machine=$($m.Machine)" }
-    Start-GLJob -Name "$verb '$($m.Member)'" -Arguments @{ F = $fab; G = $gw.Id; M = $m.Id; E = $Enabled; A = $audit; Rec = $rec } `
-        -Context @{ What = "$($verb)d '$($m.Member)' of '$($gw.Name)'." } -Work {
-        param($F, $G, $M, $E, $A, $Rec)
-        try { Set-GLMemberEnabled -GatewayId $G -MemberId $M -Enabled $E -FabricToken $F }
-        catch { Write-GLChange -Audit $A @Rec -Result Failed -Message $_.Exception.Message; throw }
-        Write-GLChange -Audit $A @Rec -Result Done
-        $true
+    $members = @($plan.Change | ForEach-Object { [pscustomobject]@{ Id = [string]$_.Id; Member = [string]$_.Member; Machine = [string]$_.Machine } })
+    $target  = [pscustomobject]@{ Id = [string]$gw.Id; Name = [string]$gw.Name }
+    Start-GLJob -Bulk -Name "$verb $($members.Count) member(s) of '$($gw.Name)'" `
+        -Arguments @{ F = $fab; Gw = $target; Members = $members; E = $Enabled; A = $audit } `
+        -Context @{ What = "$verb members of '$($gw.Name)'"; GatewayId = [string]$gw.Id; Name = [string]$gw.Name } -Work {
+        param($F, $Gw, $Members, $E, $A, $Progress)
+        Invoke-GLBulkMembers -Gateway $Gw -Members $Members -Enabled $E -FabricToken $F -Progress $Progress -Audit $A
     } -OnDone {
         param($r, $err, $ctx)
         if ($err) { return }
-        Write-GLLog $ctx.What
-        Invoke-GLGatewayRefresh
+        Write-GLResults $ctx.What $r
+        Invoke-GLClusterRefresh -GatewayId $ctx.GatewayId -Name $ctx.Name
     }
 }
 
@@ -5325,6 +5656,8 @@ function Get-GLStateFilter {
 }
 
 function Show-GLConnections {
+    # -Say: the user changed a filter - the log says what the list shows now.
+    param([switch]$Say)
     if ($script:State.Populating) { return }
     Set-GLRowGatewayState -Rows $script:State.ConnRows -GatewayState $script:State.GatewayState
     $cloud = [bool]$script:UI.ChkCnCloud.IsChecked
@@ -5343,6 +5676,7 @@ function Show-GLConnections {
     if ($ex) { $txt += "   ($ex excluded)" }
     $script:UI.TxtCnCount.Text   = $txt
     $script:UI.TxtBulkTitle.Text = "All $($rows.Count) listed connection(s)"
+    if ($Say -and @($script:State.ConnRows).Count) { Write-GLLog "Listed: $txt." }
 }
 
 function Update-GLConnectionCombos {
@@ -5371,6 +5705,7 @@ function Invoke-GLConnectionRefresh {
     if (-not $fab) { return }
     $dir = [bool]$script:UI.ChkDirectory.IsChecked
     $pbi = if ($dir) { Get-GLTokenSafe PowerBI } else { $null }
+    Write-GLLog "Reading connections: usernames and access from the unofficial API $(if ($dir) { 'on' } else { 'off' })."
     Start-GLJob -Name 'Loading connections' -Arguments @{ F = $fab; P = $pbi; D = $dir } -Work {
         param($F, $P, $D)
         $data = Get-GLConnectionData -FabricToken $F
@@ -5379,15 +5714,16 @@ function Invoke-GLConnectionRefresh {
             try { $directory = Get-GLDatasourceDirectory -PbiToken $P }
             catch { $warn = "Usernames and access are unavailable (unofficial API): $($_.Exception.Message)" }
         }
-        @{ Gateways = $data.Gateways; Connections = $data.Connections; Directory = $directory; Warn = $warn }
+        # the rows are made here: thousands of them would hold up the window
+        $rows = ConvertTo-GLConnectionRows -Connections $data.Connections -GatewayNames (Get-GLGatewayNameMap -Gateways $data.Gateways)
+        Add-GLDirectoryInfo -Rows $rows -Directory $directory
+        @{ Gateways = $data.Gateways; Connections = $data.Connections; Directory = $directory; Rows = $rows; Warn = $warn }
     } -OnDone {
         param($r, $err, $ctx)
         if ($err -or -not $r) { return }
         if ($r.Warn) { Write-GLLog $r.Warn 'Warn' }
         Set-GLGatewayList $r.Gateways
-        $names = Get-GLGatewayNameMap -Gateways $r.Gateways
-        $rows  = ConvertTo-GLConnectionRows -Connections $r.Connections -GatewayNames $names
-        Add-GLDirectoryInfo -Rows $rows -Directory $r.Directory
+        $rows = @($r.Rows | Where-Object { $_ })
         $script:State.ConnRows  = $rows
         $script:State.Directory = $r.Directory
         $script:State.RawConnections = @{}
@@ -5410,6 +5746,9 @@ function Invoke-GLConnectionRefresh {
 
 function Update-GLConnectionDetail {
     $row = $script:UI.GridConnections.SelectedItem
+    $id  = if ($row) { [string]$row.Id } else { '' }
+    if ($id -and $id -eq $script:State.CnAccessFor) { return }      # another cell of the same row
+    $script:State.CnAccessFor = $id
     Set-GLGridItems -Grid $script:UI.GridCnAccess -Items $null
     if (-not $row) { $script:UI.TxtCnSelected.Text = 'Select a connection to see who has access.'; return }
     $where = if ($row.Gateway) { " on $($row.Gateway)" } else { '' }
@@ -5442,14 +5781,21 @@ function Invoke-GLBulkStatusUi {
     Start-GLJob -Bulk -Name $title -Arguments @{ P = $pbi; Items = $items } -Context @{ Retest = [bool]$Retest } -Work {
         param($P, $Items, $Progress)
         # not $I: names ignore case, so a loop over $i would overwrite it
+        # Ten at a time: a test can wait up to a minute for a gateway, and each batch
+        # reports as soon as it is done - so the log keeps moving.
         $Progress.Total = $Items.Count
         $all = @{}
-        for ($i = 0; $i -lt $Items.Count; $i += 20) {
+        for ($i = 0; $i -lt $Items.Count; $i += 10) {
             if ($Progress.Cancel) { break }
-            $chunk = @($Items[$i..([Math]::Min($i + 20, $Items.Count) - 1)])
+            $chunk = @($Items[$i..([Math]::Min($i + 10, $Items.Count) - 1)])
+            $Progress.Said.Enqueue([pscustomobject]@{ Text = "  Testing $($i + 1)-$($i + $chunk.Count) of $($Items.Count)..."; Level = 'Info' })
             $res = Test-GLConnectionsBulk -Items $chunk -PbiToken $P
-            foreach ($k in $res.Keys) { $all[$k] = $res[$k] }
-            $Progress.Done = [Math]::Min($i + 20, $Items.Count)
+            foreach ($c in $chunk) {
+                $o = ConvertTo-GLTestOutcome -Result $res[[string]$c.Id] -SkipTest ([bool]$c.SkipTest) -Name $c.Name
+                $all[[string]$c.Id] = [pscustomobject]@{ Status = $o.Status; Detail = $o.Detail }
+                $Progress.Said.Enqueue($o)
+            }
+            $Progress.Done = [Math]::Min($i + 10, $Items.Count)
         }
         $all
     } -OnDone {
@@ -5460,40 +5806,86 @@ function Invoke-GLBulkStatusUi {
         $vals = @($r.Values)
         $ok = @($vals | Where-Object { $_.Status -eq 'OK' }).Count
         $to = @($vals | Where-Object { $_.Status -eq 'Timeout' }).Count
-        $bad = $vals.Count - $ok - $to
+        $un = @($vals | Where-Object { $_.Status -eq 'Unverified' }).Count
+        $bad = $vals.Count - $ok - $to - $un
+        $unText = if ($un) { ", $un OK but not verified (Skip test connection is on)" } else { '' }
         if ($ctx.Retest) {
-            $level = if ($bad -or $to) { 'Warn' } else { 'Info' }
-            Write-GLLog "Tested after the credential update: $ok of $($vals.Count) work, $bad still fail, $to did not answer. Show > Failing tests lists the ones to look at." $level
+            $level = if ($bad -or $to -or $un) { 'Warn' } else { 'Info' }
+            Write-GLLog "Tested after the credential update: $ok of $($vals.Count) work, $bad still fail, $to did not answer$unText. Show > Failing tests lists the ones to look at." $level
         }
-        else { Write-GLLog "Status: $ok OK, $bad failed, $to did not answer. See the Status and StatusDetail columns." }
+        else { Write-GLLog "Status: $ok OK, $bad failed, $to did not answer$unText. See the Status and StatusDetail columns." $(if ($bad -or $to -or $un) { 'Warn' } else { 'Info' }) }
     }
 }
 
 function Invoke-GLBulkUsersUi {
     $items = Get-GLListed
     if ($items.Count -eq 0) { Write-GLLog 'The list is empty.' 'Warn'; return }
+    Start-GLUsersRead -Items $items
+}
+
+function Start-GLUsersRead {
+    <#
+        Who has access to these connections, read fresh from Fabric, with names from
+        Graph - for Verify users, and after every change to access. Every connection
+        goes to the log with its users; one that could not be read, with the reason.
+        The open access panel is filled from the same answer.
+    #>
+    param($Items, [string]$Why = 'Reading users')
+    $list = @($Items | Where-Object { $_ })
+    if ($list.Count -eq 0) { return }
     $fab = Get-GLTokenSafe Fabric
     if (-not $fab) { return }
-    $ids = @($items | ForEach-Object { [string]$_.Id })
-    Start-GLJob -Bulk -Name "Reading users of $($ids.Count) connection(s)" -Arguments @{ F = $fab; Ids = $ids } -Work {
-        param($F, $Ids, $Progress)
+    $gr  = Get-GLTokenSafe Graph
+    $ids = @($list | ForEach-Object { [string]$_.Id })
+    $nameOf = @{}
+    foreach ($c in $list) { $nameOf[[string]$c.Id] = [string]$c.Name }
+    Start-GLJob -Bulk -Name "$Why of $($ids.Count) connection(s)" -Arguments @{ F = $fab; G = $gr; Ids = $ids; Known = $script:State.Names } `
+        -Context @{ Ids = $ids; NameOf = $nameOf } -Work {
+        param($F, $G, $Ids, $Known, $Progress)
         $Progress.Total = $Ids.Count
-        $all = @{}
+        $all = @{}; $errors = @{}
         for ($i = 0; $i -lt $Ids.Count; $i += 25) {
             if ($Progress.Cancel) { break }
             $chunk = @($Ids[$i..([Math]::Min($i + 25, $Ids.Count) - 1)])
-            $res = Get-GLRoleAssignmentsBulk -Ids $chunk -FabricToken $F
+            $res = Get-GLRoleAssignmentsBulk -Ids $chunk -FabricToken $F -Errors $errors
             foreach ($k in $res.Keys) { $all[$k] = $res[$k] }
             $Progress.Done = [Math]::Min($i + 25, $Ids.Count)
         }
-        $all
+        $names = @{}; $warn = ''
+        $who = @($all.Values | Where-Object { $_ } | ForEach-Object { $_ } | ForEach-Object { [string]$_.principal.id })
+        try { $names = Get-GLPrincipalNames -Ids $who -GraphToken $G -Known $Known } catch { $warn = $_.Exception.Message }
+        @{ Assignments = $all; Errors = $errors; Names = $names; Warn = $warn }
     } -OnDone {
         param($r, $err, $ctx)
         if ($err -or -not $r) { return }
-        Set-GLRowUsers -Rows $script:State.ConnRows -Assignments $r
-        $script:UI.GridConnections.Items.Refresh()
-        $bad = @($r.Values | Where-Object { $null -eq $_ }).Count
-        Write-GLLog "Users read for $($r.Count - $bad) connection(s)$(if ($bad) { ", $bad could not be read" }). The User filter now works on them."
+        Add-GLNames $r.Names $r.Warn
+        $as = $r.Assignments
+        Set-GLRowUsers -Rows $script:State.ConnRows -Assignments $as -Names $script:State.Names
+        try { $script:UI.GridConnections.Items.Refresh() } catch { }
+        $bad = 0; $n = 0
+        foreach ($id in $ctx.Ids) {
+            if (-not $as.ContainsKey($id)) { continue }
+            $n++
+            $name = $ctx.NameOf[$id]
+            if ($null -eq $as[$id]) {
+                $bad++
+                $reason = if ($r.Errors -and $r.Errors.ContainsKey($id)) { $r.Errors[$id] } else { 'no answer' }
+                $line = "    ${name}: could not be read - $reason"
+                if ($n -le 1000) { Write-GLLog $line 'Warn' } else { Write-GLLog $line -FileOnly }
+                continue
+            }
+            $line = "    ${name}: $(Format-GLAccessList (ConvertTo-GLRoleRows -Assignments $as[$id] -Names $script:State.Names))"
+            if ($n -le 1000) { Write-GLLog $line } else { Write-GLLog $line -FileOnly }
+        }
+        if ($n -gt 1000) { Write-GLLog "    ... and $($n - 1000) more - all of them are in the log file (Open folder)." }
+        $tail = if ($bad) { ", $bad could not be read - each says why above" } else { '' }
+        Write-GLLog "Users read for $($n - $bad) connection(s)$tail. The User filter now works on them." $(if ($bad) { 'Warn' } else { 'Info' })
+        # the open access panel shows the same answer, without asking again
+        $sel = Get-GLSelectedId connections
+        if ($sel -and $as.ContainsKey($sel) -and $null -ne $as[$sel]) {
+            $script:State.CnAccessFor = $sel
+            Set-GLGridItems -Grid $script:UI.GridCnAccess -Items (ConvertTo-GLRoleRows -Assignments $as[$sel] -Names $script:State.Names)
+        }
     }
 }
 
@@ -5518,7 +5910,7 @@ function Invoke-GLBulkAccessUi {
     $gr = Get-GLTokenSafe Graph
     $name = if ($Revoke) { "Removing access on $($items.Count) connection(s)" } else { "Granting $role on $($items.Count) connection(s)" }
     Start-GLJob -Bulk -Name $name -Arguments @{ F = $fab; G = $gr; I = $items; Pr = $principals; T = $ptype; R = $role; X = [bool]$Revoke; A = $audit } `
-        -Context @{ What = $(if ($Revoke) { 'Remove access' } else { 'Grant access' }) } -Work {
+        -Context @{ What = $(if ($Revoke) { 'Remove access' } else { 'Grant access' }); Items = $items } -Work {
         param($F, $G, $I, $Pr, $T, $R, $X, $A, $Progress)
         # resolve everyone first - one unknown name stops the run before anything changes
         $resolved = foreach ($p in $Pr) {
@@ -5531,13 +5923,13 @@ function Invoke-GLBulkAccessUi {
         param($r, $err, $ctx)
         if ($err) { return }
         Write-GLResults $ctx.What $r
-        Write-GLLog 'Press Verify users to see the result in the list.'
+        Start-GLUsersRead -Items $ctx.Items -Why 'Reading users again'      # the list shows what really happened
     }
 }
 
 function Invoke-GLHandoverUi {
     # Someone leaving, or a new owner: To gets exactly the roles From has, on every
-    # listed connection - and with Gateways too, on every gateway on the Gateways tab.
+    # listed connection - and with Gateway clusters too, on every cluster on the Gateways tab.
     param([switch]$Move)
     foreach ($f in 'TxtMoveFrom', 'TxtMoveTo') { Save-GLFieldHistory $f }
     $items    = Get-GLListed
@@ -5560,7 +5952,7 @@ function Invoke-GLHandoverUi {
     $toType = [string]$script:UI.CmbMoveToType.SelectedItem
     $verb = if ($Move) { 'Move' } else { 'Copy' }
     $on = @("$($items.Count) listed connection(s)")
-    if ($gws.Count) { $on += "$($gws.Count) gateway(s) on the Gateways tab" }
+    if ($gws.Count) { $on += "$($gws.Count) gateway cluster(s) on the Gateways tab" }
     $msg = "$verb every role '$fromText' has to '$toText' ($toType)?`n`nOn $($on -join ' and ')."
     $msg += if ($Move) { "`n`nThen '$fromText' loses those roles - only where '$toText' has them by then, so nothing is left without an owner." }
             else { "`n`n'$fromText' keeps their roles." }
@@ -5576,7 +5968,7 @@ function Invoke-GLHandoverUi {
                @(foreach ($c in $items) { [pscustomobject]@{ Kind = 'connections'; Id = [string]$c.Id; Name = [string]$c.Name; Gateway = [string]$c.Gateway; GatewayId = [string]$c.GatewayId } })
     Start-GLJob -Bulk -Name "$verb access of '$fromText' to '$toText'" `
         -Arguments @{ F = $fab; G = $gr; Targets = $targets; FromText = $fromText; ToText = $toText; ToType = $toType; M = [bool]$Move; A = $audit } `
-        -Context @{ What = "$verb access" } -Work {
+        -Context @{ What = "$verb access"; Items = $items; Gateways = $gws } -Work {
         param($F, $G, $Targets, $FromText, $ToText, $ToType, $M, $A, $Progress)
         # both looked up before anything changes - someone unknown stops the run here
         $who  = Resolve-GLHandoverFrom -Value $FromText -GraphToken $G
@@ -5587,7 +5979,9 @@ function Invoke-GLHandoverUi {
         param($r, $err, $ctx)
         if ($err) { return }
         Write-GLResults $ctx.What $r
-        Write-GLLog 'Press Verify users to see the result in the list.'
+        Start-GLUsersRead -Items $ctx.Items -Why 'Reading users again'      # the list shows what really happened
+        $g = $script:UI.LstGwTiles.SelectedItem
+        if ($g -and @($ctx.Gateways | Where-Object { $_.Id -eq $g.Id }).Count) { Update-GLAccess -Kind gateways -Id $g.Id -Name $g.Name }
     }
 }
 
@@ -5606,10 +6000,11 @@ function Invoke-GLAccessReportUi {
     if (-not $fab) { return }
     $targets = @(foreach ($g in $gws) { [pscustomobject]@{ Kind = 'gateways'; Id = [string]$g.Id; Name = [string]$g.Name; Gateway = [string]$g.Name; Type = [string]$g.Type; Path = ''; Account = ''; LastUsed = '' } }) +
                @(foreach ($c in $items) { [pscustomobject]@{ Kind = 'connections'; Id = [string]$c.Id; Name = [string]$c.Name; Gateway = [string]$c.Gateway; Type = [string]$c.Type; Path = [string]$c.Path; Account = [string]$c.Account; LastUsed = [string]$c.LastUsed } })
-    Start-GLJob -Bulk -Name "Reading who has access to $($targets.Count) item(s)" -Arguments @{ F = $fab; Targets = $targets; W = $who } `
+    $gr = Get-GLTokenSafe Graph
+    Start-GLJob -Bulk -Name "Reading who has access to $($targets.Count) item(s)" -Arguments @{ F = $fab; G = $gr; Targets = $targets; W = $who; Known = $script:State.Names } `
         -Context @{ Path = $dlg.FileName; Who = $who } -Work {
-        param($F, $Targets, $W, $Progress)
-        Get-GLAccessReport -Targets $Targets -Who $W -FabricToken $F -Progress $Progress
+        param($F, $G, $Targets, $W, $Known, $Progress)
+        Get-GLAccessReport -Targets $Targets -Who $W -FabricToken $F -Progress $Progress -GraphToken $G -Known $Known
     } -OnDone {
         param($r, $err, $ctx)
         if ($err -or $script:Progress.Cancel) { return }
@@ -5688,13 +6083,16 @@ function Invoke-GLBulkDeleteUi {
     $raw = @{}
     foreach ($it in $items) { if ($script:State.RawConnections.ContainsKey([string]$it.Id)) { $raw[[string]$it.Id] = $script:State.RawConnections[[string]$it.Id] } }
 
-    Start-GLJob -Bulk -Name "Deleting $n connection(s)" -Arguments @{ F = $fab; I = $items; R = $raw; B = $path; A = $audit } -Context @{ Backup = $path } -Work {
-        param($F, $I, $R, $B, $A, $Progress)
-        # 1) who has access, so the backup can restore that too
+    $gr = Get-GLTokenSafe Graph
+    Start-GLJob -Bulk -Name "Deleting $n connection(s)" -Arguments @{ F = $fab; G = $gr; I = $items; R = $raw; B = $path; A = $audit; Known = $script:State.Names } -Context @{ Backup = $path } -Work {
+        param($F, $G, $I, $R, $B, $A, $Known, $Progress)
+        # 1) who has access, by name, so the backup can restore that too
         $Progress.Name = "Backing up $($I.Count) connection(s)"
         $assign = Get-GLRoleAssignmentsBulk -Ids @($I | ForEach-Object { [string]$_.Id }) -FabricToken $F
+        $names = @{} + $Known
+        try { $names += Get-GLPrincipalNames -Ids @($assign.Values | Where-Object { $_ } | ForEach-Object { $_ } | ForEach-Object { [string]$_.principal.id }) -GraphToken $G -Known $Known } catch { }
         # 2) the backup - if this throws, the job stops here and nothing is deleted
-        $null = Backup-GLConnections -Items $I -Raw $R -Assignments $assign -Path $B
+        $null = Backup-GLConnections -Items $I -Raw $R -Assignments $assign -Path $B -Names $names
         # 3) only now, the deletes
         $Progress.Name = "Deleting $($I.Count) connection(s)"
         $res = Invoke-GLBulkDelete -Items $I -BackupPath $B -FabricToken $F -Progress $Progress -Audit $A
@@ -5725,18 +6123,38 @@ function Get-GLSelectedId([string]$Kind) {
     return $null
 }
 
+function Add-GLNames {
+    # Names from a job into the session's list. Graph refusing is said once.
+    param([hashtable]$Names, [string]$Warn)
+    if ($Names) { foreach ($k in $Names.Keys) { $script:State.Names[$k] = $Names[$k] } }
+    if ($Warn -and -not $script:State.NamesWarned) {
+        $script:State.NamesWarned = $true
+        Write-GLLog "Names could not be read from Microsoft Graph, so object ids are shown instead: $Warn" 'Warn'
+    }
+}
+
 function Update-GLAccess {
+    # Who has access to one gateway or connection, with names from Graph.
     param([string]$Kind, [string]$Id, [string]$Name)
     $fab = Get-GLTokenSafe Fabric
     if (-not $fab) { return }
-    Start-GLJob -Name "Access for '$Name'" -Arguments @{ F = $fab; K = $Kind; I = $Id } -Context @{ Kind = $Kind; Id = $Id } -Work {
-        param($F, $K, $I)
-        Get-GLRoleAssignments -Kind $K -Id $I -FabricToken $F
+    $gr = Get-GLTokenSafe Graph
+    Start-GLJob -Quiet -Name "Access for '$Name'" -Arguments @{ F = $fab; G = $gr; K = $Kind; I = $Id; Known = $script:State.Names } `
+        -Context @{ Kind = $Kind; Id = $Id; Name = $Name } -Work {
+        param($F, $G, $K, $I, $Known)
+        $ras = Get-GLRoleAssignments -Kind $K -Id $I -FabricToken $F
+        $names = @{}; $warn = ''
+        try { $names = Get-GLPrincipalNames -Ids @($ras | ForEach-Object { [string]$_.principal.id }) -GraphToken $G -Known $Known }
+        catch { $warn = $_.Exception.Message }
+        @{ Assignments = @($ras); Names = $names; Warn = $warn }
     } -OnDone {
         param($r, $err, $ctx)
-        if ($err) { return }
+        if ($err -or -not $r) { return }
+        Add-GLNames $r.Names $r.Warn
+        $rows = ConvertTo-GLRoleRows -Assignments $r.Assignments -Names $script:State.Names
+        Write-GLLog "Access for '$($ctx.Name)': $(Format-GLAccessList $rows)"
         if ((Get-GLSelectedId $ctx.Kind) -ne $ctx.Id) { return }
-        Set-GLGridItems -Grid (Get-GLAccessGrid $ctx.Kind) -Items (ConvertTo-GLRoleRows -Assignments $r)
+        Set-GLGridItems -Grid (Get-GLAccessGrid $ctx.Kind) -Items $rows
     }
 }
 
@@ -5768,6 +6186,17 @@ function Show-GLAccessDialog {
     [void]$dlg.ShowDialog()
     if (-not $state.Ok) { return $null }
     return @{ Principal = $c.DlgPrincipal.Text.Trim(); Type = [string]$c.DlgType.SelectedItem; Role = [string]$c.DlgRole.SelectedItem }
+}
+
+function Update-GLAfterAccessChange {
+    # After a change to one item's access: a connection's users are read again (the
+    # list and the panel), a gateway's access panel is filled again.
+    param([string]$Kind, [string]$Id, [string]$Name)
+    if ($Kind -eq 'connections') {
+        $row = @($script:State.ConnRows | Where-Object { [string]$_.Id -eq $Id }) | Select-Object -First 1
+        if ($row) { Start-GLUsersRead -Items @($row) -Why 'Reading users again'; return }
+    }
+    if ((Get-GLSelectedId $Kind) -eq $Id) { Update-GLAccess -Kind $Kind -Id $Id -Name $Name }
 }
 
 function Invoke-GLAddAccess {
@@ -5803,7 +6232,7 @@ function Invoke-GLAddAccess {
         param($r, $err, $ctx)
         if ($err -or -not $r) { return }
         Write-GLLog "Added $($r.Who) as $($ctx.Role) on '$($ctx.Name)'."
-        if ((Get-GLSelectedId $ctx.Kind) -eq $ctx.Id) { Update-GLAccess -Kind $ctx.Kind -Id $ctx.Id -Name $ctx.Name }
+        Update-GLAfterAccessChange -Kind $ctx.Kind -Id $ctx.Id -Name $ctx.Name
     }
 }
 
@@ -5840,7 +6269,7 @@ function Invoke-GLRemoveAccess {
         param($r, $err, $ctx)
         if ($err) { return }
         Write-GLLog "Removed $($ctx.Who) from '$($ctx.Name)'."
-        if ((Get-GLSelectedId $ctx.Kind) -eq $ctx.Id) { Update-GLAccess -Kind $ctx.Kind -Id $ctx.Id -Name $ctx.Name }
+        Update-GLAfterAccessChange -Kind $ctx.Kind -Id $ctx.Id -Name $ctx.Name
     }
 }
 
@@ -5892,6 +6321,12 @@ function Start-GLSmokeTest {
     $plan.Add(@{ Kind = 'ShowView'; Value = 'Duplicates' })
     $plan.Add(@{ Kind = 'ShowView'; Value = 'All connections' })
     $plan.Add(@{ Kind = 'Tab'; Value = 1 })
+    # the search box filters once typing stops - and gives every row back when cleared
+    $plan.Add(@{ Kind = 'Filter'; Value = 'Sales' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'FilterCheck' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'FilterBack' })
     $plan.Add(@{ Kind = 'GridChecks' })
     $plan.Add(@{ Kind = 'Tab'; Value = 0 })
     $plan.Add(@{ Kind = 'Kiosk' })
@@ -5922,14 +6357,33 @@ function Step-GLSmokeTest {
     switch ($p.Kind) {
         'Theme' { $script:UI.CmbTheme.SelectedItem = $p.Value }
         'Tab'   { $script:UI.Tabs.SelectedIndex = $p.Value }
-        'Font'  { Set-GLFontSize $p.Value }
+        'Font'  { Set-GLFontSize $p.Value; if ($p.Value -eq 16) { $sm.TileScale = Get-GLTileScale } }
         'GridChecks' { $sm.GridChecks = Test-GLGridBehaviour -Grid $script:UI.GridConnections }
+        'Wait'   { }
+        'Filter' {
+            $sm.FilterAll = @($script:UI.GridConnections.ItemsSource).Count
+            $script:UI.TxtCnSearch.Text = $p.Value
+        }
+        'FilterCheck' {
+            $n = @($script:UI.GridConnections.ItemsSource).Count
+            $sm.FilterOk = $n -gt 0 -and $n -lt $sm.FilterAll
+            $script:UI.TxtCnSearch.Text = ''
+        }
+        'FilterBack' { $sm.FilterOk = $sm.FilterOk -and @($script:UI.GridConnections.ItemsSource).Count -eq $sm.FilterAll }
         'ShowView' {
             $script:UI.CmbCnShow.SelectedItem = $p.Value
             if ($p.Value -eq 'Duplicates') { $sm.Duplicates = @($script:UI.GridConnections.ItemsSource).Count }
         }
-        'Kiosk' { Enter-GLKiosk; $sm.KioskIn = ($script:UI.HeaderBar.Visibility -eq 'Collapsed' -and $script:UI.GwDetail.Visibility -eq 'Collapsed') }
-        'KioskOff' { Exit-GLKiosk; $sm.KioskOk = $sm.KioskIn -and $script:UI.HeaderBar.Visibility -eq 'Visible' -and $script:UI.GwDetail.Visibility -eq 'Visible' -and -not $script:KioskSaved }
+        'Kiosk' {
+            $sm.AutoBefore = [string]$script:UI.CmbAutoRefresh.SelectedItem
+            Enter-GLKiosk
+            $sm.KioskIn = ($script:UI.HeaderBar.Visibility -eq 'Collapsed' -and $script:UI.GwDetail.Visibility -eq 'Collapsed')
+        }
+        'KioskOff' {
+            Exit-GLKiosk
+            $sm.KioskOk = $sm.KioskIn -and $script:UI.HeaderBar.Visibility -eq 'Visible' -and $script:UI.GwDetail.Visibility -eq 'Visible' -and -not $script:KioskSaved -and
+                          [string]$script:UI.CmbAutoRefresh.SelectedItem -eq $sm.AutoBefore
+        }
         'Close' { $script:SmokeTimer.Stop(); $script:Window.Close() }
     }
 }
@@ -5946,7 +6400,9 @@ function Get-GLSmokeVerdict {
     if (-not ($script:State.Releases -and $script:State.Releases.Newest)) { $problems.Add('the newest gateway version was not read from the demo''s copy of Microsoft''s pages') }
     $st = @($script:State.Tiles | ForEach-Object Status | Sort-Object -Unique)
     if (@($script:State.Tiles).Count -ne 5 -or ($st -notcontains 'Offline') -or ($st -notcontains 'VNet')) { $problems.Add("gateway tiles: $(@($script:State.Tiles).Count) with $($st -join ', '), expected 5 including Offline and VNet") }
-    if ($script:Smoke -and -not $script:Smoke.KioskOk) { $problems.Add('kiosk view did not hide and restore the window parts') }
+    if ($script:Smoke -and -not $script:Smoke.FilterOk) { $problems.Add('the search box did not filter the connections once typing stopped, or did not give them all back when cleared') }
+    if ($script:Smoke -and -not $script:Smoke.KioskOk) { $problems.Add('kiosk view did not hide and restore the window parts and the auto-refresh') }
+    if ($script:Smoke -and [math]::Abs([double]$script:Smoke.TileScale - 16 / 12) -gt 0.01) { $problems.Add("tiles at text size 16 were drawn at $($script:Smoke.TileScale) of their size, expected 1.33") }
     $cg = $script:UI.GridConnections
     if ($script:Smoke -and $cg -and $cg.RowHeight -ne (Get-GLRowHeight -FontSize $script:Settings.FontSize).Row) {
         $problems.Add("grid rows are $($cg.RowHeight) high at text size $($script:Settings.FontSize), expected $((Get-GLRowHeight -FontSize $script:Settings.FontSize).Row)")
@@ -6056,7 +6512,7 @@ function Show-GLWindow {
         param($s, $e)
         $i = $e.Row.Item
         Set-GLRowColor $e.Row $(if ($i.Status -eq 'Failed' -or $i.GatewayState -eq 'Offline') { 'Danger' }
-                                 elseif ($i.Status -eq 'Timeout' -or $i.GatewayState -eq 'Partial') { 'Warn' } else { '' })
+                                 elseif ($i.Status -in 'Timeout', 'Unverified' -or $i.GatewayState -eq 'Partial') { 'Warn' } else { '' })
     })
 
     # dropdown contents
@@ -6081,6 +6537,7 @@ function Show-GLWindow {
     $script:UI.CmbTheme.Add_SelectionChanged({
         $script:Settings.Theme = Set-GLTheme -Target $script:Window -Name ([string]$script:UI.CmbTheme.SelectedItem)
         $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath
+        Write-GLLog "Theme: $($script:Settings.Theme)."
     })
     $script:UI.BtnFontDown.Add_Click({ Step-GLFontSize -By -1 })
     $script:UI.BtnFontUp.Add_Click({ Step-GLFontSize -By 1 })
@@ -6108,7 +6565,7 @@ function Show-GLWindow {
         Invoke-GLGatewayRefresh
     })
     $script:UI.CmbAutoRefresh.Add_SelectionChanged({ Set-GLAutoRefresh })
-    Add-GLTextChanged $script:UI.TxtGwFilter { Show-GLGateways }
+    Add-GLTextChanged $script:UI.TxtGwFilter { Start-GLDebounce Gateways }
     $script:UI.LstGwTiles.Add_SelectionChanged({ Update-GLGatewayDetail })
     $script:UI.BtnGwExport.Add_Click({ Export-GLGrid -Data (Get-GLGatewayExport) -Suggested 'gateways' })
     $script:UI.BtnGwCopyId.Add_Click({ Copy-GLId -Grid $script:UI.LstGwTiles })
@@ -6125,17 +6582,22 @@ function Show-GLWindow {
 
     # connections
     $script:UI.BtnCnRefresh.Add_Click({ Invoke-GLConnectionRefresh })
-    foreach ($tb in 'TxtCnSearch', 'TxtCnUser', 'TxtCnAccount') { Add-GLTextChanged $script:UI[$tb] { Show-GLConnections } }
-    foreach ($cb in 'CmbCnGateway', 'CmbCnConnectivity', 'CmbCnType') { $script:UI[$cb].Add_SelectionChanged({ Show-GLConnections }) }
-    foreach ($ck in 'ChkStOnline', 'ChkStPartial', 'ChkStOffline', 'ChkStUnknown') { $script:UI[$ck].Add_Click({ Show-GLConnections }) }
-    $script:UI.CmbCnShow.Add_SelectionChanged({ Show-GLConnections })
-    $script:UI.ChkCnCloud.Add_Click({ Update-GLConnectionCombos; Show-GLConnections })
+    foreach ($tb in 'TxtCnSearch', 'TxtCnUser', 'TxtCnAccount') { Add-GLTextChanged $script:UI[$tb] { Start-GLDebounce Connections } }
+    foreach ($cb in 'CmbCnGateway', 'CmbCnConnectivity', 'CmbCnType') { $script:UI[$cb].Add_SelectionChanged({ Show-GLConnections -Say }) }
+    foreach ($ck in 'ChkStOnline', 'ChkStPartial', 'ChkStOffline', 'ChkStUnknown') { $script:UI[$ck].Add_Click({ Show-GLConnections -Say }) }
+    $script:UI.CmbCnShow.Add_SelectionChanged({ Show-GLConnections -Say })
+    $script:UI.ChkCnCloud.Add_Click({ Update-GLConnectionCombos; Show-GLConnections -Say })
     $script:UI.BtnCnAccessReport.Add_Click({ Invoke-GLAccessReportUi })
     $script:UI.BtnCopyAccess.Add_Click({ Invoke-GLHandoverUi })
     $script:UI.BtnMoveAccess.Add_Click({ Invoke-GLHandoverUi -Move })
     $script:UI.GridConnections.Add_SelectionChanged({ Update-GLConnectionDetail })
     $script:UI.BtnCnExclude.Add_Click({ Invoke-GLExclude })
-    $script:UI.BtnCnUnexclude.Add_Click({ $script:State.Excluded.Clear(); Show-GLConnections })
+    $script:UI.BtnCnUnexclude.Add_Click({
+        $n = $script:State.Excluded.Count
+        $script:State.Excluded.Clear()
+        Show-GLConnections
+        Write-GLLog "$n excluded row(s) are back in the list."
+    })
     $script:UI.BtnCnExport.Add_Click({ Export-GLGrid -Grid $script:UI.GridConnections -Suggested 'connections' })
     $script:UI.BtnCnCopyId.Add_Click({ Copy-GLId -Grid $script:UI.GridConnections })
     $script:UI.BtnCnTest.Add_Click({ Invoke-GLTestConnection })
@@ -6149,7 +6611,7 @@ function Show-GLWindow {
     $script:UI.BtnBulkDelete.Add_Click({ Invoke-GLBulkDeleteUi })
 
     # log panel
-    Add-GLTextChanged $script:UI.TxtLogFind { Update-GLLogView }
+    Add-GLTextChanged $script:UI.TxtLogFind { Start-GLDebounce Log }
     $script:UI.CmbLogLevel.Add_SelectionChanged({ Update-GLLogView })
     $script:UI.BtnLogCopy.Add_Click({ Copy-GLLog })
     $script:UI.BtnLogSave.Add_Click({ Save-GLLog })

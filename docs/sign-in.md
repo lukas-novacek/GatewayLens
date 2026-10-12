@@ -78,13 +78,14 @@ What it asks for, and why:
 | Power BI Service | `Connection.ReadWrite.All` | Connections, connection access, delete |
 | Power BI Service | `Dataset.ReadWrite.All` | Connection test, update credentials (Power BI REST API) |
 | Microsoft Graph | `User.Read` | Signing in, the signed-in user's own name |
+| Microsoft Graph | `Directory.Read.All` | The names of the people, groups and apps in access lists - Fabric gives only their object ids |
 | Microsoft Graph | `User.ReadBasic.All` | Finding a user by email when granting access |
 | Microsoft Graph | `GroupMember.Read.All` | Finding a group by name when granting access |
 | Microsoft Graph | `Application.Read.All` | Finding a service principal by name when granting access |
 
 All of them are delegated: GatewayLens can never do more than the person using it.
-Without the Graph permissions, everything works except looking people up by name -
-access is then granted by object id.
+Without the Graph permissions, everything works except names: the access lists
+show object ids, and access is granted by object id.
 
 Sign-in policies (Conditional Access, MFA) apply to GatewayLens like to any other
 app. If one blocks it, the error names the policy check that failed.

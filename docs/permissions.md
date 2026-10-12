@@ -44,12 +44,13 @@ ones the Fabric API uses.
 | Enable or disable a member | Admin on the gateway |
 | Update a connection's credentials | Owner of the connection, or Admin on its gateway |
 | Delete a connection | Owner of the connection |
-| Hand over access (copy or move roles) | Owner of each connection; Admin on each gateway (with *Gateways too*) |
+| Hand over access (copy or move roles) | Owner of each connection; Admin on each gateway (with *Gateway clusters too*) |
 | Access report | Owner of each connection and Admin on each gateway - for any other, its row says it could not be read |
 | Connection recency | Comes with the connections list - Microsoft decides which connections carry it for your account (preview) |
 | Connections per cluster | Nothing extra - the count is what your account can see, so a cluster can hold more |
 | Usernames and access in one call | Admin on the gateways concerned |
 | Grant access by name or email | Permission to read users and groups in Microsoft Graph - normal for members of most tenants |
+| Names in access lists | Permission to read the directory in Microsoft Graph - without it, the lists show object ids |
 
 These follow Microsoft's role model. The exact rule for any single call is in
 Microsoft's REST API reference; when in doubt, the self-test shows what actually
@@ -63,7 +64,13 @@ To work with a gateway, ask one of its admins to add you.
 
 ## Microsoft Graph
 
+Fabric says who has access by object id only. GatewayLens asks Microsoft Graph for
+the names, up to 1,000 in one call, and remembers them while the window is open.
+
 Granting access by name ("jane@contoso.com", "BI Team") turns the name into an
-object id through Microsoft Graph. If your organisation has not approved the Graph
-permissions for GatewayLens, paste the object id instead - you will find it in the
-Microsoft Entra admin center.
+object id through Microsoft Graph too. If your organisation has not approved the
+Graph permissions for GatewayLens, the access lists show object ids, and you paste
+an object id to grant access or hand it over - you will find it in the Microsoft
+Entra admin center, or in the access lists themselves. Someone whose account has
+been deleted is no longer in Graph: hand over their access by the object id the
+lists show.
