@@ -1,8 +1,8 @@
 # What your account needs
 
 GatewayLens acts as **you**. It can see and change exactly what your account can
-in the Power BI and Fabric portals - no more. Nothing needs to be set up in the
-tenant first, and no app registration is required.
+in the Power BI and Fabric portals - no more. The only set-up is a one-time
+approval of GatewayLens by your organisation - see [sign-in.md](sign-in.md).
 
 The quickest way to find out what works for you is:
 
@@ -43,8 +43,11 @@ ones the Fabric API uses.
 | Live member status | Admin on the gateway |
 | Enable or disable a member | Admin on the gateway |
 | Update a connection's credentials | Owner of the connection, or Admin on its gateway |
-| Create a connection | Admin, or a connection-creator role, on the gateway |
 | Delete a connection | Owner of the connection |
+| Hand over access (copy or move roles) | Owner of each connection; Admin on each gateway (with *Gateways too*) |
+| Access report | Owner of each connection and Admin on each gateway - for any other, its row says it could not be read |
+| Connection recency | Comes with the connections list - Microsoft decides which connections carry it for your account (preview) |
+| Connections per cluster | Nothing extra - the count is what your account can see, so a cluster can hold more |
 | Usernames and access in one call | Admin on the gateways concerned |
 | Grant access by name or email | Permission to read users and groups in Microsoft Graph - normal for members of most tenants |
 
@@ -61,6 +64,6 @@ To work with a gateway, ask one of its admins to add you.
 ## Microsoft Graph
 
 Granting access by name ("jane@contoso.com", "BI Team") turns the name into an
-object id through Microsoft Graph. This needs Az.Accounts. With
-MicrosoftPowerBIMgmt, paste the object id instead - you will find it in the
+object id through Microsoft Graph. If your organisation has not approved the Graph
+permissions for GatewayLens, paste the object id instead - you will find it in the
 Microsoft Entra admin center.

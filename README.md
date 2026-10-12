@@ -1,234 +1,301 @@
-<img src="assets/icon-256.png" width="88" align="right" alt="">
+<img src="assets/icon-256.png" width="96" align="right" alt="">
 
 # GatewayLens
 
-A lightweight desktop console for **Microsoft on-premises data gateways** and the
-connections that run on them, for Power BI and Microsoft Fabric.
+### The missing admin console for Power BI and Fabric data gateways
 
-One PowerShell script - or one small exe. No database, no server, no agent on the
-gateways. Sign in as yourself and see every gateway, every member, every connection
-and who has access to it - in one window.
+**Hundreds of gateway connections? Do in minutes what takes days in the portal.**
 
-![tests](https://github.com/<your-github-name>/GatewayLens/actions/workflows/tests.yml/badge.svg)
+- A service account password changed? **Update every connection that uses it in one run** - and see straight away which ones work.
+- Someone leaving? **Move all their access** - every connection, every gateway, the same roles - to their successor.
+- A gateway cluster filling up? **Find the connections nobody has used for months**, and the duplicates, before you hit Microsoft's limit of 1,000.
+- Need to know what is down? **A live wall of every gateway cluster**, on any screen.
 
-<!-- Add a screenshot taken in demo mode (.\GatewayLens.ps1 -Demo): save it as
-docs/screenshot.png and uncomment the line below.
-![GatewayLens](docs/screenshot.png)
+Free and open source. One exe, nothing installed on the gateways, signs in as you.
+
+**[Download GatewayLens.exe](../../releases/latest)** - **[Try the demo in two minutes](#try-it-in-two-minutes)** - **[See everything it does](#what-it-does)**
+
+![release](https://img.shields.io/github/v/release/lukas-novacek/GatewayLens)
+![downloads](https://img.shields.io/github/downloads/lukas-novacek/GatewayLens/total)
+![tests](https://github.com/lukas-novacek/GatewayLens/actions/workflows/tests.yml/badge.svg)
+![licence](https://img.shields.io/badge/licence-MIT-blue)
+
+<!-- Screenshots and a short GIF sell this more than any text. Take them in demo mode
+(.\GatewayLens.ps1 -Demo) - Contoso is fictional, so nothing real is shown. Save them
+as docs/gateways.png, docs/connections.png and docs/demo.gif, then uncomment:
+![The gateway wall](docs/gateways.png)
+![Connections, filtered by the account in their credentials](docs/connections.png)
 -->
 
-## Why
+## Built for big tenants
 
-The portal's *Manage connections and gateways* page works well for one gateway.
-With dozens of gateway clusters and hundreds of connections, the everyday
-questions get slow to answer:
+The portal's *Manage connections and gateways* page is fine for a handful of
+connections. With dozens of gateway clusters and hundreds or thousands of
+connections, everyday admin work turns into hours of clicking through one item at a
+time. GatewayLens does the same work in bulk, safely:
 
-- Which gateway members are offline right now, and which are on an old version?
-- Which connections run on this gateway, and what do they point at?
-- Who can use this connection - and can I give a colleague access without
-  clicking through every connection one at a time?
-
-GatewayLens answers those in one place.
+| The job | In the portal | In GatewayLens |
+|---|---|---|
+| **Rotate a service account password** | Edit each connection's credentials, one by one | Filter by the account stored in the credentials, update every connection in one run - each one is then tested |
+| **Someone leaves the company** | Find each connection and gateway they can use, share it again, remove them | **Move access**: their successor gets exactly the same roles everywhere, then theirs are removed |
+| **Who can use what?** | Open each connection's list of users | Filter by person, by credential account, by server or database - and export an access report for the auditor |
+| **Make room on a cluster** | Check connections one by one | Connections counted per cluster against the 1,000 limit; *not used for 90 days*, *no use recorded*, *duplicates*, *failing* - then delete, with a backup written first |
+| **Is every gateway up, current and supported?** | Open each gateway | One coloured tile per cluster, a kiosk mode for a wall screen, versions checked against Microsoft's list of supported releases |
+| **What changed, and who did it?** | - | Every change is recorded the moment it happens: who, when, what, and the result |
 
 ## What it does
 
-**Gateways**
-- Every gateway you can see: on-premises, personal and virtual network
-- Members with version, enabled state and live online / offline status *(optional - see below)*
-- Version drift at a glance, a running "x of y members online", and auto-refresh
-- Enable and disable members - with a warning before you disable the last one
-- Copy one gateway or all of them as tab-separated text, ready for Excel or a ticket
-- Resolve member machines to IP addresses, one block per gateway
-- Gateway access: admins and connection creators, with add and remove
+### Monitor every gateway
+- **One coloured tile per gateway cluster** - on-premises and virtual network: green
+  online, amber degraded, red offline. Problems come first, so they are seen from
+  across the room.
+- Each tile shows members online ("1 of 2 members online"), the gateway version and
+  its release month, how long a member has been down, and the cluster's connections
+  against the 1,000 limit.
+- **Versions against Microsoft's own list** - the newest build from the
+  [Download Center](https://www.microsoft.com/en-us/download/details.aspx?id=53127)
+  and the six monthly releases Microsoft still supports from
+  [Learn](https://learn.microsoft.com/en-us/data-integration/gateway/service-gateway-monthly-updates).
+  Badges say **UNSUPPORTED VERSION**, **UPDATE AVAILABLE**, **MIXED VERSIONS**,
+  **NEAR CONNECTION LIMIT** or **AT CONNECTION LIMIT**.
+- **Kiosk view** - full screen, tiles only, nothing that changes anything, refreshing
+  every minute. The **Kiosk view** button, `-Kiosk` or F11; Esc leaves it.
+- **VNet gateways are never woken up.** A status check starts a VNet gateway that has
+  gone to sleep, and it then uses capacity - so *Skip VNet status* is on by default.
+- Enable or disable members, with a warning before the last one. Copy a cluster as
+  tab-separated text for Excel or a ticket. Resolve member machines to IP addresses.
 
-**Connections**
-- Every connection, with filters you can combine: several search values at once,
-  gateway, connectivity, type, a user with access, the account stored in the
-  credentials, and whether the connection's gateway is online
-- Exclude rows you want to leave alone, then act on everything that is left:
-  - **Verify status** - the gateway's own reason for every failing connection
-  - **Verify users** - who has access to each one
-  - **Grant** or **remove** access for any number of users and groups
-  - **Update credentials** - Windows, Basic, Anonymous or Key
-  - **Delete** - only after typing the count to confirm
-- Single-connection access and a connection test in the panel below the list
+### Find any connection
+Filters you can combine, which the portal does not have:
+- **who has access** - one person, a group, anyone whose email contains a word
+- **the account stored in the credentials** - every connection that uses `svc_sales`
+- **the server, database or path** - several values at once: `sql01; sql02; ora-prd`
+- gateway, connectivity, type, and whether the connection's gateway is online
+- gateway connections only by default; cloud connections with one tick
 
-**Create connections**
-- Type rows in, paste connection strings, or load a CSV - and create them all on
-  any on-premises gateway in one go. Passwords are never stored in a file.
+Every list works like a spreadsheet: **click a column name to sort** - the sort stays
+through refreshes - and **copy** a cell, the selected rows or all of them, with or
+without the column names (Ctrl+C, Ctrl+Shift+C, or right-click). It pastes into Excel
+as cells. **Double-click a cell** to select just part of it, such as a server name in
+a long path.
 
-**Everywhere**
-- Every bulk run shows progress and can be cancelled
-- CSV export of any list
-- Nothing blocks the window: every API call runs in the background
-- A plain activity log of what was done, and the reason for anything that was not
+### Change hundreds of connections at once
+Everything acts on every listed connection - filter first, exclude what you want to
+leave alone, then press one button:
+- **Update credentials** - Windows, Basic, Anonymous or Key - and **test them
+  afterwards**, so you know at once which ones still fail.
+- **Grant** or **remove** access for any number of people and groups.
+- **Verify status** - the gateway's own reason for every failing connection.
+- **Verify users** - who has access to each one.
+- **Delete** - only after typing the count, and only after a backup is written.
 
-## Requirements
+### Hand over access
+For someone leaving, or a new owner of a team's connections. Name who hands over and
+who takes over. **Copy access** gives the successor exactly the same roles on every
+listed connection - and on every gateway, if you want - raising a lower role where
+they already have one. **Move access** does that, then removes the old roles - but
+only where the successor has them by then, so nothing is ever left without an owner.
 
-- Windows with **PowerShell 7.2 or later** - `winget install Microsoft.PowerShell`
-- One sign-in module, either of:
-  - **Az.Accounts** *(recommended)* - `Install-Module Az.Accounts -Scope CurrentUser`
-  - MicrosoftPowerBIMgmt - works, but cannot look people up by name, so granting
-    access needs an object id
+### Clean up before you hit the limit
+Microsoft allows
+[1,000 data sources per gateway cluster](https://learn.microsoft.com/en-us/data-integration/gateway/service-gateway-onprem).
+Every tile counts the connections on its cluster, and the **Show** filter finds the
+ones to remove:
+- **Last used over 30, 90, 180 or 365 days ago**, and **no use recorded**, from
+  Microsoft's connection recency *(preview in Fabric)*
+- **Duplicates** - the same gateway, type, path and account, side by side
+- **Failing tests** - after Verify status
 
-## Get started
+Connection recency is also in the connections export and the access report: when
+each connection was created, last linked to an item, and last used at run time.
 
-**Try it first, without a tenant:**
+### Prove it to an auditor
+- **Access report** - one row per connection or gateway and person, with the role,
+  read fresh from Fabric. With the User filter set: everything that one person can
+  access.
+- **Change record** - every change GatewayLens makes, one row each, as it happens:
+  who, when, what, the person and role, the result, and Microsoft's reason for
+  anything that failed. If the record cannot be written, the change is not made.
+- CSV export of any list, ready for Excel.
+
+## Try it in two minutes
 
 ```powershell
 .\GatewayLens.ps1 -Demo
 ```
 
 Demo mode opens the real application on Contoso, a fictional company: gateways
-online, offline and slow, connections that fail for different reasons, people,
-groups and a week of change history. Every button works, nothing leaves your
-computer, and no sign-in or Azure module is needed. It is also the safe way to take
-screenshots.
+online, offline and slow, connections that fail for different reasons, a stale
+duplicate, people and groups. Every button works, nothing leaves your computer, and
+no sign-in is needed. Things to try:
 
-**The exe** - download `GatewayLens.exe` from the
-[Releases](../../releases) page and run it. It carries the script inside it and
-starts it in PowerShell 7; if PowerShell 7 is missing, it says how to install it.
+1. **Kiosk view** (F11) - the wall screen.
+2. **Connections > Verify status** - five connections fail, and the *StatusDetail* column
+   says why: a login, an expired password, a gateway that is offline.
+3. **Joe Smith is leaving**: set *User* to `joe.smith`, press *Verify users*, then in
+   *Hand over access* set *To* to `ana.novak@contoso.com` and press *Move access*.
+4. **Show > Duplicates** - a stale copy of Sales DW is taking a slot on the Prod cluster.
+
+## Use it on your tenant
+
+**The exe** - download `GatewayLens.exe` from [Releases](../../releases) and run it.
+It carries the script inside it and starts it in PowerShell 7; if PowerShell 7 is
+missing, it says how to install it.
 
 **Or the script:**
 
 ```powershell
-# 1. Download GatewayLens.ps1, then allow it to run
-Unblock-File .\GatewayLens.ps1
-
-# 2. Check what works for your account - read-only, changes nothing
-.\GatewayLens.ps1 -SelfTest
-
-# 3. Open the console
-.\GatewayLens.ps1
+Unblock-File .\GatewayLens.ps1      # allow the downloaded script to run
+.\GatewayLens.ps1 -SelfTest         # what works for your account - read-only, changes nothing
+.\GatewayLens.ps1                   # the console
 ```
 
 Run the self-test first - `GatewayLens.exe -SelfTest` works too. It signs you in,
 calls every API once and reports what your account can and cannot do, so a missing
 permission shows up as one clear line instead of an empty grid.
 
-Other options:
+### Requirements and sign-in
+
+- Windows with **PowerShell 7.2 or later** - `winget install Microsoft.PowerShell`
+- Nothing else. GatewayLens signs in **as you**, in the browser, and acts with your
+  permissions - exactly what you can see and change in the portal, no more. On a
+  company PC the browser usually signs you in without a password.
+
+| | You need | Approval by your organisation |
+|---|---|---|
+| **Az.Accounts** - used when installed | `Install-Module Az.Accounts -Scope CurrentUser`, once, no admin rights | None |
+| **Built-in** - used when it is not | Nothing | Once, the first time anyone uses GatewayLens |
+
+[docs/sign-in.md](docs/sign-in.md) has the details, and a section to forward to IT.
+[docs/permissions.md](docs/permissions.md) says which role each action needs.
+
+### Options
 
 ```powershell
+.\GatewayLens.ps1 -Kiosk                                # straight into the wall screen
+.\GatewayLens.ps1 -Account admin.jane@contoso.com       # a separate admin account
 .\GatewayLens.ps1 -TenantId contoso.onmicrosoft.com     # a specific tenant
 .\GatewayLens.ps1 -DeviceCode                           # sign in on another device
-.\GatewayLens.ps1 -DnsSuffix corp.contoso.com           # extra suffix for Resolve IPs
-.\GatewayLens.ps1 -LogFolder \\server\share\gatewaylens  # a shared change record for a team
+.\GatewayLens.ps1 -LogFolder \\server\share\gatewaylens  # one change record for a whole team
+.\GatewayLens.ps1 -SignIn Browser                       # the built-in sign-in, even with Az.Accounts
+.\GatewayLens.ps1 -ClientId <application id>            # your organisation's own app registration
+.\GatewayLens.ps1 -DnsSuffix corp.contoso.com           # an extra suffix for Resolve IPs
 .\GatewayLens.ps1 -Inspect                              # which fields the APIs return (no data)
 .\GatewayLens.ps1 -Demo -SelfTest                       # the self-test against the demo
 Get-Help .\GatewayLens.ps1 -Full                        # everything else
 ```
 
-### About the exe
+## Safe by design
 
-`GatewayLens.exe` is a small launcher built from [build/launcher](build/launcher)
-by GitHub Actions - the same script, inside. It needs no runtime of its own (.NET
-Framework 4.8 is part of Windows 10 and 11), but it does need **PowerShell 7**.
+GatewayLens can change access and credentials on hundreds of connections, so it is
+built to make mistakes hard:
+- **Nothing changes until you press a button that says so** - and every one of them
+  asks first, naming exactly what it will do and to how many items.
+- **One item at a time**, cancellable at any point, with a report of every item that
+  did not succeed and why.
+- **No record, no change** - every change is written to the change record as it
+  happens, and is not made at all if the record cannot be written.
+- **Delete writes a backup first** - everything needed to recreate each connection
+  except its password, which the API never returns. No backup, no delete. You type
+  the count to confirm.
+- **Move access never leaves a connection without an owner** - the old role is only
+  removed where the new person has it.
+- **Names are never guessed** - a name that matches more than one person is refused.
+- **No passwords or tokens are stored** - you sign in on Microsoft's own page, and
+  tokens live in memory only. Password boxes are never remembered.
+- **Nothing is sent anywhere but Microsoft** - no telemetry, no server of ours.
+- **VNet gateways are not woken up** unless you ask.
+- **Open source**, with over 400 automated tests - and a demo mode to try every
+  button first.
 
-The exe is not code-signed, so Windows SmartScreen may warn the first time it runs,
-and some company security tools block unsigned programs that start PowerShell. If
-yours does, run the script instead - it is exactly the same tool.
-
-## Activity and change record
-
-Every change GatewayLens makes is recorded the moment it happens, one row per
-connection or member: who, when, what, the principal and role, the result, and
-Microsoft's reason for anything that failed. Passwords never appear. If the record
-cannot be written, the change is not made.
-
-- The **Activity** tab shows the record, filtered by period, action, result, user
-  and text - failures in red - and exports it.
-- **Undo selected** reverses your own completed access changes and member
-  enable / disable. Each undo is recorded too.
-- The **log panel** filters by text or level, and copies or saves what it shows.
-  Everything in it, plus every item of every bulk run, also goes to a daily log
-  file, kept for 30 days.
-
-Both live in `%LOCALAPPDATA%\GatewayLens\logs` - **Open folder** takes you there.
-
-**For a team:** start GatewayLens with `-LogFolder \\server\share\gatewaylens` for
-everyone. The Activity tab then shows the whole team's changes. Each person writes
-only to files with their own name in them, so nobody overwrites anybody.
-
-## Look and feel
-
-- **Themes**: Light, Dark, Midnight and Contrast - top right, switched instantly.
-- **Text size**: the **A-** and **A+** buttons, from 9 to 20.
-- **History**: the search, filter, user, account and principal boxes remember the
-  last 20 entries - open the drop-down to pick one. **Password boxes are never
-  remembered** and always masked. **Clear history** forgets everything.
-
-All three are kept for your Windows account only, in
-`%LOCALAPPDATA%\GatewayLens\settings.json`.
+Exported CSV files contain your tenant's gateway, connection and user names - treat
+them accordingly.
 
 ## What you will see
 
 GatewayLens shows what **your account** can see. The Fabric API lists the gateways
 and connections you hold a role on - it is not a tenant-wide inventory, even for
-Fabric administrators. To manage a gateway or its connections you need the
-matching role on it; [docs/permissions.md](docs/permissions.md) has the details.
+Fabric administrators. Connection counts are what your account can see too, so a
+cluster can hold more. To manage a gateway or its connections you need the matching
+role on it - [docs/permissions.md](docs/permissions.md).
 
 ## Where the data comes from
 
 | Feature | API | Status |
 |---|---|---|
-| Gateways, members, connections, access, delete | Fabric REST API | Documented |
-| Connection test, create, update credentials | Power BI REST API | Documented |
+| Sign-in | Microsoft Entra ID (OAuth 2.0) | Documented |
+| Gateways, members, connections, access, recency, delete | Fabric REST API | Documented (recency is in preview) |
+| Connection test, update credentials | Power BI REST API | Documented |
 | Name lookup when granting access | Microsoft Graph | Documented |
 | **Live member status** | Power BI v2 `gatewayClusters` | **Unofficial** |
 | **Usernames and access in one call** | Power BI v2 `gatewayClusterDatasources` | **Unofficial** |
+| Newest gateway version, supported releases | Microsoft Download Center and Learn pages | Public web pages - read once a session, no sign-in, nothing about your tenant is sent |
 
-### About the unofficial parts
+**About the unofficial parts.** Two things are not available from the documented APIs
+at a reasonable cost, so GatewayLens takes them from the endpoints the portal itself
+uses: whether each member is online right now, and the account stored in each
+connection's credentials with its users, in one call. Each is isolated in a single
+function with its own checkbox. If Microsoft changes one, the only effect is empty
+columns - everything else keeps working.
 
-Two things are not available from Microsoft's documented APIs at a reasonable cost,
-and GatewayLens takes them from the same endpoints the portal itself uses:
-
-- **Live member status** - whether each member is online right now.
-- **Usernames and access in one call** - the account stored in each connection's
-  credentials, and its users. The documented route needs one call per connection
-  for the users and has no username at all.
-
-Each is isolated in a single function and has its own checkbox. If Microsoft ever
-changes one, the only effect is empty columns - everything else keeps working, and
-**Verify users** remains the documented way to read access.
-
-### Credentials
-
-Credentials sent to a gateway must be encrypted with that gateway's public key, in
-exactly the format the gateway expects. GatewayLens uses a port of Microsoft's own
-implementation from the open-source Power BI .NET SDK (MIT License), so it needs no
-extra module - and the test suite decrypts its output with a private key to prove the
+**About credentials.** Credentials sent to a gateway must be encrypted with that
+gateway's public key, in exactly the format the gateway expects. GatewayLens uses a
+port of Microsoft's own implementation from the open-source Power BI .NET SDK (MIT
+License), and the test suite decrypts its output with a private key to prove the
 format byte for byte.
 
-## Safety
+## Log, change record and look
 
-- Nothing changes unless you press a button that says so - and every one of them
-  asks first, naming exactly what it is about to do and to how many connections.
-- Bulk changes go one connection at a time, can be cancelled at any point, and report
-  every connection that did not succeed, with the reason.
-- Every change is written to the change record as it happens - and is not made at
-  all if the record cannot be written. Access and member changes can be undone.
-- **Delete** asks you to type the number of connections, then writes a backup CSV
-  before deleting anything - everything needed to recreate each connection except
-  its password, which the API never returns. If the backup cannot be written, nothing
-  is deleted. Disabling the last enabled member of a gateway warns you that
-  refreshes will stop.
-- A name that matches more than one user or group is refused, not guessed -
-  granting access to the wrong person is worse than asking for the object id.
-- No credentials are stored. Sign-in is handled by Az.Accounts or
-  MicrosoftPowerBIMgmt; GatewayLens only ever holds short-lived access tokens.
-- Exported CSV files contain your tenant's gateway, connection and user names.
-  Treat them accordingly.
+- The **log panel** filters by text or level, and copies or saves what it shows.
+  Everything in it, and every item of every bulk run, also goes to a daily log file,
+  kept for 30 days. The change record is kept for good.
+- Both live in `%LOCALAPPDATA%\GatewayLens\logs` - **Open folder** takes you there.
+  With `-LogFolder \\server\share\gatewaylens` a whole team's records sit in one
+  place; each person writes only to files with their own name in them.
+- **Themes**: Light, Dark, Midnight and Contrast. **Text size**: A- and A+, Ctrl + mouse
+  wheel, or Ctrl + plus and minus - Ctrl + 0 goes back to the default. Rows stay
+  compact and follow the text size, so more of a long list fits on the screen. The
+  search and name boxes remember their last 20 entries; password boxes never do.
+
+## Questions
+
+**Is it really free?** Yes - MIT licence, for any use, including at work.
+
+**Is it from Microsoft?** No. It is an independent tool that uses Microsoft's own
+APIs, with your own sign-in and permissions.
+
+**Does it need admin rights on my PC, or anything on the gateways?** No. It runs as
+you, and the gateways are only reached through Microsoft's APIs.
+
+**Can it see every gateway in the tenant?** It sees what your account can see - the
+same as the portal. See [What you will see](#what-you-will-see).
+
+**Will it wake up my VNet gateways?** Not unless you untick *Skip VNet status*.
+
+**Does it send my data anywhere?** Only to Microsoft's APIs, which it needs to do its
+job, and it reads two public Microsoft pages for the newest gateway version. There is
+no telemetry and no server of ours.
 
 ## Troubleshooting
 
 **An empty grid.** Run `.\GatewayLens.ps1 -SelfTest`. It names the call that failed
 and the API's own error message.
 
+**Sign-in says GatewayLens is not approved.** Your organisation approves it once -
+see [docs/sign-in.md](docs/sign-in.md), which you can forward to IT. Or install
+Az.Accounts (`Install-Module Az.Accounts -Scope CurrentUser`) and start again - no
+approval is needed that way.
+
 **"cannot be loaded because running scripts is disabled".** Run
 `Unblock-File .\GatewayLens.ps1`, or for your user only:
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 
-**The Status column shows n/a.** The unofficial status endpoint did not answer -
-see the activity log for the reason. Untick *Live member status* to stop trying.
+**The exe is blocked or SmartScreen warns.** The exe is not code-signed, and some
+company security tools block unsigned programs that start PowerShell. Run the script
+instead - it is exactly the same tool.
+
+**The Status column shows n/a.** The unofficial status endpoint did not answer - the
+log says why. Untick *Live member status* to stop trying.
 
 **A connection test fails with a data source error.** That is the gateway's own
 answer: it reached the gateway, and the gateway could not reach the data source.
@@ -236,10 +303,18 @@ answer: it reached the gateway, and the gateway could not reach the data source.
 ## Roadmap
 
 - Local snapshots, to show what changed and what was deleted since a given day
-- Sign-in as a service principal for unattended reporting
+- Sign-in as a service principal, for unattended reports
 - Credentials for virtual network gateway connections
 
-Suggestions are welcome as issues.
+Ideas and bug reports are welcome as [issues](../../issues).
+
+## About
+
+GatewayLens is made by **Lukas Novacek**. <!-- one line about you: what you do, and what people can contact you for -->
+
+<!-- - LinkedIn: add the link to your profile here -->
+- If GatewayLens saves you time, **star the repository** and share it with a
+  colleague who runs gateways - that is what keeps it going.
 
 ## Development
 
@@ -248,13 +323,13 @@ Suggestions are welcome as issues.
 .\build\Build-Exe.ps1          # builds dist\GatewayLens.exe (needs the .NET SDK)
 ```
 
-The tests replace every call to Microsoft with a stand-in, so they run on every
-push via GitHub Actions - which also builds the exe each time; download it from the
-run's **Artifacts**. Pushing a tag such as `v0.3.0` publishes a release with the
-exe and the script attached. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+The tests replace every call to Microsoft with a stand-in, so they run on every push
+via GitHub Actions - which also builds the exe; download it from the run's
+**Artifacts**. Pushing a tag such as `v0.6.0` publishes a release with the exe and
+the script attached. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence
 
 [MIT](LICENSE). GatewayLens is an independent project and is not affiliated with,
-endorsed by or supported by Microsoft. Power BI and Microsoft Fabric are trademarks
-of Microsoft Corporation.
+endorsed by or supported by Microsoft. Power BI and Microsoft Fabric are trademarks of
+Microsoft Corporation.

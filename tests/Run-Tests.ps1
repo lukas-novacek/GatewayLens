@@ -46,11 +46,21 @@ $nonAscii = foreach ($f in $repoFiles) {
 Assert (-not $nonAscii) "every file is plain ASCII $(if ($nonAscii) { '- not: ' + ($nonAscii -join ', ') })"
 
 # A GUID in the code is almost always a tenant, app registration or object id
-# that belongs to someone. The tool has no reason to contain one.
+# that belongs to someone. The one exception is GatewayLens's own public client id,
+# on the single line marked public-client-id - every sign-in page shows it anyway.
 $guidRx = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 $text   = Get-Content $script -Raw
-$guids  = [regex]::Matches($text, $guidRx) | ForEach-Object Value
-Assert (-not $guids) "no GUID literals in the script $(if ($guids) { '- found: ' + ($guids -join ', ') })"
+$marked = @(($text -split "`n") | Where-Object { $_ -match '#\s*public-client-id\s*$' })
+Assert ($marked.Count -eq 1 -and $marked[0] -match "^\`$script:BuiltInClientId = '($guidRx)?'\s+#\s*public-client-id\s*$") "exactly one line is marked public-client-id, and it holds only the built-in client id ($($marked.Count) marked)"
+$unmarked = (($text -split "`n") | Where-Object { $_ -notmatch '#\s*public-client-id\s*$' }) -join "`n"
+$guids  = [regex]::Matches($unmarked, $guidRx) | ForEach-Object Value
+Assert (-not $guids) "no other GUID literals in the script $(if ($guids) { '- found: ' + ($guids -join ', ') })"
+
+# Tokens are as good as a password for an hour: nothing may write one anywhere.
+$leaks = @(($text -split "`n") | Where-Object {
+    $_ -match '(Write-GLLog|Write-Host|Write-GLChange|Write-GLLogFile|Add-Content|Set-Content|Out-File|Export-Csv)' -and
+    $_ -match '(access_token|refresh_token|RefreshToken|code_verifier|\.Verifier|Tokens\[)' })
+Assert (-not $leaks) "no token is written to the log, the change record or a file $(if ($leaks) { '- ' + ($leaks.Trim() -join '; ') })"
 
 $wordFile = Join-Path $PSScriptRoot 'forbidden-words.local.txt'
 if (Test-Path $wordFile) {
@@ -80,6 +90,12 @@ $bad = $ast.FindAll({
     $automatic -contains $n.Left.VariablePath.UserPath.ToLowerInvariant()
 }, $true) | ForEach-Object { "`$$($_.Left.VariablePath.UserPath) (line $($_.Extent.StartLineNumber))" }
 Assert (-not $bad) "no assignment to an automatic variable $(if ($bad) { '- ' + ($bad -join ', ') })"
+# A parameter is assigned too, when it is bound - $PId is $PID, read-only, and a
+# scriptblock with param($PId) failed every time it ran.
+$badParams = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ParameterAst] }, $true) |
+    Where-Object { $automatic -contains $_.Name.VariablePath.UserPath.ToLowerInvariant() } |
+    ForEach-Object { "line $($_.Extent.StartLineNumber): `$$($_.Name.VariablePath.UserPath)" })
+Assert (-not $badParams) "no parameter is named like an automatic variable $(if ($badParams) { '- ' + ($badParams -join ', ') })"
 
 # #Requires above the help block makes Get-Help ignore the help entirely - the
 # first thing many admins type would show nothing but a parameter list.
@@ -146,6 +162,28 @@ $changelog = Join-Path $root 'CHANGELOG.md'
 if (Test-Path $changelog) {
     Assert ((Get-Content $changelog -Raw) -match "\[$([regex]::Escape($version))\]") "CHANGELOG.md has an entry for $version"
 }
+# PowerShell names ignore case: a job with param($I) that loops with $i overwrites its
+# own input - which is how Verify status and Verify users tested nothing at all.
+$shadow = foreach ($b in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ScriptBlockAst] -and $n.ParamBlock -and $n.Parent }, $true)) {
+    $pn = @($b.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    foreach ($v in $b.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+        $u = $v.VariablePath.UserPath
+        foreach ($p in $pn) { if ($u -ieq $p -and $u -cne $p) { "line $($v.Extent.StartLineNumber): `$$u is `$$p" } }
+    }
+}
+$shadow = @($shadow | Sort-Object -Unique)
+Assert (-not $shadow) "no variable is a parameter spelled with other capitals $(if ($shadow) { '- ' + ($shadow -join '; ') })"
+
+# A .GetNewClosure() handler runs in a module of its own, where the script's
+# functions do not exist - the history boxes failed that way on losing focus.
+$ourFns = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object Name)
+$closureCalls = foreach ($m in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Value -eq 'GetNewClosure' }, $true)) {
+    foreach ($c in $m.Expression.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        if ($ourFns -contains $c.GetCommandName()) { "line $($c.Extent.StartLineNumber): $($c.GetCommandName())" }
+    }
+}
+Assert (-not $closureCalls) "no .GetNewClosure() handler calls the script's own functions $(if ($closureCalls) { '- ' + ($closureCalls -join '; ') })"
+
 $undefined = $script:WorkerFunctions | Where-Object { -not (Get-Command $_ -CommandType Function -ErrorAction SilentlyContinue) }
 Assert (-not $undefined) "every worker function is defined $(if ($undefined) { '- missing: ' + ($undefined -join ', ') })"
 
@@ -156,12 +194,175 @@ Assert (Test-GLGuid '0f8fad5b-d9cb-469f-a165-70867728950e'.Replace('0f8fad5b', '
 Assert (-not (Test-GLGuid 'someone@contoso.com')) 'an email is not a GUID'
 Assert (-not (Test-GLGuid '')) 'empty is not a GUID'
 
-$secure = ConvertTo-SecureString 'plain-token' -AsPlainText -Force
-Assert ((ConvertFrom-GLToken $secure) -eq 'plain-token') 'a SecureString token is converted to text'
-Assert ((ConvertFrom-GLToken 'already-text') -eq 'already-text') 'a text token passes through'
-
 $body = New-GLRoleAssignmentBody -PrincipalId 'p1' -PrincipalType 'Group' -Role 'User' | ConvertTo-Json -Compress -Depth 5
 Assert ($body -match '"principal":\{' -and $body -match '"id":"p1"' -and $body -match '"type":"Group"' -and $body -match '"role":"User"') 'role assignment body has the documented shape'
+
+# ============================================================================
+Section 'Sign-in - plain OAuth in the browser, no module'
+# ============================================================================
+# RFC 7636 appendix B: the published verifier and the challenge it must give
+Assert ((ConvertTo-GLCodeChallenge 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk') -eq 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM') 'the PKCE challenge matches the RFC 7636 example'
+$pk = New-GLPkce; $pk2 = New-GLPkce
+Assert ($pk.Verifier -match '^[A-Za-z0-9_-]{43}$' -and $pk.Challenge -eq (ConvertTo-GLCodeChallenge $pk.Verifier) -and $pk.Verifier -ne $pk2.Verifier) 'each sign-in gets a new random verifier of the right shape'
+
+$q = ConvertFrom-GLQueryString '?code=a%2Fb+c&state=xyz&empty'
+Assert ($q.code -eq 'a/b c' -and $q.state -eq 'xyz' -and $q.ContainsKey('empty') -and $q.empty -eq '') 'the browser''s answer is decoded'
+
+$authArgs = @{ ClientId = 'cid'; Tenant = 'organizations'; RedirectUri = 'http://localhost:5000'; Scope = 'a b'; State = 's1'; Challenge = 'ch' }
+$u  = New-GLAuthorizeUrl @authArgs
+$uq = ConvertFrom-GLQueryString ($u.Split('?')[1])
+Assert ($u.StartsWith('https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?') -and $uq.client_id -eq 'cid' -and $uq.redirect_uri -eq 'http://localhost:5000' -and
+        $uq.scope -eq 'a b' -and $uq.state -eq 's1' -and $uq.code_challenge -eq 'ch' -and $uq.code_challenge_method -eq 'S256' -and $uq.response_type -eq 'code') 'the sign-in address carries everything Entra needs'
+$uh = ConvertFrom-GLQueryString ((New-GLAuthorizeUrl @authArgs -LoginHint 'jane@contoso.com').Split('?')[1])
+Assert (-not $uq.ContainsKey('login_hint') -and $uh.login_hint -eq 'jane@contoso.com') 'an account is suggested to the browser only when there is one'
+
+function New-TestJwt($Claims) { return 'eyJhbGciOiJub25lIn0.' + (ConvertTo-GLBase64Url ([System.Text.Encoding]::UTF8.GetBytes(($Claims | ConvertTo-Json -Compress)))) + '.sig' }
+$padOk = foreach ($n in 'a', 'ab', 'abc', 'abcd') { (ConvertFrom-GLJwt (New-TestJwt @{ preferred_username = 'jane@contoso.com'; tid = 'tenant-1'; name = $n })).name -eq $n }
+Assert (-not ($padOk -contains $false)) 'the sign-in token is read whatever its length (base64url has no padding)'
+$c = ConvertFrom-GLJwt (New-TestJwt @{ preferred_username = 'jane@contoso.com'; tid = 'tenant-1' })
+Assert ($c.preferred_username -eq 'jane@contoso.com' -and $c.tid -eq 'tenant-1') 'the name and tenant are read from the sign-in token'
+Assert ($null -eq (ConvertFrom-GLJwt 'not-a-token') -and $null -eq (ConvertFrom-GLJwt 'a.!!!.c')) 'a malformed token gives nothing, not an error'
+
+$m = Format-GLSignInError 'invalid_client' "AADSTS700016: Application was not found in the directory.`r`nTrace ID: t1`r`nCorrelation ID: c1"
+Assert ($m -match '^invalid_client: AADSTS700016: Application was not found in the directory\. No app registration has this client id' -and $m -notmatch 'Trace ID') 'a sign-in error is one line: the reason and what to do, without trace ids'
+Assert ((Get-GLSignInHint 'AADSTS65001: The user or administrator has not consented') -match 'administrator approves it once') 'not approved yet: says an administrator approves it once'
+Assert ((Get-GLSignInHint 'AADSTS90094: Admin consent is required') -match 'administrator approves it once') 'users may not approve apps: same advice'
+Assert ((Get-GLSignInHint 'AADSTS50011: redirect URI mismatch') -match 'http://localhost') 'a missing redirect address is named'
+Assert ((Get-GLSignInHint 'AADSTS7000218: client_assertion or client_secret') -match 'public client flows') 'device code without public client flows is explained'
+Assert ((Get-GLSignInHint 'invalid_grant: AADSTS700082: The refresh token has expired') -match 'Restart') 'an expired sign-in says to restart'
+Assert ((Get-GLSignInHint 'something unexpected') -eq '') 'an unknown error gets no made-up advice'
+
+# ---- which way to sign in ----
+$cid = [guid]::NewGuid().ToString()
+Assert ((Select-GLSignIn -AzAvailable $true -BuiltInId $cid) -eq 'Az') 'Auto: Az.Accounts is used when installed - it needs no approval'
+Assert ((Select-GLSignIn -AzAvailable $false -BuiltInId $cid) -eq 'Browser') 'Auto: without Az.Accounts, the built-in sign-in - nothing to install'
+Assert ((Select-GLSignIn -AzAvailable $true -BuiltInId '' -ClientId $cid) -eq 'Browser') 'Auto: a -ClientId given on purpose means the built-in sign-in, even with Az.Accounts'
+Assert ((Select-GLSignIn -Requested Browser -AzAvailable $true -BuiltInId $cid) -eq 'Browser' -and (Select-GLSignIn -Requested AzAccounts -AzAvailable $true -BuiltInId '') -eq 'Az') '-SignIn chooses one way'
+$err = ''; try { $null = Select-GLSignIn -AzAvailable $false -BuiltInId '' } catch { $err = $_.Exception.Message }
+Assert ($err -match 'Install-Module Az\.Accounts -Scope CurrentUser' -and $err -match '-ClientId' -and $err -match 'docs/sign-in\.md') 'neither way available: says how to get either, instead of opening a browser'
+$err = ''; try { $null = Select-GLSignIn -Requested AzAccounts -AzAvailable $false -BuiltInId $cid } catch { $err = $_.Exception.Message }
+Assert ($err -match 'not installed' -and $err -match 'Install-Module') '-SignIn AzAccounts without the module says how to install it'
+$err = ''; try { $null = Select-GLSignIn -Requested Browser -AzAvailable $true -BuiltInId '' } catch { $err = $_.Exception.Message }
+Assert ($err -match 'no app registration' -and $err -match '-ClientId') '-SignIn Browser without a client id says what to do'
+$err = ''; try { $null = Select-GLSignIn -AzAvailable $true -BuiltInId $cid -ClientId 'not-an-id' } catch { $err = $_.Exception.Message }
+Assert ($err -match 'application \(client\) id') 'a client id that is not one is refused before anything is sent'
+Assert ((Get-GLSignInHint 'AADSTS65001') -match 'Install-Module Az\.Accounts') 'not approved yet: Az.Accounts is offered as the way round it'
+
+# ---- Az.Accounts, with the module replaced by stand-ins ----
+$keepBuiltIn = $script:BuiltInClientId
+$script:AzInstalled = $false
+function Test-GLAzAccounts { return $script:AzInstalled }
+$script:BuiltInClientId = ''
+$err = ''; try { Connect-GL } catch { $err = $_.Exception.Message }
+Assert ($err -match 'no way to sign in') 'Connect-GL with neither way available stops before anything is sent'
+
+$script:AzInstalled = $true
+$script:AzCalls = [System.Collections.Generic.List[object]]::new()
+function Import-Module { param($Name) $script:AzCalls.Add("import $Name") }
+function Connect-AzAccount { param($TenantId, [switch]$UseDeviceAuthentication, $AccountId) $script:AzCalls.Add("connect tenant=$TenantId device=$UseDeviceAuthentication account=$AccountId") }
+function Get-AzContext { return [pscustomobject]@{ Account = [pscustomobject]@{ Id = 'jane@contoso.com' }; Tenant = [pscustomobject]@{ Id = 'contoso-tenant' } } }
+function Get-AzAccessToken {
+    param($ResourceUrl)
+    $script:AzCalls.Add("token $ResourceUrl")
+    if ($ResourceUrl -match 'graph') { throw 'no Graph for this account' }
+    return [pscustomobject]@{ Token = (ConvertTo-SecureString "tok-$ResourceUrl" -AsPlainText -Force) }
+}
+Connect-GL -Account 'admin.jane@contoso.com' -DeviceCode -TenantId 'contoso.onmicrosoft.com'
+Assert ($script:AuthMode -eq 'Az.Accounts' -and $script:SignedInAs -eq 'jane@contoso.com' -and $script:TenantShown -eq 'contoso-tenant') 'Az.Accounts sign-in: the window shows who signed in'
+Assert ($script:AzCalls -contains 'import Az.Accounts' -and $script:AzCalls -contains 'connect tenant=contoso.onmicrosoft.com device=True account=admin.jane@contoso.com') 'Az.Accounts gets the tenant, the device code choice and the account'
+Assert ((Get-GLToken Fabric) -eq 'tok-https://api.fabric.microsoft.com' -and (Get-GLToken PowerBI) -eq 'tok-https://analysis.windows.net/powerbi/api') 'Az.Accounts hands out the Fabric and Power BI tokens, SecureString turned into text'
+Assert ($null -eq (Get-GLToken Graph)) 'Az.Accounts without Graph: no token - name lookups fall back to object ids'
+$secure = ConvertTo-SecureString 'plain-token' -AsPlainText -Force
+Assert ((ConvertFrom-GLToken $secure) -eq 'plain-token' -and (ConvertFrom-GLToken 'already-text') -eq 'already-text') 'a token is text whichever form Az.Accounts uses'
+foreach ($f in 'Import-Module', 'Connect-AzAccount', 'Get-AzContext', 'Get-AzAccessToken') { Remove-Item "function:$f" }
+$script:AzInstalled = $false
+
+# ---- the built-in sign-in, with Entra replaced by a stand-in ----
+$script:TokenCalls   = [System.Collections.Generic.List[object]]::new()
+$script:TokenReplies = [System.Collections.Generic.Queue[object]]::new()
+function Invoke-GLTokenEndpoint { param($Uri, $Form) $script:TokenCalls.Add([pscustomobject]@{ Uri = $Uri; Form = $Form.Clone() }); return $script:TokenReplies.Dequeue() }
+function New-TokenReply([string]$Access, [string]$Refresh, $Claims) {
+    $b = [pscustomobject]@{ access_token = $Access; expires_in = 3600; refresh_token = $Refresh }
+    if ($Claims) { $b | Add-Member id_token (New-TestJwt $Claims) }
+    return [pscustomobject]@{ Ok = $true; Body = $b; Error = ''; Description = '' }
+}
+function New-TokenError([string]$Code, [string]$Desc) { return [pscustomobject]@{ Ok = $false; Body = $null; Error = $Code; Description = $Desc } }
+
+# The browser: given the sign-in address, it calls the redirect address back the
+# way Entra would - a real HTTP request to the real listener.
+$script:Sent = $null; $script:Browser = $null; $script:BrowserAnswer = ''
+$script:FakeBrowser = {
+    param($u)
+    $script:Sent    = ConvertFrom-GLQueryString $u.Split('?')[1]
+    $a              = $script:BrowserAnswer.Replace('{state}', [uri]::EscapeDataString($script:Sent.state))
+    $script:Browser = [System.Net.Http.HttpClient]::new().GetAsync("$($script:Sent.redirect_uri)/?$a")
+    return $true
+}
+function Set-FakeBrowser([string]$Answer) { $script:BrowserAnswer = $Answer }
+# A real browser must never open during the tests: the app's own opener is replaced.
+function Open-GLBrowser { param($Url) return (& $script:FakeBrowser $Url) }
+function Get-LastCall { return $script:TokenCalls[$script:TokenCalls.Count - 1] }
+function Get-BrowserPage { if (-not $script:Browser.Wait(5000)) { return $null }; $r = $script:Browser.Result; return [pscustomobject]@{ Status = [int]$r.StatusCode; Text = $r.Content.ReadAsStringAsync().Result } }
+
+$script:TokenReplies.Enqueue((New-TokenReply 'fab-1' 'rt-1' @{ preferred_username = 'jane@contoso.com'; tid = 'contoso-tenant' }))
+Set-FakeBrowser 'code=the-code&state={state}'
+$err = ''; try { Connect-GL -ClientId $cid -Account 'admin.jane@contoso.com' } catch { $err = $_.Exception.Message }
+$page = Get-BrowserPage
+Assert (-not $err) "browser sign-in completes against the real listener $(if ($err) { "- $err" })"
+Assert ($script:SignedInAs -eq 'jane@contoso.com' -and $script:TenantShown -eq 'contoso-tenant' -and $script:AuthMode -eq 'Browser') 'the window shows who signed in, and to which tenant'
+Assert ($script:Sent.client_id -eq $cid -and $script:Sent.login_hint -eq 'admin.jane@contoso.com' -and $script:Sent.redirect_uri -match '^http://localhost:\d+$' -and $script:Sent.scope -match 'offline_access') 'the browser is sent with the client id, the chosen account and a localhost return address'
+$tc = $script:TokenCalls[0]
+Assert ($tc.Uri -eq 'https://login.microsoftonline.com/organizations/oauth2/v2.0/token' -and $tc.Form.grant_type -eq 'authorization_code' -and $tc.Form.code -eq 'the-code' -and $tc.Form.client_id -eq $cid) 'the code from the browser is traded for tokens'
+Assert ((ConvertTo-GLCodeChallenge $tc.Form.code_verifier) -eq $script:Sent.code_challenge -and $tc.Form.redirect_uri -eq $script:Sent.redirect_uri) 'the verifier matches the challenge sent, and the return address is the same - Entra checks both'
+Assert ($page -and $page.Status -eq 200 -and $page.Text -match 'signed in') 'the browser tab says sign-in worked'
+$closed = $false; try { $tcp = [System.Net.Sockets.TcpClient]::new(); $tcp.Connect('127.0.0.1', ([uri]$script:Sent.redirect_uri).Port); $tcp.Dispose() } catch { $closed = $true }
+Assert $closed 'the listener is closed as soon as sign-in is done'
+
+$n = $script:TokenCalls.Count
+Assert ((Get-GLToken Fabric) -eq 'fab-1' -and $script:TokenCalls.Count -eq $n) 'a fresh token is reused, not fetched again'
+$script:TokenReplies.Enqueue((New-TokenReply 'pbi-1' 'rt-2'))
+$pbiTok = Get-GLToken PowerBI
+$tc = (Get-LastCall)
+Assert ($pbiTok -eq 'pbi-1' -and $tc.Form.grant_type -eq 'refresh_token' -and $tc.Form.refresh_token -eq 'rt-1' -and $tc.Form.scope -match '^https://analysis\.windows\.net/powerbi/api/\.default') 'a Power BI token comes from the same sign-in, without asking again'
+Assert ($tc.Uri -match '/contoso-tenant/oauth2/v2\.0/token$') 'later tokens come from the tenant actually signed in to'
+Assert ($script:Auth.RefreshToken -eq 'rt-2') 'a new refresh token from Entra replaces the old one'
+$script:Auth.Tokens.Fabric.ExpiresOn = (Get-Date).AddMinutes(5)
+$script:TokenReplies.Enqueue((New-TokenReply 'fab-2' ''))
+Assert ((Get-GLToken Fabric) -eq 'fab-2' -and (Get-LastCall).Form.refresh_token -eq 'rt-2' -and $script:Auth.RefreshToken -eq 'rt-2') 'a token close to expiring is renewed before a job gets it'
+$script:TokenReplies.Enqueue((New-TokenError 'invalid_grant' 'AADSTS65001: The user or administrator has not consented to use the application.'))
+$n = $script:TokenCalls.Count
+$g1 = Get-GLToken Graph; $g2 = Get-GLToken Graph
+Assert ($null -eq $g1 -and $null -eq $g2 -and $script:TokenCalls.Count -eq $n + 1) 'Graph not approved: no token, asked once - name lookups fall back to object ids'
+$script:Auth.Tokens.Fabric.ExpiresOn = (Get-Date).AddMinutes(-1)
+$script:TokenReplies.Enqueue((New-TokenError 'invalid_grant' 'AADSTS700082: The refresh token has expired due to inactivity.'))
+$err = ''; try { $null = Get-GLToken Fabric } catch { $err = $_.Exception.Message }
+Assert ($err -match 'AADSTS700082' -and $err -match 'Restart GatewayLens') 'an expired sign-in fails with the reason and what to do'
+
+Set-FakeBrowser 'error=access_denied&error_description=AADSTS65001%3A+The+user+or+administrator+has+not+consented&state={state}'
+$err = ''; try { Connect-GL -ClientId $cid } catch { $err = $_.Exception.Message }
+$page = Get-BrowserPage
+Assert ($err -match 'access_denied: AADSTS65001' -and $err -match 'administrator approves it once' -and $page.Status -eq 200) 'a refusal in the browser comes back as the reason and what to do'
+
+Set-FakeBrowser 'code=stolen&state=someone-else'
+$err = ''; try { Connect-GLBrowser -ClientId $cid -Tenant 'organizations' -TimeoutSec 2 } catch { $err = $_.Exception.Message }
+$page = Get-BrowserPage
+Assert ($page.Status -eq 400 -and $err -match 'did not finish' -and $err -match '-DeviceCode') 'an answer meant for another sign-in is refused, and the wait ends with advice'
+
+$script:TokenCalls.Clear()
+$script:TokenReplies.Enqueue([pscustomobject]@{ Ok = $true; Error = ''; Description = ''; Body = [pscustomobject]@{ message = 'To sign in, open the page and enter code TEST'; device_code = 'dc-1'; interval = 0; expires_in = 60 } })
+$script:TokenReplies.Enqueue((New-TokenError 'authorization_pending' 'AADSTS70016: pending'))
+$script:TokenReplies.Enqueue((New-TokenReply 'fab-dc' 'rt-dc' @{ upn = 'joe@contoso.com'; tid = 'contoso-tenant' }))
+$err = ''; try { Connect-GL -ClientId $cid -DeviceCode -TenantId 'contoso.onmicrosoft.com' } catch { $err = $_.Exception.Message }
+Assert (-not $err -and $script:AuthMode -eq 'Device code' -and $script:SignedInAs -eq 'joe@contoso.com' -and (Get-GLToken Fabric) -eq 'fab-dc') "device code sign-in waits while Entra says pending, then signs in $(if ($err) { "- $err" })"
+Assert ($script:TokenCalls[0].Uri -match '/contoso\.onmicrosoft\.com/oauth2/v2\.0/devicecode$' -and $script:TokenCalls[2].Form.grant_type -eq 'urn:ietf:params:oauth:grant-type:device_code' -and $script:TokenCalls[2].Form.device_code -eq 'dc-1') 'device code: the code is asked for in the chosen tenant and polled for'
+$script:TokenReplies.Enqueue([pscustomobject]@{ Ok = $true; Error = ''; Description = ''; Body = [pscustomobject]@{ message = 'code'; device_code = 'dc-2'; interval = 0; expires_in = 60 } })
+$script:TokenReplies.Enqueue((New-TokenError 'authorization_declined' 'AADSTS70000: The user declined.'))
+$err = ''; try { Connect-GL -ClientId $cid -DeviceCode } catch { $err = $_.Exception.Message }
+Assert ($err -match 'authorization_declined') 'device code: a refusal stops the wait with the reason'
+
+# back to the real functions and a signed-out state
+. $script -LoadOnly
+Assert ($script:BuiltInClientId -eq $keepBuiltIn -and -not $script:Auth -and -not $script:AuthMode) 'the sign-in tests leave nothing behind'
 
 # ============================================================================
 Section 'Credential encryption - decrypted with the private key to prove the format'
@@ -305,6 +506,31 @@ Assert ($bad.Theme -eq 'Light') 'a damaged settings file falls back to the defau
 Set-Content -Path $sp -Value '{"FontSize": 99, "History": {"PwdX": ["leak"]}}'
 $cl = Read-GLSettings -Path $sp
 Assert ($cl.FontSize -eq 20 -and -not $cl.History.Contains('PwdX')) 'out-of-range font size is clamped, password-like history is dropped on read'
+
+# ---- text size: A- and A+, Ctrl + mouse wheel, Ctrl + plus / minus / 0 ----
+$rh = @(9, 12, 16, 20 | ForEach-Object { Get-GLRowHeight -FontSize $_ })
+Assert ($rh[1].Row -eq 22 -and $rh[1].Header -eq 28) 'rows are compact at the default text size: 22 high, the header 28'
+Assert ($rh[0].Row -eq 18 -and $rh[3].Row -eq 33 -and $rh[0].Row -lt $rh[1].Row -and $rh[1].Row -lt $rh[2].Row -and $rh[2].Row -lt $rh[3].Row) 'smaller text, lower rows; larger text, higher rows - from 18 at 9 to 33 at 20'
+Assert (-not (@(9..20) | Where-Object { (Get-GLRowHeight -FontSize $_).Row -lt [math]::Ceiling($_ * 4 / 3) + 4 })) 'at every text size a row is higher than a line of its text - nothing is cut off'
+Assert ((Get-GLFontStep -Delta 120 -Ctrl $true) -eq 1 -and (Get-GLFontStep -Delta -120 -Ctrl $true) -eq -1) 'Ctrl + mouse wheel: up is larger, down is smaller'
+Assert ($null -eq (Get-GLFontStep -Delta 120 -Ctrl $false)) 'the wheel without Ctrl just scrolls'
+Assert ((Get-GLFontStep -Key 'OemPlus' -Ctrl $true) -eq 1 -and (Get-GLFontStep -Key 'Subtract' -Ctrl $true) -eq -1 -and (Get-GLFontStep -Key 'D0' -Ctrl $true) -eq 0) 'Ctrl + plus, Ctrl + minus (main keys or number pad), and Ctrl + 0 for the default'
+Assert ($null -eq (Get-GLFontStep -Key 'OemPlus' -Ctrl $false) -and $null -eq (Get-GLFontStep -Key 'C' -Ctrl $true)) 'other keys, or no Ctrl: the text size is left alone'
+$keepFont = @{ W = $script:Window; U = $script:UI; S = $script:Settings; P = $script:SettingsPath }
+$script:Window = [pscustomobject]@{ FontSize = 12 }
+$script:UI = @{ TxtFontSize = [pscustomobject]@{ Text = '' }; GridConnections = [pscustomobject]@{ RowHeight = 0; ColumnHeaderHeight = 0 } }
+$script:Settings = New-GLDefaultSettings
+$script:SettingsPath = Join-Path ([System.IO.Path]::GetTempPath()) ('gl-font-' + [guid]::NewGuid().ToString('N') + '.json')
+Step-GLFontSize -By 1
+$savedSize = (Get-Content -Raw $script:SettingsPath | ConvertFrom-Json).FontSize
+Assert ($script:Window.FontSize -eq 13 -and $script:UI.TxtFontSize.Text -eq '13' -and $savedSize -eq 13) 'a step changes the text size, shows it next to A- and A+, and keeps it in the settings'
+Assert ($script:UI.GridConnections.RowHeight -eq 24 -and $script:UI.GridConnections.ColumnHeaderHeight -eq 30) "the grid rows follow the text size ($($script:UI.GridConnections.RowHeight) at 13)"
+foreach ($n in 1..20) { Step-GLFontSize -By 1 }
+Assert ($script:Settings.FontSize -eq 20 -and $script:Window.FontSize -eq 20) 'however far the wheel turns, it stops at 20'
+Step-GLFontSize -Reset
+Assert ($script:Settings.FontSize -eq 12 -and (Get-Content -Raw $script:SettingsPath | ConvertFrom-Json).FontSize -eq 12) 'Ctrl + 0 goes back to the default, 12, and keeps it'
+Remove-Item -LiteralPath $script:SettingsPath -ErrorAction SilentlyContinue
+$script:Window = $keepFont.W; $script:UI = $keepFont.U; $script:Settings = $keepFont.S; $script:SettingsPath = $keepFont.P
 Remove-Item -Recurse -Force (Split-Path -Parent $sp)
 
 # ============================================================================
@@ -352,6 +578,98 @@ Assert ($mrows.Count -eq 2 -and $mrows[0].Machine -eq 'HOST1' -and $mrows[1].Sta
 $noProps = $rows[0].PSObject.Properties.Name | Where-Object { $_ -like '*_*' }
 Assert (-not $noProps) 'no underscores in column names (WPF would hide them)'
 
+$withPersonal = @($gws) + @([pscustomobject]@{ id = 'GP'; displayName = 'Jane (personal mode)'; type = 'OnPremisesPersonal' })
+$pr = ConvertTo-GLGatewayRows -Gateways $withPersonal -Members $mem -Live $live
+Assert ($pr.Count -eq 2 -and -not ($pr | Where-Object Type -eq 'OnPremisesPersonal')) 'personal gateways are left out - on-premises and VNet only'
+
+# ---- the monitoring tiles ----
+Assert ((Format-GLDuration ([timespan]::FromSeconds(20))) -eq 'under a minute' -and (Format-GLDuration ([timespan]::FromMinutes(27.6))) -eq '27 min') 'durations: under a minute, minutes'
+Assert ((Format-GLDuration ([timespan]::FromMinutes(185))) -eq '3 h 05 min' -and (Format-GLDuration ([timespan]::FromHours(52))) -eq '2 d 4 h') 'durations: hours, days'
+
+$t0 = [datetime]'2026-10-12 08:00'
+$d1 = Update-GLDownSince -DownSince @{} -Live $live -Now $t0
+Assert ($d1.Count -eq 1 -and $d1['m2'] -eq $t0) 'a member seen offline is remembered with the time it was first seen'
+$d2 = Update-GLDownSince -DownSince $d1 -Live $live -Now $t0.AddMinutes(30)
+Assert ($d2['m2'] -eq $t0) 'still offline at the next refresh: the first time is kept'
+$liveAgain = @{ 'm1' = [pscustomobject]@{ Status = 'Live' }; 'm2' = [pscustomobject]@{ Status = 'Live' } }
+Assert ((Update-GLDownSince -DownSince $d2 -Live $liveAgain -Now $t0.AddMinutes(40)).Count -eq 0) 'back online: forgotten'
+Assert ((Update-GLDownSince -DownSince $d2 -Live $null -Now $t0).Count -eq 0) 'live status off: nothing is claimed to be down'
+
+$tg = @(
+    [pscustomobject]@{ id = 'G1'; displayName = 'Cluster A'; type = 'OnPremises' }
+    [pscustomobject]@{ id = 'G3'; displayName = 'Cluster C'; type = 'OnPremises' }
+    [pscustomobject]@{ id = 'G4'; displayName = 'Alpha';     type = 'OnPremises' }
+    [pscustomobject]@{ id = 'G2'; displayName = 'VNet B';    type = 'VirtualNetwork' }
+    [pscustomobject]@{ id = 'G5'; displayName = 'Beta';      type = 'OnPremises' }
+)
+$tm = @{
+    'G1' = $mem['G1']                                                                                     # 3000.250.5 + 3000.246.4, one down
+    'G3' = @([pscustomobject]@{ id = 'M3'; displayName = 'c-1'; version = '3000.250.5'; enabled = $true })  # down
+    'G4' = @([pscustomobject]@{ id = 'M4'; displayName = 'a-1'; version = '3000.250.5'; enabled = $true })  # fine
+    'G5' = @([pscustomobject]@{ id = 'M5'; displayName = 'b-1'; version = '3000.240.1'; enabled = $true })  # fine, but behind
+}
+$tl = @{
+    'm1' = [pscustomobject]@{ Status = 'Live' }; 'm2' = [pscustomobject]@{ Status = 'Offline' }
+    'm3' = [pscustomobject]@{ Status = 'Offline' }; 'm4' = [pscustomobject]@{ Status = 'Live' }; 'm5' = [pscustomobject]@{ Status = 'Live' }
+}
+$trows = ConvertTo-GLGatewayRows -Gateways $tg -Members $tm -Live $tl
+$down  = @{ 'm2' = $t0.AddMinutes(-5); 'm3' = $t0.AddMinutes(-27) }
+$tiles = ConvertTo-GLGatewayTiles -Rows $trows -Members $tm -DownSince $down -Now $t0
+$byName = @{}; foreach ($x in $tiles) { $byName[$x.Name] = $x }
+Assert (($tiles | ForEach-Object Name) -join ',' -eq 'Cluster C,Cluster A,Alpha,Beta,VNet B') "problems first: offline, degraded, then the rest by name, VNet last ($(($tiles | ForEach-Object Name) -join ', '))"
+Assert ($byName['Cluster C'].Status -eq 'Offline' -and $byName['Cluster C'].StatusText -eq 'OFFLINE' -and $byName['Cluster C'].DownText -eq 'Down for 27 min') 'an offline gateway says for how long'
+Assert ($byName['Cluster A'].Status -eq 'Degraded' -and $byName['Cluster A'].MembersText -eq '1 of 2 members online' -and $byName['Cluster A'].DownText -eq '1 down, the first for 5 min') 'a degraded gateway: how many members are up, and how long one has been down'
+Assert ($byName['Cluster A'].Badge -eq 'MIXED VERSIONS' -and $byName['Cluster A'].HasBadge -and $byName['Cluster A'].VersionText -eq '3000.246.4 / 3000.250.5') 'members on different versions: MIXED VERSIONS'
+Assert ($byName['Beta'].Badge -eq 'OLDER VERSION' -and $byName['Alpha'].Badge -eq '' -and -not $byName['Alpha'].HasBadge) 'a gateway behind the newest version seen: OLDER VERSION; an up-to-date one: no badge'
+Assert ($byName['Alpha'].Status -eq 'Online' -and $byName['Alpha'].DownText -eq '') 'an online gateway has nothing to say about downtime'
+Assert ($byName['VNet B'].Status -eq 'VNet' -and -not $byName['VNet B'].HasBadge) 'a VNet gateway gets its own tile, with no member checks'
+$quiet = ConvertTo-GLGatewayTiles -Rows (ConvertTo-GLGatewayRows -Gateways $tg -Members $tm -Live $null) -Members $tm -DownSince @{} -Now $t0
+Assert (-not ($quiet | Where-Object { $_.Status -in 'Offline', 'Degraded', 'Online' }) -and ($quiet | Where-Object Status -eq 'Unknown').Count -eq 4) 'live status off: tiles say NO STATUS - never a made-up green'
+# ---- Microsoft's pages: the newest build, and the releases still supported ----
+# the shapes the real pages had in October 2026
+$dlc = '<script>{"files":[{"name":"GatewayInstall.exe","size":"717118056","version":"3000.334.9","datePublished":"10/5/2026 5:25:34 PM"}],' +
+       '"detailsSection_file_version":"3000.334.9","detailsSection_file_name":["GatewayInstall.exe"]}</script>'
+$dp = ConvertFrom-GLDownloadPage $dlc
+Assert ($dp.Version -eq [version]'3000.334.9' -and $dp.Published -eq [datetime]'2026-10-05 17:25:34') "Download Center: the newest build and its date, from the page's JSON ($($dp.Version), $($dp.Published))"
+$dp2 = ConvertFrom-GLDownloadPage '<div><h3 class="h6">Version:</h3><p style="overflow-wrap:break-word">3000.334.9</p></div>'
+Assert ($dp2.Version -eq [version]'3000.334.9' -and $null -eq $dp2.Published) 'Download Center: the Version label still works if the JSON goes'
+Assert ($null -eq (ConvertFrom-GLDownloadPage '<html>We are currently experiencing high demand.</html>') -and $null -eq (ConvertFrom-GLDownloadPage '')) 'Download Center: a busy page or nothing gives no version - never a guess'
+$learn = '<nav>September 2026 update (3000.334)</nav>' + (@(
+    'September 2026|334', 'August 2026|330', 'July 2026|326', 'June 2026|322', 'May 2026|318', 'April 2026|314' | ForEach-Object {
+        $p = $_ -split '\|'; "<h2 id=""x"">$($p[0]) update (3000.$($p[1]))</h2><ul><li>Download</li></ul>" }) -join '')
+$rp = ConvertFrom-GLReleasePage $learn
+Assert ($rp.Count -eq 6 -and $rp[0].Version -eq [version]'3000.334' -and $rp[0].Name -eq 'September 2026' -and $rp[5].Version -eq [version]'3000.314') "Learn: six supported releases, newest first, each once ($($rp.Count))"
+$noRel = ConvertFrom-GLReleasePage 'nothing here'
+Assert ($noRel -is [array] -and $noRel.Count -eq 0) 'Learn: a page without releases is an empty list'
+
+$rel = [pscustomobject]@{ Newest = [version]'3000.334.9'; Supported = $rp }
+Assert ((Get-GLReleaseInfo '3000.334.9' $rel).State -eq 'Current' -and (Get-GLReleaseInfo '3000.334.9' $rel).Release -eq 'September 2026') 'the newest build is Current, in its month'
+Assert ((Get-GLReleaseInfo '3000.334.7' $rel).State -eq 'Behind' -and (Get-GLReleaseInfo '3000.318.5' $rel).State -eq 'Behind') 'an older build, or an older supported month, can be updated'
+Assert ((Get-GLReleaseInfo '3000.310.2' $rel).State -eq 'Unsupported' -and (Get-GLReleaseInfo '3000.310.2' $rel).Release -eq '') 'older than the oldest supported release: Unsupported'
+$learnOnly = [pscustomobject]@{ Newest = [version]'3000.334'; Supported = $rp }
+Assert ((Get-GLReleaseInfo '3000.334.1' $learnOnly).State -eq 'Current') 'with only the Learn page, any build of the newest month is Current'
+Assert ($null -eq (Get-GLReleaseInfo '3000.310.2' $null) -and $null -eq (Get-GLReleaseInfo 'n/a' $rel)) 'no pages read, or no version: no verdict'
+
+$rm = @{
+    'G1' = @([pscustomobject]@{ id = 'A1'; version = '3000.334.9' })
+    'G2' = @([pscustomobject]@{ id = 'B1'; version = '3000.326.4' })
+    'G3' = @([pscustomobject]@{ id = 'C1'; version = '3000.302.1' }, [pscustomobject]@{ id = 'C2'; version = '3000.334.9' })
+}
+$rg = @('G1', 'G2', 'G3' | ForEach-Object { [pscustomobject]@{ id = $_; displayName = "Gw $_"; type = 'OnPremises' } })
+$rrows = ConvertTo-GLGatewayRows -Gateways $rg -Members $rm -Live $null
+$rtiles = ConvertTo-GLGatewayTiles -Rows $rrows -Members $rm -DownSince @{} -Releases $rel
+$rb = @{}; foreach ($x in $rtiles) { $rb[$x.Id] = $x }
+Assert ($rb['G1'].Badge -eq '' -and $rb['G1'].VersionText -eq '3000.334.9 (September 2026)') "on the newest build: no badge, and the month is named ($($rb['G1'].VersionText))"
+Assert ($rb['G2'].Badge -eq 'UPDATE AVAILABLE' -and $rb['G3'].Badge -eq 'UNSUPPORTED VERSION') 'behind: UPDATE AVAILABLE; a member out of support outranks mixed versions: UNSUPPORTED VERSION'
+$rn = Get-GLGatewayCounts -Tiles $rtiles
+Assert ($rn.Unsupported -eq 1 -and $rn.Behind -eq 1 -and $rn.Mixed -eq 0) 'the banner counts unsupported and behind gateways'
+$rmr = ConvertTo-GLMemberRows -GatewayName 'Gw G3' -Members $rm['G3'] -Live $null -Releases $rel
+Assert ($rmr[0].Support -eq 'Not supported' -and $rmr[1].Support -eq 'Newest' -and $rmr[1].Release -eq 'September 2026') 'members say their release and whether it is supported'
+
+$n = Get-GLGatewayCounts -Tiles $tiles
+Assert ($n.Total -eq 5 -and $n.Offline -eq 1 -and $n.Degraded -eq 1 -and $n.Drift -eq 2) 'the banner counts gateways, offline, degraded and version drift'
+Assert (-not ($tiles[0].PSObject.Properties.Name | Where-Object { $_ -like '*_*' })) 'no underscores in tile fields'
+
 # ============================================================================
 Section 'Shaping connections'
 # ============================================================================
@@ -368,21 +686,142 @@ $conns = @(
 $crows = ConvertTo-GLConnectionRows -Connections $conns -GatewayNames $names
 Assert ($crows[0].Gateway -eq 'Cluster A') 'gateway id resolves to its name, case-insensitively'
 Assert ($crows[1].Gateway -eq 'GONE') 'an unknown gateway shows its id instead of vanishing'
+
+# connection recency (preview): times as local time, empty when not recorded
+$now  = [datetime]::SpecifyKind([datetime]'2026-10-12 12:00', 'Utc').ToLocalTime()
+$used = [datetime]::SpecifyKind([datetime]'2026-09-02 12:00', 'Utc')
+$rec  = @(
+    [pscustomobject]@{ id = 'R1'; displayName = 'Text times'; connectivityType = 'OnPremisesGateway'
+        connectionRecency = [pscustomobject]@{ createdDateTime = '2026-01-05T08:30:00Z'; lastBoundDateTime = '2026-01-06T08:30:00Z'; lastCredentialUsedDateTime = '2026-09-02T12:00:00Z' } }
+    [pscustomobject]@{ id = 'R2'; displayName = 'Parsed times'; connectivityType = 'OnPremisesGateway'
+        connectionRecency = [pscustomobject]@{ createdDateTime = [datetime]::SpecifyKind([datetime]'2026-01-05 08:30', 'Utc'); lastCredentialUsedDateTime = $used } }
+    [pscustomobject]@{ id = 'R3'; displayName = 'Never used'; connectivityType = 'ShareableCloud'
+        connectionRecency = [pscustomobject]@{ createdDateTime = '2026-01-05T08:30:00Z'; lastBoundDateTime = $null; lastCredentialUsedDateTime = $null } }
+    [pscustomobject]@{ id = 'R4'; displayName = 'No recency at all'; connectivityType = 'ShareableCloud' }
+)
+$rr = ConvertTo-GLConnectionRows -Connections $rec -GatewayNames @{} -Now $now
+$localCreated = [datetime]::SpecifyKind([datetime]'2026-01-05 08:30', 'Utc').ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+Assert ($rr[0].Created -eq $localCreated -and $rr[0].LastLinked -and $rr[0].LastUsed) "recency: created, last linked and last used are shown, in local time ($($rr[0].Created))"
+Assert ($rr[0].UnusedDays -eq 40 -and $rr[1].UnusedDays -eq 40) "recency: days since the credentials were last used, from text or parsed times ($($rr[0].UnusedDays), $($rr[1].UnusedDays))"
+Assert ($rr[1].Created -eq $localCreated) 'recency: a time PowerShell already parsed comes out the same as text'
+Assert ($rr[2].LastUsed -eq '' -and $null -eq $rr[2].UnusedDays -and $rr[3].Created -eq '' -and $null -eq $rr[3].UnusedDays) 'recency: never used, or not recorded, stays empty - never a made-up date'
 Assert ($crows[2].Gateway -eq '' -and $crows[2].Credential -eq '') 'a cloud connection has no gateway and survives missing fields'
 
 $f = Select-GLConnections -Rows $crows -Text 'sales'
 Assert ($f.Count -eq 1 -and $f[0].Id -eq 'C1') 'search is case-insensitive across name and path'
 $f = Select-GLConnections -Rows $crows -Gateway 'Cluster A'
 Assert ($f.Count -eq 1) 'filter by gateway'
-$f = Select-GLConnections -Rows $crows -Connectivity 'ShareableCloud'
+$f = Select-GLConnections -Rows $crows -Connectivity 'ShareableCloud' -IncludeCloud
 Assert ($f.Count -eq 1 -and $f[0].Id -eq 'C3') 'filter by connectivity'
-$f = Select-GLConnections -Rows $crows -Gateway '(all)' -Connectivity '(all)' -Type '(all)' -Text ''
+$f = Select-GLConnections -Rows $crows -Gateway '(all)' -Connectivity '(all)' -Type '(all)' -Text '' -IncludeCloud
 Assert ($f.Count -eq 3) '(all) everywhere returns everything'
+$f = Select-GLConnections -Rows $crows
+Assert ($f.Count -eq 2 -and -not ($f | Where-Object Connectivity -eq 'ShareableCloud')) 'gateway connections only, unless cloud ones are asked for'
 $f = Select-GLConnections -Rows $crows -Text 'nothing-matches-this'
 Assert ($f -is [array] -and $f.Count -eq 0) 'no match is an empty array'
 
 $d = Get-GLDistinct -Rows $crows -Property Type
 Assert ($d[0] -eq '(all)' -and ($d -join ',') -eq '(all),Oracle,SQL,Web') "dropdown values: (all) first, sorted, distinct ($($d -join ','))"
+
+# ---- copying rows: what Excel gets ----
+$cols = @([pscustomobject]@{ Header = 'Name'; Property = 'Name' }, [pscustomobject]@{ Header = 'Path'; Property = 'Path' }, [pscustomobject]@{ Header = 'Users'; Property = 'UserList' })
+$crs = @(
+    [pscustomobject]@{ Name = 'Sales'; Path = "sql01`tsales"; UserList = @('jane@contoso.com', 'joe@contoso.com') }
+    [pscustomobject]@{ Name = "Two`r`nlines"; Path = $null; UserList = @() }
+)
+$ct = ConvertTo-GLClipboardText -Rows $crs -Columns $cols -Headers
+$cl2 = @($ct -split "`r`n")
+Assert ($cl2.Count -eq 3 -and $cl2[0] -eq "Name`tPath`tUsers") 'copied rows with column names: the names first, then one line per row'
+Assert ($cl2[1] -eq "Sales`tsql01 sales`tjane@contoso.com; joe@contoso.com" -and $cl2[2] -eq "Two lines`t`t") 'a tab or line break inside a value becomes a space, a list is joined with ";", empty stays empty'
+Assert ((ConvertTo-GLClipboardText -Rows $crs -Columns $cols) -notmatch '^Name') 'without -Headers there is no header line'
+Assert ((ConvertTo-GLClipboardText -Rows @() -Columns $cols) -eq '' -and (ConvertTo-GLClipboardText -Rows @([pscustomobject]@{ Other = 1 }) -Columns $cols) -eq "`t`t") 'no rows is empty text; a missing property is an empty cell, not an error'
+
+# ---- gateway connections only, and the cleanup views ----
+$kinds = @('OnPremisesGateway', 'VirtualNetworkGateway', 'StreamingVirtualNetworkGateway', 'ShareableCloud', 'PersonalCloud', 'OnPremisesGatewayPersonal', 'Automatic', 'None' | ForEach-Object {
+    [pscustomobject]@{ id = "K-$_"; displayName = $_; connectivityType = $_; connectionDetails = [pscustomobject]@{ type = 'SQL'; path = 'p' } } })
+$kr = ConvertTo-GLConnectionRows -Connections $kinds -GatewayNames @{}
+Assert ((($kr | ForEach-Object Connectivity) -join ',') -eq 'OnPremisesGateway,VirtualNetworkGateway,StreamingVirtualNetworkGateway,ShareableCloud') 'gateway and shareable cloud connections are kept - personal, Automatic and unbound ones are no gateway admin''s'
+
+$cl = @(
+    [pscustomobject]@{ Id = 'D1'; Name = 'Sales';       Connectivity = 'OnPremisesGateway'; GatewayId = 'G1'; Gateway = 'A'; Type = 'SQL'; Path = 'srv;db';   Account = 'CONTOSO\svc'; LastUsed = '2026-10-01 08:00'; UnusedDays = 11;    Status = 'OK';      GatewayState = 'Online'; UserList = @() }
+    [pscustomobject]@{ Id = 'D2'; Name = 'Sales copy';  Connectivity = 'OnPremisesGateway'; GatewayId = 'g1'; Gateway = 'A'; Type = 'sql'; Path = 'SRV;db ';  Account = 'contoso\SVC'; LastUsed = '2026-01-01 08:00'; UnusedDays = 284;   Status = 'Failed';  GatewayState = 'Online'; UserList = @() }
+    [pscustomobject]@{ Id = 'D3'; Name = 'Other';       Connectivity = 'OnPremisesGateway'; GatewayId = 'G1'; Gateway = 'A'; Type = 'SQL'; Path = 'srv;other'; Account = 'CONTOSO\svc'; LastUsed = '';                UnusedDays = $null; Status = 'Timeout'; GatewayState = 'Online'; UserList = @() }
+    [pscustomobject]@{ Id = 'D4'; Name = 'Cloud dup';   Connectivity = 'ShareableCloud';    GatewayId = '';   Gateway = '';  Type = 'Web'; Path = 'https://x'; Account = '';           LastUsed = '';                UnusedDays = $null; Status = '';        GatewayState = '';       UserList = @() }
+    [pscustomobject]@{ Id = 'D5'; Name = 'Cloud dup 2'; Connectivity = 'ShareableCloud';    GatewayId = '';   Gateway = '';  Type = 'Web'; Path = 'https://x'; Account = '';           LastUsed = '';                UnusedDays = $null; Status = '';        GatewayState = '';       UserList = @() }
+)
+$v = Select-GLConnections -Rows $cl -Show 'Last used over 90 days ago'
+Assert ($v.Count -eq 1 -and $v[0].Id -eq 'D2') 'last used over 90 days ago: only rows with an old date - an empty one is not guessed at'
+$v = Select-GLConnections -Rows $cl -Show 'No use recorded'
+Assert ($v.Count -eq 1 -and $v[0].Id -eq 'D3') 'no use recorded: gateway connections without a date (cloud ones only when included)'
+$v = Select-GLConnections -Rows $cl -Show 'Duplicates'
+Assert ((($v | ForEach-Object Id) -join ',') -eq 'D1,D2') 'duplicates: same gateway, type, path and account, whatever the case or spaces - side by side'
+$v = Select-GLConnections -Rows $cl -Show 'Duplicates' -IncludeCloud
+Assert ($v.Count -eq 4) 'duplicates among cloud connections too, when they are included'
+$v = Select-GLConnections -Rows $cl -Show 'Failing tests'
+Assert ((($v | ForEach-Object Id) -join ',') -eq 'D2,D3') 'failing tests: failed or did not answer'
+$v = Select-GLConnections -Rows $cl -Show 'All connections'
+Assert ($v.Count -eq 3) 'All connections: no cleanup filter'
+
+$cc = Get-GLConnectionCounts -Rows $cl -Directory @{ 'd1' = [pscustomobject]@{ ClusterId = 'g1' }; 'x9' = [pscustomobject]@{ ClusterId = 'g1' }; 'y1' = [pscustomobject]@{ ClusterId = '' } }
+Assert ($cc['g1'] -eq 4 -and $cc.Count -eq 1) "connections per gateway: the Fabric list and the directory together, each once, cloud ones not counted ($($cc['g1']))"
+
+# ---- the 1,000 data sources Microsoft allows on a cluster ----
+$lim = @(
+    [pscustomobject]@{ id = 'L1'; displayName = 'Full';        type = 'OnPremises' }
+    [pscustomobject]@{ id = 'L2'; displayName = 'Near';        type = 'OnPremises' }
+    [pscustomobject]@{ id = 'L3'; displayName = 'Roomy';       type = 'OnPremises' }
+    [pscustomobject]@{ id = 'L4'; displayName = 'Cloudy VNet'; type = 'VirtualNetwork' }
+)
+$lm = @{
+    'L1' = @([pscustomobject]@{ id = 'Q1'; version = '3000.310.1' })
+    'L2' = @([pscustomobject]@{ id = 'Q2'; version = '3000.310.1' })
+    'L3' = @([pscustomobject]@{ id = 'Q3'; version = '3000.334.9' })
+}
+$lrows = ConvertTo-GLGatewayRows -Gateways $lim -Members $lm -Live $null
+$lt = ConvertTo-GLGatewayTiles -Rows $lrows -Members $lm -DownSince @{} -Releases $rel -ConnectionCounts @{ 'l1' = 1000; 'l2' = 812; 'l3' = 40; 'l4' = 3 } -VnetSkipped
+$lb = @{}; foreach ($x in $lt) { $lb[$x.Name] = $x }
+Assert ($lb['Full'].Badge -eq 'AT CONNECTION LIMIT' -and $lb['Full'].ConnectionsText -eq '1,000 of 1,000 connections') "at 1,000 connections: AT CONNECTION LIMIT, before even an unsupported version ($($lb['Full'].ConnectionsText))"
+Assert ($lb['Near'].Badge -eq 'UNSUPPORTED VERSION' -and $lb['Roomy'].Badge -eq '' -and $lb['Roomy'].ConnectionsText -eq '40 of 1,000 connections') 'an unsupported version outranks being near the limit; plenty of room: no badge'
+$lt2 = ConvertTo-GLGatewayTiles -Rows $lrows -Members @{ 'L2' = @([pscustomobject]@{ id = 'Q2'; version = '3000.334.9' }) } -DownSince @{} -Releases $rel -ConnectionCounts @{ 'l2' = 812 }
+Assert (($lt2 | Where-Object Name -eq 'Near').Badge -eq 'NEAR CONNECTION LIMIT') '80% of the limit, nothing worse: NEAR CONNECTION LIMIT'
+Assert ($lb['Cloudy VNet'].ConnectionsText -eq '3 connections' -and -not $lb['Cloudy VNet'].HasBadge) 'a VNet gateway shows its connections, with no limit badge'
+Assert ((Get-GLGatewayCounts -Tiles $lt).NearLimit -eq 1 -and (Get-GLGatewayCounts -Tiles $lt2).NearLimit -eq 1) 'the banner counts gateways at or near the limit'
+$nc = ConvertTo-GLGatewayTiles -Rows $lrows -Members $lm -DownSince @{}
+Assert (-not ($nc | Where-Object ConnectionsText)) 'connections not loaded yet: no count is shown - never a made-up 0'
+
+# ---- handing over access ----
+$pj = [pscustomobject]@{ id = 'U-JOE'; displayName = 'Joe Smith'; type = 'User'; userDetails = [pscustomobject]@{ userPrincipalName = 'joe@contoso.com' } }
+$pg = [pscustomobject]@{ id = 'G-BI'; displayName = 'BI Team'; type = 'Group'; groupDetails = [pscustomobject]@{ email = 'bi@contoso.com' } }
+Assert ((Test-GLPrincipalMatch $pj ([pscustomobject]@{ Id = 'u-joe'; Names = @() })) -and (Test-GLPrincipalMatch $pj ([pscustomobject]@{ Id = ''; Names = @('JOE@contoso.com') })) -and (Test-GLPrincipalMatch $pg ([pscustomobject]@{ Id = ''; Names = @('bi@contoso.com') }))) 'the one handing over is matched by object id, UPN or group email - in any case'
+Assert (-not (Test-GLPrincipalMatch $pj ([pscustomobject]@{ Id = ''; Names = @('Joe Smith') }))) 'never by display name - two people can share one'
+$ras = @(
+    [pscustomobject]@{ id = 'A1'; role = 'Owner'; principal = $pj }
+    [pscustomobject]@{ id = 'A2'; role = 'User';  principal = [pscustomobject]@{ id = 'U-ANA'; type = 'User' } }
+)
+$fromJ = [pscustomobject]@{ Id = 'U-JOE'; Names = @() }
+$st1 = Get-GLHandoverStep -Assignments $ras -From $fromJ -To ([pscustomobject]@{ Id = 'U-ANA' })
+Assert ($st1.Action -eq 'Raise' -and $st1.Role -eq 'Owner' -and $st1.ToRole -eq 'User' -and $st1.ToAssignmentId -eq 'A2' -and $st1.FromAssignmentId -eq 'A1') 'a lower role: Raise it to the same role'
+$st2 = Get-GLHandoverStep -Assignments $ras -From $fromJ -To ([pscustomobject]@{ Id = 'U-NEW' })
+Assert ($st2.Action -eq 'Grant' -and $st2.Role -eq 'Owner') 'no role yet: Grant the same role'
+$st3 = Get-GLHandoverStep -Assignments $ras -From ([pscustomobject]@{ Id = 'U-ANA'; Names = @() }) -To ([pscustomobject]@{ Id = 'U-JOE' })
+Assert ($st3.Action -eq 'Keep' -and $st3.ToRole -eq 'Owner') 'already a higher role: Keep it'
+$st4 = Get-GLHandoverStep -Assignments $ras -From ([pscustomobject]@{ Id = 'U-NOBODY'; Names = @() }) -To ([pscustomobject]@{ Id = 'U-ANA' })
+Assert ($st4.Action -eq 'None') 'no role to hand over: None'
+$gwRas = @([pscustomobject]@{ id = 'B1'; role = 'Admin'; principal = $pj }, [pscustomobject]@{ id = 'B2'; role = 'ConnectionCreatorWithResharing'; principal = [pscustomobject]@{ id = 'U-ANA' } })
+Assert ((Get-GLHandoverStep -Assignments $gwRas -From $fromJ -To ([pscustomobject]@{ Id = 'U-ANA' }) -Kind gateways).Action -eq 'Raise') 'gateway roles rank too: connection creator to Admin is a raise'
+
+# ---- the access report ----
+$at = @(
+    [pscustomobject]@{ Kind = 'connections'; Id = 'C1'; Name = 'Sales';  Gateway = 'A'; Type = 'SQL'; Path = 'srv;db'; Account = 'svc'; LastUsed = '2026-10-01 08:00' }
+    [pscustomobject]@{ Kind = 'gateways';    Id = 'G1'; Name = 'A';      Gateway = 'A'; Type = 'OnPremises'; Path = ''; Account = ''; LastUsed = '' }
+    [pscustomobject]@{ Kind = 'connections'; Id = 'C9'; Name = 'Locked'; Gateway = 'A' }
+)
+$am = @{ 'connections/C1' = $ras; 'gateways/G1' = $gwRas; 'connections/C9' = $null }
+$ar = ConvertTo-GLAccessReportRows -Targets $at -Assignments $am
+Assert ($ar.Count -eq 5 -and $ar[0].Kind -eq 'Connection' -and $ar[0].Email -eq 'joe@contoso.com' -and $ar[0].Role -eq 'Owner' -and $ar[0].Path -eq 'srv;db' -and $ar[0].LastUsed) "access report: one row per item and principal, with what an auditor needs ($($ar.Count) rows)"
+Assert (($ar | Where-Object Target -eq 'Locked').Role -eq '(could not be read)' -and @($ar | Where-Object Kind -eq 'Gateway').Count -eq 2) 'gateways are in it, and an item whose access could not be read says so'
+$arj = ConvertTo-GLAccessReportRows -Targets $at -Assignments $am -Who 'joe'
+Assert ($arj.Count -eq 2 -and -not ($arj | Where-Object { $_.Email -ne 'joe@contoso.com' })) 'for one person: only their rows, without "could not be read" noise'
 
 $t = Select-GLByText -Rows $rows -Text 'vnet'
 Assert ($t.Count -eq 1 -and $t[0].Name -eq 'VNet B') 'quick filter matches any column'
@@ -402,10 +841,10 @@ $f = Select-GLConnections -Rows $mrows -Text 'sql01; ora01'
 Assert ($f.Count -eq 2) 'several search values at once - a row matches any of them'
 $f = Select-GLConnections -Rows $mrows -States @('Online')
 Assert ($f.Count -eq 1 -and $f[0].Id -eq 'C1') 'gateway state filter: Online only'
-$f = Select-GLConnections -Rows $mrows -States @('Online', 'Partial', 'Unknown')
+$f = Select-GLConnections -Rows $mrows -States @('Online', 'Partial', 'Unknown') -IncludeCloud
 Assert ($f.Count -eq 3) 'cloud connections count as Unknown for the state filter'
 $ex = [System.Collections.Generic.HashSet[string]]::new([string[]]@('C2'))
-$f = Select-GLConnections -Rows $mrows -Excluded $ex
+$f = Select-GLConnections -Rows $mrows -Excluded $ex -IncludeCloud
 Assert ($f.Count -eq 2 -and -not ($f | Where-Object Id -eq 'C2')) 'excluded rows stay out'
 
 Add-GLDirectoryInfo -Rows $mrows -Directory @{ 'c1' = [pscustomobject]@{ Account = 'DOM\svc_sales'; Users = @([pscustomobject]@{ Principal = 'jane@contoso.com' }, [pscustomobject]@{ Principal = 'bi@contoso.com' }) } }
@@ -425,9 +864,6 @@ Assert ($mrows[0].Users -eq '2') 'rows not in the result keep what they had'
 Set-GLRowStatus -Rows $mrows -Status @{ 'C1' = [pscustomobject]@{ Status = 'Failed'; Detail = 'Login failed' } }
 Assert ($mrows[0].Status -eq 'Failed' -and $mrows[0].StatusDetail -eq 'Login failed' -and $mrows[1].Status -eq '') 'verify status fills only the rows it checked'
 
-Assert ((ConvertFrom-GLConnectionString 'Data Source=s;Initial Catalog=d').Type -eq 'Sql') 'type guess: SQL Server keywords give Sql'
-Assert ((ConvertFrom-GLConnectionString 'Host=o;Service Name=P').Type -eq 'Oracle') 'type guess: Oracle keywords give Oracle'
-Assert ((ConvertFrom-GLConnectionString 'Server=pg;Database=d').Type -eq '') 'type guess: ambiguous strings are left blank'
 
 # ============================================================================
 Section 'Shaping access'
@@ -584,13 +1020,6 @@ Assert ($c.Method -eq 'PATCH' -and $c.Uri -eq 'https://api.powerbi.com/v1.0/myor
 Assert ($c.Body.credentialDetails.credentialType -eq 'Basic' -and $c.Body.credentialDetails.privacyLevel -eq 'Private') 'update credentials: keeps the privacy level it was given'
 
 Reset-Calls
-$script:Rules = @{ 'POST https://api.powerbi.com' = [pscustomobject]@{ id = 'NEW1' } }
-$r = New-GLGatewayConnection -GatewayId 'G1' -PublicKey $pk -Name 'Sales' -DataSourceType 'Sql' -ConnectionDetails '{"server":"s","database":"d"}' -CredentialType Windows -Username 'DOM\u' -Password 'p' -PbiToken 't'
-$c = $script:Calls[0]
-Assert ($c.Method -eq 'POST' -and $c.Uri -like '*/gateways/G1/datasources' -and $r.id -eq 'NEW1') 'create: POST to the gateway''s datasources'
-Assert ($c.Body.connectionDetails -is [string] -and $c.Body.datasourceName -eq 'Sales' -and $c.Body.dataSourceType -eq 'Sql') 'create: connectionDetails is a JSON STRING, as the API requires'
-
-Reset-Calls
 Remove-GLConnection -Id 'C9' -FabricToken 'f'
 Assert ($script:Calls[0].Method -eq 'DELETE' -and $script:Calls[0].Uri -eq 'https://api.fabric.microsoft.com/v1/connections/C9') 'delete: the documented Fabric call'
 
@@ -599,26 +1028,10 @@ Set-GLMemberEnabled -GatewayId 'G1' -MemberId 'M1' -Enabled $false -FabricToken 
 $c = $script:Calls[0]
 Assert ($c.Method -eq 'PATCH' -and $c.Uri -like '*/v1/gateways/G1/members/M1' -and $c.Body.enabled -eq $false) 'disable member: PATCH enabled=false on the member'
 
-Assert ((ConvertTo-GLConnectionDetails -Server ' sql01 ' -Database 'Sales') -eq '{"server":"sql01","database":"Sales"}') 'connection details from server and database, trimmed'
-Assert ((ConvertTo-GLConnectionDetails -Url 'https://x') -eq '{"url":"https://x"}') 'connection details from a url'
-Assert ((ConvertTo-GLConnectionDetails -Server 'ignored' -Json '{"extensionDataSourceKind":"Snowflake"}') -eq '{"extensionDataSourceKind":"Snowflake"}') 'explicit JSON wins, for connectors this does not know'
-$err = $null; try { ConvertTo-GLConnectionDetails -Json '{bad' } catch { $err = $_.Exception.Message }
-Assert ($err -match 'not valid JSON') 'broken JSON is refused before sending'
-$err = $null; try { ConvertTo-GLConnectionDetails } catch { $err = $_.Exception.Message }
-Assert ($err -match 'No connection details') 'an empty row is refused'
 
 # ============================================================================
-Section 'Connection strings, names and addresses'
+Section 'Names and addresses'
 # ============================================================================
-$cs = ConvertFrom-GLConnectionString 'Data Source=sql01.contoso.com,1433;Initial Catalog=Sales;Integrated Security=True'
-Assert ($cs.Server -eq 'sql01.contoso.com,1433' -and $cs.Database -eq 'Sales') 'SQL Server style: Data Source + Initial Catalog'
-$cs = ConvertFrom-GLConnectionString 'Server=pg01;Port=5432;Database=dw;User Id=x'
-Assert ($cs.Server -eq 'pg01:5432' -and $cs.Database -eq 'dw') 'Server + Port + Database, port joined on'
-$cs = ConvertFrom-GLConnectionString 'Host=ora01;Port=1521;Service Name=PROD'
-Assert ($cs.Server -eq 'ora01:1521' -and $cs.Database -eq 'PROD') 'Oracle style: Host + Port + Service Name'
-$cs = ConvertFrom-GLConnectionString 'not a connection string'
-Assert ($cs.Server -eq '' -and $cs.Database -eq '') 'nonsense gives empty fields, not an error'
-
 $lst = Split-GLList "a@x.com; b@x.com`r`nc@x.com,a@x.com;;"
 Assert ($lst.Count -eq 3 -and ($lst -join ',') -eq 'a@x.com,b@x.com,c@x.com') 'principal lists split on ; , and new lines, de-duplicated'
 $lst = Split-GLList '   '
@@ -745,24 +1158,6 @@ $res = Invoke-GLBulkDelete -Items $items[0..1] -BackupPath $bk -FabricToken 'f' 
 Assert ($res.Count -eq 0 -and $script:Calls.Count -eq 0) 'cancel: a cancelled run sends nothing more'
 Remove-Item -Recurse -Force $tmp
 
-$gwList = @(
-    [pscustomobject]@{ id = 'G1'; displayName = 'Prod Cluster'; type = 'OnPremises'; publicKey = $pk }
-    [pscustomobject]@{ id = 'GV'; displayName = 'VNet';         type = 'VirtualNetwork' }
-)
-$rows = @(
-    [pscustomobject]@{ Gateway = 'prod cluster'; Name = 'Sales'; Type = 'Sql'; Server = 's'; Database = 'd'; CredentialType = 'Windows'; Username = 'DOM\u' }
-    [pscustomobject]@{ Gateway = '';             Name = 'Web';   Type = 'Web'; Url = 'https://x'; CredentialType = 'Anonymous' }
-    [pscustomobject]@{ Gateway = 'VNet';         Name = 'Bad';   Type = 'Sql'; Server = 's' }
-    [pscustomobject]@{ Gateway = 'Prod Cluster'; Name = '';      Type = 'Sql'; Server = 's' }
-)
-Reset-Calls
-$script:Rules = @{ 'POST https://api.powerbi.com' = [pscustomobject]@{ id = 'NEW' } }
-$res = Invoke-GLBulkCreate -Rows $rows -Gateways $gwList -DefaultGateway 'G1' -Password 'p' -PbiToken 't' -Progress @{ Cancel = $false }
-Assert ($res[0].Ok -and $res[1].Ok) 'create: by gateway name (any case) and by the default gateway'
-Assert (-not $res[2].Ok -and $res[2].Message -match "no on-premises gateway called 'VNet'") 'create: a VNet gateway is refused - this API is for on-premises gateways'
-Assert (-not $res[3].Ok -and $res[3].Message -match 'no Name') 'create: a row without a name is refused'
-Assert (@($script:Calls | Where-Object Method -eq 'POST').Count -eq 2) 'create: only the valid rows are sent'
-
 Remove-Item function:Invoke-GLRequest
 . $script -LoadOnly
 
@@ -792,7 +1187,7 @@ $lost = $script:WorkerFunctions | Where-Object { -not (Get-Command $_ -CommandTy
 Assert (-not $lost) "every real function is back after the stand-ins $(if ($lost) { '- missing: ' + ($lost -join ', ') })"
 
 # ============================================================================
-Section 'Activity log and change record'
+Section 'Log files and change record'
 # ============================================================================
 $lf = Join-Path ([System.IO.Path]::GetTempPath()) ("gl-log-" + [guid]::NewGuid().ToString('N'))
 Assert ((Get-GLSafeName 'Jane.Doe@Contoso.com') -eq 'jane.doe@contoso.com') 'user names make safe, lower-case file names'
@@ -851,13 +1246,8 @@ $au2 = New-GLAudit -Folder $cf -User 'joe@contoso.com' -Tenant 'contoso' -Versio
 Start-Sleep -Milliseconds 1100
 Write-GLChange -Audit $au2 -Action 'Disable member' -Result Done -Target 'GW01' -Gateway 'Cluster A'
 $all = Read-GLChanges -Folder $cf
-Assert ($all.Count -eq 3 -and $all[0].User -eq 'joe@contoso.com') 'the Activity view reads every user''s record, newest first'
+Assert ($all.Count -eq 3 -and $all[0].User -eq 'joe@contoso.com') 'everyone''s records are read together, newest first'
 Assert ($all[0].When -is [datetime] -and $all[0].When.Kind -eq 'Local') 'times are shown in your own time zone'
-Assert ((Select-GLChanges -Rows $all -Result 'Failed').Count -eq 1) 'filter by result'
-Assert ((Select-GLChanges -Rows $all -Action 'Disable member').Count -eq 1) 'filter by action'
-Assert ((Select-GLChanges -Rows $all -Text 'cluster a').Count -eq 1) 'search across target, gateway, principal and details'
-Assert ((Select-GLChanges -Rows $all -User 'jane@contoso.com').Count -eq 2) 'filter by user'
-Assert ((Select-GLChanges -Rows $all -Days 1).Count -eq 3) 'filter by period'
 $empty = Read-GLChanges -Folder (Join-Path $lf 'nothing-here')
 Assert ($empty -is [array] -and $empty.Count -eq 0) 'no records yet is an empty list, not an error'
 
@@ -894,39 +1284,13 @@ $g = @($rec | Where-Object Action -eq 'Grant access')
 Assert ($g.Count -eq 2 -and $g[0].Result -eq 'Done' -and $g[0].PrincipalId -eq 'U1' -and $g[0].Role -eq 'UserWithReshare' -and $g[0].PrincipalType -eq 'User') 'grant: principal, id, type and role are recorded as columns'
 Assert ($g[1].Result -eq 'NoChange' -and $g[1].Message -eq 'already had access') 'grant: "already had access" is recorded as no change'
 $r = @($rec | Where-Object Action -eq 'Remove access')
-Assert ($r[0].Result -eq 'Done' -and $r[0].Role -eq 'UserWithReshare' -and $r[0].PrincipalId -eq 'U1') 'remove: the role that was removed is recorded - what undo needs'
+Assert ($r[0].Result -eq 'Done' -and $r[0].Role -eq 'UserWithReshare' -and $r[0].PrincipalId -eq 'U1') 'remove: the role that was removed is recorded'
 Assert ($r[1].Result -eq 'NoChange') 'remove: a connection they were not on is recorded as no change'
 $c = @($rec | Where-Object Action -eq 'Update credentials')
 Assert ($c[0].Result -eq 'Done' -and $c[0].Details -match 'Username=svc_report' -and $c[1].Result -eq 'Skipped') 'credentials: done and skipped are both recorded, with the username'
 Assert (-not ((Get-Content (Get-GLChangePath -Folder $bf -User 'jane@contoso.com') -Raw) -match 'Tr0ub4dor')) 'the password is nowhere in the change record'
 Assert (@($rec | Select-Object -ExpandProperty RunId -Unique).Count -eq 1) 'one run, one run id on every row'
 
-# ============================================================================
-Section 'Undo'
-# ============================================================================
-$script:Calls.Clear()
-$script:Rules = @{ 'GET https://api.fabric.microsoft.com/v1/connections/C1/roleAssignments' = [pscustomobject]@{ value = @(
-    [pscustomobject]@{ id = 'RA9'; role = 'UserWithReshare'; principal = [pscustomobject]@{ id = 'U1'; displayName = 'Joe'; type = 'User' } }
-    [pscustomobject]@{ id = 'RA8'; role = 'Owner';           principal = [pscustomobject]@{ id = 'U1'; displayName = 'Joe'; type = 'User' } }) } }
-$undoRows = @(
-    [pscustomobject]@{ Action = 'Grant access';   Result = 'Done'; TargetType = 'Connection'; Target = 'one'; TargetId = 'C1'; Principal = 'Joe'; PrincipalId = 'U1'; PrincipalType = 'User'; Role = 'UserWithReshare'; User = 'jane'; Time = 't'; RunId = 'r1' }
-    [pscustomobject]@{ Action = 'Remove access';  Result = 'Done'; TargetType = 'Gateway';    Target = 'GA';  TargetId = 'G1'; Principal = 'Ann'; PrincipalId = 'U2'; PrincipalType = 'Group'; Role = 'Admin'; User = 'jane'; Time = 't'; RunId = 'r1' }
-    [pscustomobject]@{ Action = 'Disable member'; Result = 'Done'; TargetType = 'Gateway member'; Target = 'n1'; TargetId = 'M1'; GatewayId = 'G1'; Gateway = 'GA'; User = 'jane'; Time = 't'; RunId = 'r1' }
-    [pscustomobject]@{ Action = 'Delete connection'; Result = 'Done'; Target = 'gone'; TargetId = 'C9' }
-    [pscustomobject]@{ Action = 'Grant access';   Result = 'Failed'; Target = 'x'; TargetId = 'C5' }
-)
-Assert (@($undoRows | Where-Object { Test-GLUndoable $_ }).Count -eq 3) 'only completed access and member changes can be undone'
-$ua  = New-GLAudit -Folder (Join-Path $lf 'undo') -User 'jane' -Tenant 't' -Version 'v'
-$ur  = Invoke-GLUndo -Rows $undoRows -FabricToken 'f' -Audit $ua -Progress @{ Cancel = $false }
-$dels = @($script:Calls | Where-Object Method -eq 'DELETE')
-Assert ($dels.Count -eq 1 -and $dels[0].Uri -like '*/connections/C1/roleAssignments/RA9') 'undo a grant: removes exactly that role, not the Owner role beside it'
-$post = @($script:Calls | Where-Object Method -eq 'POST')
-Assert ($post.Count -eq 1 -and $post[0].Uri -like '*/gateways/G1/roleAssignments' -and $post[0].Body.role -eq 'Admin' -and $post[0].Body.principal.type -eq 'Group') 'undo a removal: grants the same role again, on the right kind of target'
-$patch = @($script:Calls | Where-Object Method -eq 'PATCH')
-Assert ($patch.Count -eq 1 -and $patch[0].Uri -like '*/gateways/G1/members/M1' -and $patch[0].Body.enabled -eq $true) 'undo a disable: enables the member again'
-Assert (-not $ur[3].Ok -and $ur[3].Message -match 'cannot be undone' -and -not $ur[4].Ok) 'a delete, or a change that failed, is refused - nothing is sent for it'
-$ul = @(Import-Csv (Get-GLChangePath -Folder $ua.Folder -User 'jane'))
-Assert ($ul.Count -eq 3 -and -not ($ul | Where-Object { $_.Details -notlike 'undo of *' })) 'every undo is itself recorded, marked as the undo of the original'
 Remove-Item function:Invoke-GLRequest
 . $script -LoadOnly
 
@@ -940,7 +1304,7 @@ Enable-GLDemo
 $s = Get-GLDemoStore
 $s.Fast = $true
 $T = 'demo-token'
-Assert ($s.Users.Count -eq 6 -and $s.Connections.Count -eq 26 -and $s.Gateways.Count -eq 6) "the company is built: 6 people, 6 gateways, 26 connections ($($s.Users.Count), $($s.Gateways.Count), $($s.Connections.Count))"
+Assert ($s.Users.Count -eq 6 -and $s.Connections.Count -eq 27 -and $s.Gateways.Count -eq 6) "the company is built: 6 people, 6 gateways, 27 connections ($($s.Users.Count), $($s.Gateways.Count), $($s.Connections.Count))"
 $allIds = @($s.Connections | ForEach-Object id) + @($s.Gateways | ForEach-Object id) + @($s.Users | ForEach-Object id)
 Assert (@($allIds | Sort-Object -Unique).Count -eq $allIds.Count) 'every id is unique'
 Assert ((New-GLDemoId 'x') -eq (New-GLDemoId 'x') -and (Test-GLGuid (New-GLDemoId 'x'))) 'demo ids are stable and shaped like real ones'
@@ -952,12 +1316,34 @@ $gs   = @{}; foreach ($r in $grow) { $gs[$r.Name] = Get-GLGatewayState $r.Online
 Assert ($gs['Contoso Prod Cluster'] -eq 'Online' -and $gs['Contoso Finance Cluster'] -eq 'Partial' -and $gs['Legacy Warehouse Gateway'] -eq 'Offline' -and $gs['Contoso Test Cluster'] -eq 'Partial') 'gateways in every state: online, partly online, offline'
 Assert (@($gd.Live.Values | Where-Object Status -eq 'Timeout').Count -eq 1) 'and one member that does not answer'
 
+# Microsoft's pages, from the demo's own copies - nothing leaves the computer
+$dr = Get-GLGatewayReleases
+Assert ($dr.Newest -eq [version]'3000.290.10' -and @($dr.Supported).Count -eq 6 -and $dr.Published -and $dr.Log.Count -eq 0) "the demo answers both Microsoft pages ($($dr.Newest), $(@($dr.Supported).Count) supported)"
+$dt = ConvertTo-GLGatewayTiles -Rows $grow -Members $gd.Members -DownSince @{} -VnetSkipped -Live $gd.Live -Releases $dr
+$db = @{}; foreach ($x in $dt) { $db[$x.Name] = $x.Badge }
+Assert ($db['Contoso Prod Cluster'] -eq '' -and $db['Contoso Test Cluster'] -eq 'UPDATE AVAILABLE' -and $db['Legacy Warehouse Gateway'] -eq 'UNSUPPORTED VERSION' -and $db['Contoso Finance Cluster'] -eq 'MIXED VERSIONS') "the demo shows every version badge ($(($db.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))"
+
+# VNet gateways: a status check starts a sleeping one, so nothing asks unless told to
+Assert ($s.VnetWoken -eq 0 -and -not ($gd.Live.Values | Where-Object { $_.Cluster -eq ($s.Gateways | Where-Object type -eq 'VirtualNetwork').id.ToLowerInvariant() })) 'live status leaves VNet gateways alone unless asked - a status check would wake them'
+$vt = ConvertTo-GLGatewayTiles -Rows $grow -Members $gd.Members -DownSince @{} -VnetSkipped -Live $gd.Live
+$vtile = $vt | Where-Object Type -eq 'VirtualNetwork'
+Assert ($vtile.Status -eq 'VNet' -and $vtile.MembersText -match 'not woken') 'a skipped VNet gateway''s tile says it was not checked, and why'
+$gdv  = Get-GLGatewayData -FabricToken $T -PbiToken $T -LiveStatus -CheckVnet
+$vrows = ConvertTo-GLGatewayRows -Gateways $gdv.Gateways -Members $gdv.Members -Live $gdv.Live
+$vrow  = $vrows | Where-Object Type -eq 'VirtualNetwork'
+$vt2  = ConvertTo-GLGatewayTiles -Rows @($vrow) -Members $gdv.Members -DownSince @{} -Live $gdv.Live
+Assert ($s.VnetWoken -eq 2 -and $vrow.Online -eq '2 / 2' -and $vt2[0].Status -eq 'Online' -and $vt2[0].MembersText -like 'VNet - 2 of 2*') "asked to check VNet gateways: both members are asked, and the tile shows their status (asked $($s.VnetWoken), $($vrow.Online))"
+$s.VnetWoken = 0
+
 $cd   = Get-GLConnectionData -FabricToken $T
 $crow = ConvertTo-GLConnectionRows -Connections $cd.Connections -GatewayNames (Get-GLGatewayNameMap -Gateways $cd.Gateways)
 Add-GLDirectoryInfo -Rows $crow -Directory (Get-GLDatasourceDirectory -PbiToken $T)
 $byN  = @{}; foreach ($r in $crow) { $byN[$r.Name] = $r }
 $hr   = $byN['HR Core']
-Assert ($crow.Count -eq 26 -and $hr.Gateway -eq 'Contoso Prod Cluster' -and $hr.Account -eq 'CONTOSO\svc_hr') 'connections come with gateway names and the account in their credentials'
+Assert ($crow.Count -eq 27 -and $hr.Gateway -eq 'Contoso Prod Cluster' -and $hr.Account -eq 'CONTOSO\svc_hr') 'connections come with gateway names and the account in their credentials'
+$idle  = @($crow | Where-Object { $_.UnusedDays -gt 30 })
+$never = @($crow | Where-Object { -not $_.LastUsed })
+Assert (@($crow | Where-Object Created).Count -eq 27 -and $idle.Count -ge 2 -and $never.Count -ge 2) "the demo has connection recency: all created, $($idle.Count) idle for over a month, $($never.Count) never used"
 
 $onp = @($crow | Where-Object Connectivity -eq 'OnPremisesGateway')
 $st  = Test-GLConnectionsBulk -Items $onp -PbiToken $T
@@ -991,12 +1377,6 @@ $v1 = Invoke-GLBulkRevoke -Items $two -Principals $who -FabricToken $T -Progress
 $ras  = Get-GLRoleAssignments -Kind connections -Id $byN['Sales DW'].Id -FabricToken $T
 $left = @($ras | Where-Object { $_.principal.id -eq $jane.Id })
 Assert (@($v1 | Where-Object Ok).Count -eq 2 -and $left.Count -eq 0) 'remove: gone from both'
-$changes = Read-GLChanges -Folder $dl
-$undo = @($changes | Where-Object { $_.Action -eq 'Remove access' -and $_.Result -eq 'Done' })
-$u1 = Invoke-GLUndo -Rows $undo -FabricToken $T -Audit $au -Progress @{ Cancel = $false }
-$ras  = Get-GLRoleAssignments -Kind connections -Id $byN['Sales DW'].Id -FabricToken $T
-$back = @($ras | Where-Object { $_.principal.id -eq $jane.Id -and $_.role -eq 'User' })
-Assert ($undo.Count -eq 2 -and @($u1 | Where-Object Ok).Count -eq 2 -and $back.Count -eq 1) 'undo, from the change record: she is back, with the same role'
 $ras    = Get-GLRoleAssignments -Kind connections -Id $byN['Web API Sandbox'].Id -FabricToken $T
 $owners = @($ras | Where-Object role -eq 'Owner')
 $err = $null
@@ -1010,12 +1390,10 @@ Assert ($m2.enabled -eq $false) 'a member is disabled'
 Set-GLMemberEnabled -GatewayId $prodGw.id -MemberId $m2.id -Enabled $true -FabricToken $T
 
 $testGw = $cd.Gateways | Where-Object displayName -eq 'Contoso Test Cluster'
-$newRow = [pscustomobject]@{ Gateway = 'contoso test cluster'; Name = 'Scratch DB'; Type = 'Sql'; Server = 'sqltst02.contoso.local'; Database = 'Scratch'; CredentialType = 'Basic'; Username = 'scratch_user' }
-$c1 = Invoke-GLBulkCreate -Rows @($newRow) -Gateways $cd.Gateways -Password 'pw' -PbiToken $T -Progress @{ Cancel = $false } -Audit $au
-$c2 = Invoke-GLBulkCreate -Rows @($newRow) -Gateways $cd.Gateways -Password 'pw' -PbiToken $T -Progress @{ Cancel = $false } -Audit $au
-$made = $s.Connections | Where-Object displayName -eq 'Scratch DB'
-Assert ($c1[0].Ok -and $made.gatewayId -eq $testGw.id -and $made.connectionDetails.path -eq 'sqltst02.contoso.local;Scratch' -and $s.Accounts[$made.id] -eq 'scratch_user') 'create: the connection exists, on the right gateway, with its account'
-Assert (-not $c2[0].Ok -and $c2[0].Message -match 'already exists') 'create: the same name twice on one gateway is refused'
+$made = [pscustomobject]@{ id = (New-GLDemoId 'connection|Scratch DB'); displayName = 'Scratch DB'; connectivityType = 'OnPremisesGateway'; gatewayId = $testGw.id
+    connectionDetails = [pscustomobject]@{ type = 'Sql'; path = 'sqltst02.contoso.local;Scratch' }; privacyLevel = 'Organizational'
+    credentialDetails = [pscustomobject]@{ credentialType = 'Basic'; singleSignOnType = 'None'; connectionEncryption = 'Encrypted'; skipTestConnection = $false } }
+$s.Connections.Add($made)
 
 $bk = Join-Path $dl 'backup.csv'
 $mi = ConvertTo-GLConnectionRows -Connections @($made) -GatewayNames (Get-GLGatewayNameMap -Gateways $cd.Gateways)
@@ -1026,9 +1404,75 @@ Assert ($d1[0].Ok -and -not ($s.Connections | Where-Object displayName -eq 'Scra
 Assert ((Resolve-GLHostAddress -Machine 'CTSGW-PRD01') -match '^10\.20\.\d+\.\d+;CTSGW-PRD01$' -and (Resolve-GLHostAddress -Machine 'LEGGW-01') -eq 'UNKNOWN;LEGGW-01') 'Resolve IPs works in the demo - with one machine missing from DNS'
 
 $rec = @(Import-Csv (Get-GLChangePath -Folder $dl -User 'demo.user@contoso.com'))
-Assert (@($rec | Select-Object -ExpandProperty Action -Unique).Count -ge 5 -and -not ((Get-Content (Get-GLChangePath -Folder $dl -User 'demo.user@contoso.com') -Raw) -match 'Correct horse')) 'every demo change is in the change record - and no password'
+$acts = @($rec | Select-Object -ExpandProperty Action -Unique)
+$want = 'Update credentials', 'Grant access', 'Remove access', 'Delete connection'
+Assert (-not ($want | Where-Object { $acts -notcontains $_ }) -and -not ((Get-Content (Get-GLChangePath -Folder $dl -User 'demo.user@contoso.com') -Raw) -match 'Correct horse')) "every kind of demo change is in the change record - and no password ($($acts -join ', '))"
 
+# ---- hand over access: Joe Smith is leaving ----
+$joeU  = $s.Users | Where-Object displayName -eq 'Joe Smith'
+$anaU  = $s.Users | Where-Object displayName -eq 'Ana Novak'
+$janeU = $s.Users | Where-Object displayName -eq 'Jane Doe'
+$meU   = $s.Users | Where-Object userPrincipalName -eq $s.Me
+$prodG = $cd.Gateways | Where-Object displayName -eq 'Contoso Prod Cluster'
+$allConn = @($crow | ForEach-Object { [pscustomobject]@{ Kind = 'connections'; Id = $_.Id; Name = $_.Name; Gateway = $_.Gateway; GatewayId = $_.GatewayId } })
+$allGw   = @($cd.Gateways | Where-Object { $_.type -in 'OnPremises', 'VirtualNetwork' } | ForEach-Object { [pscustomobject]@{ Kind = 'gateways'; Id = $_.id; Name = $_.displayName; Gateway = $_.displayName; GatewayId = $_.id } })
+$ha = New-GLAudit -Folder (Join-Path $dl 'handover') -User 'demo.user@contoso.com' -Tenant 'contoso.example (demo)' -Version 'test'
+function Get-DemoRole([string]$Kind, [string]$Id, [string]$UserId) { return (@($s.Roles["$Kind/$Id"]) | Where-Object { $_.principal.id -eq $UserId } | Select-Object -First 1).role }
+$toAna = [pscustomobject]@{ Id = $anaU.id; DisplayName = 'Ana Novak'; Type = 'User' }
+$vnetG = $cd.Gateways | Where-Object type -eq 'VirtualNetwork' | Select-Object -First 1
+$nobody = Get-GLRoleAssignmentsBulk -Ids @($vnetG.id) -FabricToken $T -Kind gateways
+Assert ($null -ne $nobody[$vnetG.id] -and $nobody[$vnetG.id] -is [array] -and $nobody[$vnetG.id].Count -eq 0) 'nobody has access is an empty list, not "could not be read"'
+
+$fromMail = Resolve-GLHandoverFrom -Value 'joe.smith@contoso.com' -GraphToken $null
+Assert ($fromMail.Id -eq '' -and $fromMail.Names -contains 'joe.smith@contoso.com') 'without Graph - say the account is already deleted - the one handing over is matched by the email their roles carry'
+$err = $null; try { $null = Resolve-GLHandoverFrom -Value 'joe' -GraphToken $T } catch { $err = $_.Exception.Message }
+Assert ($err -match 'was not found' -and $err -match 'email') 'a name that is found nowhere is refused - it would match nobody'
+$h1 = Invoke-GLAccessHandover -Targets ($allGw + $allConn) -From $fromMail -To $toAna -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha
+$given = @($h1 | Where-Object { $_.Message -like 'gave Ana Novak*' })
+Assert ($given.Count -eq 2 -and (Get-DemoRole connections $byN['Sales DW'].Id $anaU.id) -eq 'User' -and (Get-DemoRole connections $byN['Sales Staging'].Id $joeU.id) -eq 'User') "Copy access: Ana gets Joe's User role on both his connections, and Joe keeps his ($($given.Count) given)"
+Assert (@($h1 | Where-Object { -not $_.Ok }).Count -eq 0 -and @($h1 | Where-Object { $_.Message -like '*has no role here' }).Count -eq ($allGw.Count + $allConn.Count - 2)) 'everything else: nothing to hand over, and nothing fails'
+
+$fromJoe = Resolve-GLHandoverFrom -Value 'joe.smith@contoso.com' -GraphToken $T
+Assert ($fromJoe.Id -eq $joeU.id) 'with Graph, the email is looked up to an object id'
+$h2 = Invoke-GLAccessHandover -Targets $allConn -From $fromJoe -To ([pscustomobject]@{ Id = $meU.id; DisplayName = 'Demo User'; Type = 'User' }) -Move -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha
+Assert (-not (Get-DemoRole connections $byN['Sales DW'].Id $joeU.id) -and (Get-DemoRole connections $byN['Sales DW'].Id $meU.id) -eq 'Owner' -and @($h2 | Where-Object { $_.Message -like '*already has Owner, removed*' }).Count -eq 2) 'Move access to someone with a higher role: their role is kept, and Joe is removed'
+
+$biG = $s.Groups | Where-Object displayName -eq 'BI Admins'
+# Jane has User on Sales DW (an earlier test removed it - give it back first)
+if (-not (Get-DemoRole connections $byN['Sales DW'].Id $janeU.id)) { $null = Add-GLRoleAssignment -Kind connections -Id $byN['Sales DW'].Id -PrincipalId $janeU.id -PrincipalType User -Role User -FabricToken $T }
+$t3 = @($allConn | Where-Object { $_.Name -in 'Sales DW', 'Product Catalog' })
+$h3 = Invoke-GLAccessHandover -Targets $t3 -From (Resolve-GLHandoverFrom -Value $biG.id) -To ([pscustomobject]@{ Id = $janeU.id; DisplayName = 'Jane Doe'; Type = 'User' }) -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha
+Assert ((Get-DemoRole connections $byN['Sales DW'].Id $janeU.id) -eq 'Owner' -and ($h3 | Where-Object Name -eq 'Sales DW').Message -like 'raised Jane Doe from User to Owner*') 'a lower role is raised to the same one - Jane goes from User to Owner, as the group had'
+Assert ((Get-DemoRole connections $byN['Product Catalog'].Id $janeU.id) -eq 'Owner' -and ($h3 | Where-Object Name -eq 'Product Catalog').Message -eq 'gave Jane Doe Owner') 'no role yet: the same role is given'
+
+$h4 = Invoke-GLAccessHandover -Targets $allGw -From (Resolve-GLHandoverFrom -Value 'jane.doe@contoso.com' -GraphToken $T) -To $toAna -Move -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha
+Assert ((Get-DemoRole gateways $prodG.id $anaU.id) -eq 'ConnectionCreator' -and -not (Get-DemoRole gateways $prodG.id $janeU.id)) 'gateways too: Ana takes over Jane''s connection-creator role on the Prod gateway'
+
+$ghost = [pscustomobject]@{ Id = (New-GLDemoId 'nobody'); DisplayName = 'Nobody'; Type = 'User' }
+$t5 = @($allConn | Where-Object Name -eq 'Sales Staging')
+$h5 = Invoke-GLAccessHandover -Targets $t5 -From (Resolve-GLHandoverFrom -Value $anaU.id) -To $ghost -Move -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha
+Assert (-not $h5[0].Ok -and $h5[0].Message -match 'could not be given' -and $h5[0].Message -match 'keeps it' -and (Get-DemoRole connections $byN['Sales Staging'].Id $anaU.id) -eq 'User') 'a grant that fails removes nothing: Ana keeps her role'
+$err = $null; try { $null = Invoke-GLAccessHandover -Targets $allConn -From (Resolve-GLHandoverFrom -Value $anaU.id) -To $toAna -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha } catch { $err = $_.Exception.Message }
+Assert ($err -match 'is the one handing over') 'handing over to the same person is refused before anything is read'
+
+$hrec = @(Import-Csv (Get-GLChangePath -Folder $ha.Folder -User 'demo.user@contoso.com'))
+$hg = @($hrec | Where-Object { $_.Action -eq 'Grant access' -and $_.Result -eq 'Done' -and $_.Details -like 'Handed over from*' })
+$hm = @($hrec | Where-Object { $_.Action -eq 'Remove access' -and $_.Result -eq 'Done' -and $_.Details -like 'Handed over to*' })
+$hc = @($hrec | Where-Object { $_.Action -eq 'Change role' -and $_.Result -eq 'Done' })
+Assert ($hg.Count -eq 4 -and $hm.Count -eq 3 -and $hc.Count -eq 1 -and $hg[0].Principal -and $hg[0].Role) "every grant, raise and removal of a handover is in the change record ($($hg.Count) given, $($hc.Count) raised, $($hm.Count) removed)"
+
+$rt = @(
+    [pscustomobject]@{ Kind = 'gateways';    Id = $prodG.id; Name = $prodG.displayName; Gateway = $prodG.displayName; Type = 'OnPremises'; Path = ''; Account = ''; LastUsed = '' }
+    [pscustomobject]@{ Kind = 'connections'; Id = $byN['Sales DW'].Id; Name = 'Sales DW'; Gateway = 'Contoso Prod Cluster'; Type = 'SQL'; Path = $byN['Sales DW'].Path; Account = $byN['Sales DW'].Account; LastUsed = $byN['Sales DW'].LastUsed }
+)
+$rep = Get-GLAccessReport -Targets $rt -FabricToken $T -Progress @{ Cancel = $false }
+Assert (@($rep | Where-Object { $_.Target -eq 'Sales DW' -and $_.Email -eq 'demo.user@contoso.com' -and $_.Role -eq 'Owner' }).Count -eq 1 -and @($rep | Where-Object { $_.Kind -eq 'Gateway' -and $_.Role -eq 'Admin' }).Count -ge 1) "access report from the demo: gateways and connections, each person with their role ($($rep.Count) rows)"
+$repAna = Get-GLAccessReport -Targets $rt -Who 'ana.novak' -FabricToken $T -Progress @{ Cancel = $false }
+Assert ($repAna.Count -eq 2 -and -not ($repAna | Where-Object { $_.Email -ne 'ana.novak@contoso.com' })) "access report for one person: Ana's gateway role and her connection, nothing else ($($repAna.Count))"
+
+$s.VnetWoken = 0
 $ok = Invoke-GLSelfTest 6>$null
+Assert ($s.VnetWoken -eq 0) 'the self-test never wakes a VNet gateway'
 Assert ($ok) 'the self-test passes against the demo, every check'
 
 # the background workers see the same Contoso - the window depends on it
@@ -1039,22 +1483,8 @@ $ps = [powershell]::Create(); $ps.Runspace = $rs
 [void]$ps.AddScript({ param($T, $G, $M) $d = Get-GLConnectionData -FabricToken $T; Set-GLMemberEnabled -GatewayId $G -MemberId $M -Enabled $false -FabricToken $T; @($d.Connections).Count }).AddArgument($T).AddArgument($prodGw.id).AddArgument($m2.id)
 $wc = $ps.Invoke()
 $ps.Dispose(); $rs.Dispose()
-Assert ($wc[0] -eq 26 -and $m2.enabled -eq $false) 'a background worker reads and changes the same demo company as the window'
+Assert ($wc[0] -eq 27 -and $m2.enabled -eq $false) 'a background worker reads and changes the same demo company as the window'
 
-$hist = Join-Path $dl 'history'
-Initialize-GLDemoHistory -Folder $hist
-$hr2 = Read-GLChanges -Folder $hist
-$mine = @($hr2 | Where-Object { $_.User -eq 'demo.user@contoso.com' -and (Test-GLUndoable $_) })
-Assert ($hr2.Count -eq 8 -and @($hr2 | Select-Object -ExpandProperty User -Unique).Count -eq 2 -and $mine.Count -eq 2) 'a week of history from two people, two of the changes yours to undo'
-$u2 = Invoke-GLUndo -Rows $mine -FabricToken $T -Audit $au -Progress @{ Cancel = $false }
-$joe = $s.Users | Where-Object displayName -eq 'Joe Smith'; $raj = $s.Users | Where-Object displayName -eq 'Raj Patel'
-$ras1 = Get-GLRoleAssignments -Kind connections -Id $byN['Sales DW'].Id -FabricToken $T
-$ras2 = Get-GLRoleAssignments -Kind connections -Id $byN['Customer 360'].Id -FabricToken $T
-$joeLeft = @($ras1 | Where-Object { $_.principal.id -eq $joe.id })
-$rajBack = @($ras2 | Where-Object { $_.principal.id -eq $raj.id })
-Assert (@($u2 | Where-Object Ok).Count -eq 2 -and $joeLeft.Count -eq 0 -and $rajBack.Count -eq 1) 'the history matches the company: undoing it really changes access'
-Initialize-GLDemoHistory -Folder $hist
-Assert ((Read-GLChanges -Folder $hist).Count -eq 8) 'the history is written once, not on every start'
 
 Disable-GLDemo
 Assert (-not [System.AppDomain]::CurrentDomain.GetData('GatewayLens.Demo')) 'switching the demo off removes it completely'
@@ -1101,8 +1531,18 @@ foreach ($f in $script:HistoryFields) {
     Assert ($xamlBy.MainXaml -match "<ComboBox Name=""$f"" IsEditable=""True""") "$f is an editable box with history"
 }
 Assert (-not ($script:HistoryFields | Where-Object { $_ -match 'Pwd|Pass' })) 'no password box is among the fields with history'
+$gridTags = @([regex]::Matches($xamlBy.MainXaml, '<DataGrid [^>]*>') | ForEach-Object Value)
+$gridNames = @($gridTags | ForEach-Object { if ($_ -match 'Name="(\w+)"') { $Matches[1] } })
+$unsafe = @($gridTags | Where-Object { $_ -notmatch 'CanUserAddRows="False"' -or $_ -notmatch 'CanUserDeleteRows="False"' })
+$wired  = [regex]::Match($text, "\`$script:Grids\s*=\s*@\(([^)]*)\)").Groups[1].Value
+$unwired = @($gridNames | Where-Object { $wired -notmatch "'$_'" })
+Assert ($gridTags.Count -ge 4 -and -not $unsafe -and -not $unwired) "every grid: rows can be neither added nor deleted, and it gets read-only copyable columns ($($gridNames -join ', ')) $(if ($unsafe -or $unwired) { '- not: ' + (@($unwired) + @($unsafe) -join ', ') })"
+
+$fixedBoxes = @([regex]::Matches($xamlBy.MainXaml, '<(ComboBox|PasswordBox|TextBox)\b[^>]*\sHeight="\d+"') | ForEach-Object { ($_.Value -split '\s+')[0..1] -join ' ' })
+Assert (-not $fixedBoxes) "no input box has a fixed height - it would cut off larger text $(if ($fixedBoxes) { '- ' + ($fixedBoxes -join ', ') })"
+
 $pwBoxes = @([regex]::Matches($xamlBy.MainXaml, '<(\w+) Name="(Pwd\w+)"') | ForEach-Object { "$($_.Groups[1].Value) $($_.Groups[2].Value)" })
-Assert ($pwBoxes.Count -eq 2 -and -not ($pwBoxes | Where-Object { $_ -notlike 'PasswordBox *' })) "both password fields are masked PasswordBoxes ($($pwBoxes -join ', '))"
+Assert ($pwBoxes.Count -eq 1 -and -not ($pwBoxes | Where-Object { $_ -notlike 'PasswordBox *' })) "the password field is a masked PasswordBox ($($pwBoxes -join ', '))"
 
 $png = [Convert]::FromBase64String($script:IconPng)
 Assert ($png[0] -eq 0x89 -and $png[1] -eq 0x50 -and $png[2] -eq 0x4E -and $png[3] -eq 0x47) 'the embedded icon is a PNG'
@@ -1116,7 +1556,7 @@ $codeBrushes = @([regex]::Matches((Get-Content $script -Raw), "Set-GLRowColor \`
     [regex]::Matches($_.Groups[1].Value, "\{\s*'(\w+)'\s*\}") | ForEach-Object { $_.Groups[1].Value } } | Sort-Object -Unique)
 foreach ($name in $script:Themes.Keys) {
     $miss = @($codeBrushes | Where-Object { -not $script:Themes[$name].Contains($_) })
-    Assert ($codeBrushes.Count -ge 3 -and -not $miss) "theme '$name' has the row colours the code asks for ($($codeBrushes -join ', ')) $(if ($miss) { '- missing: ' + ($miss -join ', ') })"
+    Assert ($codeBrushes.Count -ge 2 -and -not $miss) "theme '$name' has the row colours the code asks for ($($codeBrushes -join ', ')) $(if ($miss) { '- missing: ' + ($miss -join ', ') })"
 }
 
 $wl = Join-Path ([System.IO.Path]::GetTempPath()) ("gl-wl-" + [guid]::NewGuid().ToString('N'))
@@ -1158,8 +1598,12 @@ Assert ($newObj.Count -eq 0) "no New-Object in the script - it wraps objects, an
 $keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
 $keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
 $script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
-$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3 }
-$script:State.GatewayRows = @(1..6); $script:State.ConnRows = @(1..26); $script:State.Changes = @(1..8)
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = '' }
+$keepTiles = $script:State.Tiles
+$script:State.GatewayRows = @(1..5); $script:State.ConnRows = @(1..27)
+$script:State.Tiles = @('Offline', 'Degraded', 'Online', 'Online', 'VNet' | ForEach-Object { [pscustomobject]@{ Status = $_ } })
+$keepReleases = $script:State.Releases
+$script:State.Releases = [pscustomobject]@{ Newest = [version]'3000.290.10'; Supported = @(); Checked = Get-Date }
 Assert ((Get-GLSmokeVerdict).Count -eq 0) 'smoke verdict: a clean run passes'
 $script:StyleMode = 'Classic'; $script:StyleError = 'bad template'
 $script:LogEntries.Add([pscustomobject]@{ Level = 'Error'; Line = '12:00:00  ERROR  boom' })
@@ -1167,9 +1611,16 @@ $script:Smoke.Next = 2
 $v = Get-GLSmokeVerdict
 Assert ($v.Count -eq 3 -and ($v -join ' ') -match 'bad template' -and ($v -join ' ') -match 'boom' -and ($v -join ' ') -match 'step 2 of 3') 'smoke verdict: falling back to the classic look, an error, or an unfinished run all fail'
 $script:State.ConnRows = @(1..3)
-Assert (((Get-GLSmokeVerdict) -join ' ') -match 'connections shown: 3, expected 26') 'smoke verdict: missing demo data fails'
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'connections shown: 3, expected 27') 'smoke verdict: missing demo data fails'
+$script:State.ConnRows = @(1..27); $script:Smoke.KioskOk = $false
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'kiosk view') 'smoke verdict: a kiosk view that did not hide and restore fails'
+$script:Smoke.KioskOk = $true; $script:Smoke.GridChecks = 'a cell wrote its text back into the row'
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'grids: a cell wrote') 'smoke verdict: a grid that sorts, opens or copies wrongly fails'
+$script:Smoke.GridChecks = ''
+$script:Smoke.KioskOk = $true; $script:State.Releases = $null
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'newest gateway version') 'smoke verdict: the newest gateway version not read fails'
 $script:StyleMode = $keepStyle; $script:StyleError = $keepErr; $script:Smoke = $keepSmoke; $script:LogEntries.Clear()
-$script:State.GatewayRows = $keepRows.G; $script:State.ConnRows = $keepRows.C; $script:State.Changes = $keepRows.A
+$script:State.GatewayRows = $keepRows.G; $script:State.ConnRows = $keepRows.C; $script:State.Changes = $keepRows.A; $script:State.Tiles = $keepTiles; $script:State.Releases = $keepReleases
 
 if ($IsWindows -and -not $env:GATEWAYLENS_NO_WINDOW_TEST) {
     # The window itself. This is also what catches a theme brush that reaches WPF as
@@ -1342,32 +1793,102 @@ Assert ($r.Count -eq 1 -and $r[0].Name -eq 'only') 'a list of one object stays a
 # the real jobs that return lists of objects
 $wf = Join-Path ([IO.Path]::GetTempPath()) ("gl-wk-" + [guid]::NewGuid().ToString('N'))
 Enable-GLDemo; (Get-GLDemoStore).Fast = $true
-Initialize-GLDemoHistory -Folder $wf
+$wa = New-GLAudit -Folder $wf -User 'demo.user@contoso.com' -Tenant 'contoso.example (demo)' -Version 'test'
+foreach ($i in 1..8) { Write-GLChange -Audit $wa -Action 'Grant access' -Result Done -Target "Connection $i" -Principal 'Joe Smith' -Role 'User' }
 $r = Invoke-Worker "Read-GLChanges -Folder '$wf'"
 Assert ($r.Count -eq 8 -and $r[0].Action -and $r[0].User -and $r[0].When -is [datetime]) 'the change record arrives from a worker whole - every change, every field'
 $cid = (Get-GLDemoStore).Connections[0].id
 $r = Invoke-Worker "Get-GLRoleAssignments -Kind connections -Id '$cid' -FabricToken 'demo-token'"
 Assert ($r.Count -ge 2 -and $r[0].role -and $r[0].principal.displayName) 'who has access arrives from a worker whole'
-$r = Invoke-Worker ('$s = Get-GLDemoStore; $c = $s.Connections[2]; $u = $s.Users[3]; ' +
+$r = Invoke-Worker ('$s = Get-GLDemoStore; $c = $s.Connections | Where-Object displayName -eq ''Customer 360''; $u = $s.Users[3]; ' +
     'Invoke-GLBulkGrant -Items @([pscustomobject]@{ Id = $c.id; Name = $c.displayName }) ' +
     '-Principals @([pscustomobject]@{ Id = $u.id; DisplayName = $u.displayName; Type = "User" }) -Role User -FabricToken demo-token -Progress @{ Cancel = $false }')
 Assert ($r.Count -eq 1 -and $r[0].Name -eq 'Customer 360' -and $r[0].Ok -eq $true -and $r[0].Message -like 'granted User to Ana Novak') "bulk results arrive from a worker whole - name, outcome and reason ($($r[0].Name): $($r[0].Message))"
 
-# the window's own Activity refresh, with stand-in controls: the path that came back empty
-$keepUI = $script:UI; $keepFolder = $script:LogFolder
+# the window's own job path - Start-GLJob, then Receive-GLJobs handing the result to
+# OnDone - with stand-in controls: the path where every list once came back empty
+$keepUI = $script:UI
 $script:UI = @{}
-foreach ($n in 'CmbActAction', 'CmbActUser', 'CmbActPeriod', 'CmbActResult', 'TxtActFind', 'GridActivity', 'TxtActCount', 'Busy', 'BtnCancel', 'TxtStatus') {
-    $script:UI[$n] = [pscustomobject]@{ ItemsSource = $null; SelectedItem = '(all)'; SelectedIndex = 0; Text = ''; Visibility = ''; IsIndeterminate = $false; Maximum = 0; Value = 0 }
+foreach ($n in 'Busy', 'BtnCancel', 'TxtStatus') {
+    $script:UI[$n] = [pscustomobject]@{ Text = ''; Visibility = ''; IsIndeterminate = $false; Maximum = 0; Value = 0 }
 }
-$script:UI.CmbActPeriod.SelectedItem = '30 days'
-$script:LogFolder = $wf
 $script:Pool = $pool    # careful: names ignore case - in this file $pool and $script:Pool are ONE variable
 $script:Jobs = [System.Collections.Generic.List[object]]::new()
-$script:State.Changes = @()
-Invoke-GLActivityRefresh 6>$null
+$script:JobResult = $null
+$readWork = { param($D) Read-GLChanges -Folder $D }
+$keepDone = { param($r, $err, $ctx) $script:JobResult = @($r | Where-Object { $_ }) }
+Start-GLJob -Quiet -Name 'Reading the change record' -Arguments @{ D = $wf } -Work $readWork -OnDone $keepDone 6>$null
 for ($i = 0; $i -lt 100 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
-Assert (@($script:State.Changes).Count -eq 8 -and @($script:UI.GridActivity.ItemsSource).Count -eq 8 -and @($script:UI.GridActivity.ItemsSource)[0].Action) "the Activity tab's own refresh shows every change ($(@($script:State.Changes).Count) loaded, $(@($script:UI.GridActivity.ItemsSource).Count) shown)"
-$script:UI = $keepUI; $script:LogFolder = $keepFolder; $script:State.Changes = @()   # $script:Pool stays: it is $pool
+Assert (@($script:JobResult).Count -eq 8 -and @($script:JobResult)[0].Action -eq 'Grant access' -and @($script:JobResult)[0].Target) "a window job hands its list to OnDone whole ($(@($script:JobResult).Count) of 8)"
+
+# the real Verify status and Verify users buttons, on demo data, with a stand-in grid
+$cdw = Get-GLConnectionData -FabricToken 'demo-token'
+$script:State.ConnRows = ConvertTo-GLConnectionRows -Connections $cdw.Connections -GatewayNames (Get-GLGatewayNameMap -Gateways $cdw.Gateways)
+$grid = [pscustomobject]@{ ItemsSource = $script:State.ConnRows; Items = [pscustomobject]@{} }
+$grid.Items | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+$script:UI.GridConnections = $grid
+$keepMode = $script:AuthMode; $script:AuthMode = 'Demo'
+Invoke-GLBulkStatusUi 6>$null
+for ($i = 0; $i -lt 200 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
+$tested = @($script:State.ConnRows | Where-Object { $_.Status })
+$bad = @($tested | Where-Object Status -eq 'Failed')
+Assert ($tested.Count -eq 20 -and $bad.Count -ge 3) "Verify status from the window tests every gateway connection ($($tested.Count) of 20 tested, $($bad.Count) failed)"
+foreach ($r in $script:State.ConnRows) { $r.Users = '' }
+Invoke-GLBulkUsersUi 6>$null
+for ($i = 0; $i -lt 200 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
+$read = @($script:State.ConnRows | Where-Object { $_.Users })
+Assert ($read.Count -eq 27) "Verify users from the window reads every connection ($($read.Count) of 27)"
+# the real Move access button: the User filter names who leaves, To who takes over
+$keepConfirm  = ${function:Confirm-GL}
+function Confirm-GL { param($Text, $Title) $script:Confirmed = $Text; return $true }
+$keepSettings = $script:Settings; $script:Settings = New-GLDefaultSettings
+$keepLogDir   = $script:LogFolder; $script:LogFolder = Join-Path $wf 'logs'
+$keepWho      = $script:SignedInAs; $script:SignedInAs = 'demo.user@contoso.com'
+foreach ($n in 'TxtMoveFrom', 'TxtMoveTo', 'TxtCnUser', 'TxtCredUser') { $script:UI[$n] = [pscustomobject]@{ Text = ''; ItemsSource = $null } }
+$script:UI.TxtMoveTo.Text  = 'ana.novak@contoso.com'
+$script:UI.TxtCnUser.Text  = 'joe.smith'
+$script:UI.ChkMoveGateways = [pscustomobject]@{ IsChecked = $false }
+$script:UI.CmbMoveToType   = [pscustomobject]@{ SelectedItem = 'User' }
+$script:UI.LstGwTiles      = [pscustomobject]@{ ItemsSource = @() }
+$joeRows = Select-GLConnections -Rows $script:State.ConnRows -User 'joe.smith'
+$script:UI.GridConnections = [pscustomobject]@{ ItemsSource = $joeRows; Items = $grid.Items }
+Invoke-GLHandoverUi -Move 6>$null
+for ($i = 0; $i -lt 200 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
+$ds = Get-GLDemoStore
+$joeW = $ds.Users | Where-Object displayName -eq 'Joe Smith'; $anaW = $ds.Users | Where-Object displayName -eq 'Ana Novak'
+$left  = @($ds.Roles.Values | ForEach-Object { $_ } | Where-Object { $_.principal.id -eq $joeW.id })
+$taken = @($joeRows | Where-Object { $id = $_.Id; @($ds.Roles["connections/$id"] | Where-Object { $_.principal.id -eq $anaW.id -and $_.role -eq 'User' }).Count })
+Assert ($joeRows.Count -eq 2 -and $script:Confirmed -match "Move every role 'joe.smith@contoso.com' has to 'ana.novak@contoso.com'" -and $taken.Count -eq 2 -and $left.Count -eq 0) "Move access from the window: the User filter names who leaves, Ana takes over both connections, Joe keeps nothing ($($taken.Count) taken, $($left.Count) left)"
+$script:UI.TxtCnUser.Text = 'a'
+$script:Confirmed = $null
+Invoke-GLHandoverUi -Move 6>$null
+Assert (-not $script:Confirmed -and $script:Jobs.Count -eq 0) 'a User filter that matches several people is not guessed at: nothing is asked, nothing runs'
+
+# the real Update credentials button, with Test them afterwards
+$sales = @($script:State.ConnRows | Where-Object { $_.Name -in 'Sales DW', 'Sales Staging', 'Sales DW (old copy)' })
+foreach ($r in $sales) { $r.Status = '' }
+$script:UI.GridConnections   = [pscustomobject]@{ ItemsSource = $sales; Items = $grid.Items }
+$script:UI.CmbCredType       = [pscustomobject]@{ SelectedItem = 'Windows' }
+$script:UI.TxtCredUser.Text  = 'CONTOSO\svc_sales'
+$pwBox = [pscustomobject]@{ Password = 'N3w-Passw0rd!' }
+$pwBox | Add-Member -MemberType ScriptMethod -Name Clear -Value { $this.Password = '' }
+$script:UI.PwdCred           = $pwBox
+$script:UI.CmbCredEncryption = [pscustomobject]@{ SelectedItem = 'Keep current' }
+$script:UI.ChkCredRetest     = [pscustomobject]@{ IsChecked = $true }
+$logBox = [pscustomobject]@{ Text = '' }
+$logBox | Add-Member -MemberType ScriptMethod -Name AppendText -Value { param($x) $this.Text += $x }
+$logBox | Add-Member -MemberType ScriptMethod -Name ScrollToEnd -Value { }
+$script:UI.TxtLog = $logBox
+$script:State.PublicKeys = @{}
+foreach ($g in $cdw.Gateways) { if ($g.publicKey) { $script:State.PublicKeys[([string]$g.id).ToLowerInvariant()] = $g.publicKey } }
+Invoke-GLBulkCredentialsUi 6>$null
+for ($i = 0; $i -lt 300 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
+$retested = @($sales | Where-Object { $_.Status -eq 'OK' })
+Assert ($retested.Count -eq 3 -and $logBox.Text -match 'Tested after the credential update: 3 of 3 work' -and $pwBox.Password -eq '') "Test them afterwards: the 3 updated connections are tested at once and all 3 work - and the password box is emptied ($($retested.Count))"
+Set-Item -Path function:Confirm-GL -Value $keepConfirm
+$script:Settings = $keepSettings; $script:LogFolder = $keepLogDir; $script:SignedInAs = $keepWho
+$script:AuthMode = $keepMode; $script:State.ConnRows = @()
+$script:UI = $keepUI   # $script:Pool stays: it is $pool
 Disable-GLDemo
 Remove-Item -Recurse -Force $wf
 

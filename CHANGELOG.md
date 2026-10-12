@@ -4,6 +4,146 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-10-12
+
+### Changed
+- **No module is required any more.** GatewayLens picks whichever way in works
+  with nothing more to do:
+  - **Az.Accounts, when it is installed** - as before. Microsoft's Azure PowerShell
+    is already approved in practically every tenant, so no one has to approve
+    anything.
+  - **Built-in sign-in, when it is not** - GatewayLens signs in by itself, through
+    the browser, as its own app registration. Nothing to install; the organisation
+    approves GatewayLens once. On a company PC the browser usually signs in without
+    a password, because Edge and Chrome pass on the Windows sign-in.
+- The built-in sign-in is plain OAuth 2.0 against Microsoft Entra ID: authorization code with
+  PKCE, through a one-off listener on this computer that only accepts connections
+  from this computer. `-DeviceCode` signs in on another device. One sign-in gives
+  the Fabric, Power BI and Microsoft Graph tokens, and each is renewed before it
+  runs out. Tokens stay in memory - never in a file, the log or the change record.
+- `docs/sign-in.md` explains both ways, how an organisation approves GatewayLens,
+  and what to forward to IT.
+- Sign-in errors say what to do next: not approved yet (with Az.Accounts offered as
+  the way round it), a sign-in policy, an expired sign-in, a wrong tenant.
+
+- **The Gateways tab is a monitoring wall.** One coloured tile per gateway cluster -
+  green online, amber degraded, red offline, grey when there is no live status -
+  with problems first, members online, versions, and a banner with the totals.
+  Click a tile for its members and access, as before.
+- Personal-mode gateways are no longer shown, and VNet gateways always are: the
+  tool is for the gateways a team runs - on-premises and virtual network.
+- **The Connections tab shows gateway connections** - on-premises, VNet and
+  streaming VNet - with **Include cloud connections** to add the shareable cloud
+  ones. Personal, Automatic and unbound connections are never listed.
+- The README leads with what the tool is for: the jobs big tenants struggle with in
+  the portal, and how GatewayLens does each one in bulk.
+
+### Fixed
+- **Verify status and Verify users did nothing in the window** - "0 OK, 0 failed".
+  Their background jobs took the list as `$I` and looped with `$i`, and PowerShell
+  names ignore case: the loop overwrote the list with 0. The functions themselves
+  were tested; the window's path to them was not. A test now presses both buttons on
+  demo data, and a guard refuses any parameter spelled again with other capitals.
+- **The search boxes forgot what was typed** when left: their handlers were made
+  with `.GetNewClosure()`, which runs them in a module of their own, where the
+  script's functions do not exist. A guard now checks every such handler.
+- An unexpected error now writes its full details to the log file, and the same
+  error many times in a row is logged once, with a count.
+- **A connection or gateway that nobody has access to read as "could not be read"** -
+  in Verify users ("error"), and in the backup before a delete. PowerShell turns an
+  empty list that comes out of an if-statement into nothing; the list is now
+  assigned directly, and a test checks it.
+- A guard now refuses a parameter named like an automatic variable: `$PId` is `$PID`,
+  which is read-only, and a scriptblock that took it failed every time it ran.
+
+### Added
+- **Text size with Ctrl + mouse wheel**, as in a browser - and Ctrl + plus, Ctrl + minus,
+  Ctrl + 0 for the default. The same steps as A- and A+, from 9 to 20, kept in the
+  settings. While Ctrl is held, the list under the mouse does not scroll.
+- **Compact rows that follow the text size** - a row is the text's line height plus a
+  little air: 22 at the default size instead of a fixed 28, so about a quarter more
+  rows fit on the screen; 18 at size 9, 33 at size 20. The column headers follow too.
+  Input boxes had a fixed height that cut off larger text; they now grow with it, and
+  a guard keeps any new one from getting a fixed height.
+- **Every list sorts and copies like a spreadsheet** - connections, members and both
+  access lists:
+  - Click a column name to sort; an arrow shows which way. The sort now lasts through
+    refreshes and filter changes - WPF forgot it every time the rows were replaced,
+    and the modern header style had no arrow, so sorting looked broken.
+  - Ctrl+C copies the selected rows, Ctrl+Shift+C with the column names; right-click
+    adds Copy cell and Copy all rows. Tab-separated, in the order shown, so it pastes
+    into Excel as cells. Exports follow the sort on screen too.
+  - Double-click a cell to open it as read-only text, all selected, to copy part of
+    it. Nothing is ever written back: the columns are template columns with one-way
+    bindings - a text column with a one-way binding refuses to open at all.
+  - Several rows can be selected in every list. Remove access, and Enable or Disable
+    a member, still take one at a time and say so if more are selected.
+  - The gateway tiles have a right-click menu too - copy this gateway, all of them,
+    or the id - and Ctrl+C.
+- **Hand over access** - for someone leaving, or a new owner. Name who hands over and
+  who takes over; **Copy access** gives the successor exactly the same roles on every
+  listed connection, and with *Gateways too* on every gateway on the Gateways tab -
+  raising a lower role where they already have one. **Move access** does the same,
+  then removes the old roles - but only where the successor has them by then, so no
+  connection is ever left without its owner. The one handing over is matched by
+  object id, UPN or email, never by display name, so someone whose account is
+  already deleted can still be handed over by their email. Left empty, *From* takes
+  the one person the User filter matches - and refuses if it matches several. Every
+  grant, raise and removal is in the change record.
+- **Cleanup views** - a *Show* filter on the Connections tab: *last used over 30, 90,
+  180 or 365 days ago*, *no use recorded*, *duplicates* (the same gateway, type, path
+  and account, side by side) and *failing tests*. Then Delete, which writes a backup
+  first.
+- **Connections per cluster against Microsoft's limit of 1,000 data sources** - on
+  every tile, counted from the connections list and the data source directory
+  together. Badges: NEAR CONNECTION LIMIT from 800, AT CONNECTION LIMIT at 1,000.
+- **Access report** - who can use what, read fresh from Fabric: one row per
+  connection or gateway and person, with the role, the credential account and when
+  the connection was last used. With the User filter set, everything that one person
+  can access.
+- **Test them afterwards** - after a mass credential update, exactly the connections
+  that took the new credentials are tested, and the log says how many still fail.
+  On by default.
+- The demo has a stale duplicate of Sales DW to find, and walks through a handover:
+  Joe Smith is leaving.
+- **Connection recency** (a Fabric preview): Created, LastLinked, LastUsed and
+  UnusedDays columns on the Connections tab and in its CSV export, from the
+  `connectionRecency` object the connections list already returns - no extra call.
+  LastUsed is when the credentials were last used at run time; empty means not
+  recorded, including use from before Microsoft began recording it.
+- **Skip VNet status**, on by default. A status check starts a VNet gateway that
+  has gone to sleep, and it then uses capacity until it sleeps again - many tenants
+  let them sleep after 30 minutes. While it is on, no status call goes to a VNet
+  gateway and its tile says it was not checked; the self-test never checks one.
+  Untick it to have them checked like the rest.
+- **Kiosk view** - full screen, tiles only, no button that changes anything,
+  refreshing every minute - for a wall screen. The **Kiosk view** button, `-Kiosk`
+  or F11; Esc or F11 leaves it.
+- **Down for** - how long a gateway or member has been offline, counted from when
+  this window first saw it (the API keeps no history).
+- **Gateway versions against Microsoft's own list.** The newest build comes from the
+  gateway's Download Center page, the six releases Microsoft still supports from the
+  Learn page of monthly updates - read once a session (again after 12 hours), with
+  no sign-in and nothing about the tenant sent. Tiles say UNSUPPORTED VERSION, MIXED
+  VERSIONS or UPDATE AVAILABLE; the banner names the newest build; each member shows
+  its release month and whether it is supported; the self-test checks both pages.
+  If the pages cannot be read, tiles compare members with each other (OLDER VERSION).
+- `-SignIn Auto|AzAccounts|Browser` - Auto by default; the other two choose one way.
+- `-Account` - sign in with another account than the Windows one, such as a
+  separate admin account. Works with both ways.
+- `-ClientId` - use your organisation's own app registration instead of the
+  built-in one.
+
+### Removed
+- `-AuthModule`, and sign-in through MicrosoftPowerBIMgmt: it could not look people
+  up by name, and the built-in sign-in now covers computers without Az.Accounts.
+- **The Create connections tab**, with its CSV import and connection-string parsing.
+- **The Activity tab and Undo.** Every change is still written to the change record
+  files the moment it happens, and nothing is changed if the record cannot be
+  written - there is just no tab to browse it in. **Open folder** in the log panel
+  shows the files. The demo no longer makes up a week of history.
+- The "Include VNet gateways" checkbox.
+
 ## [0.5.5] - 2026-10-11
 
 ### Fixed

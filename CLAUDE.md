@@ -7,8 +7,12 @@ how to check your work, and the traps this project has already fallen into.
 
 A desktop console for Microsoft on-premises data gateways and their connections,
 for Power BI and Microsoft Fabric. One PowerShell 7 script with a WPF window. It
-talks only to Microsoft's REST APIs - Fabric and Power BI, plus Microsoft Graph for
-name lookups. No database, no server, no agent. MIT licence, published on GitHub.
+talks only to Microsoft: the Fabric and Power BI REST APIs, Microsoft Graph for
+name lookups, and two public pages for the newest gateway version (Download Center,
+Learn - no token is ever sent there). Sign-in: Az.Accounts when installed (no tenant approval needed),
+otherwise built-in OAuth in the browser as its own multi-tenant app registration
+(no module needed). No database, no server, no agent. MIT licence,
+published on GitHub as freeware for anyone.
 
 The user signs in as themselves and the tool acts with their permissions. It can
 change real access and credentials on hundreds of connections, so correctness and
@@ -26,6 +30,8 @@ safety come before features.
 - `build/` - `GatewayLens.exe`: a small .NET Framework 4.8 launcher (C#) that carries
   the script inside it, and `Build-Exe.ps1`.
 - `assets/` - icons. `docs/permissions.md` - which role each action needs.
+  `docs/sign-in.md` - how sign-in works, approval by IT, the app registration.
+  `docs/testing-on-a-real-tenant.md` - the checklist for a real tenant, read-only first.
 - `.github/workflows/` - tests on Linux and Windows, exe build, release on a tag.
 
 ## Commands
@@ -60,7 +66,8 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
    values. Start each row with a comma: `,@('a', 'b')`.
 6. **Every function a background job calls must be in `$script:WorkerFunctions`.**
    A missing one only fails when the button is pressed. Guard.
-7. **Plain ASCII in every file. No GUID literals. No tenant data** - no real names,
+7. **Plain ASCII in every file. No GUID literals** - except the built-in public client
+   id, on the one line marked `# public-client-id`. Guard. **No tenant data** - no real names,
    ids, emails, server names. Use Contoso and the demo for examples.
    `tests/forbidden-words.local.txt` holds the user's private words; it is never
    committed and the tests check every file against it.
@@ -74,10 +81,12 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
     New controls need `Name="..."` and are reached as `$script:UI.Name`. Styling can
     fail at run time without the tests noticing; that is why the modern style
     dictionary loads inside a try, with the classic one as fallback.
-11. **Never log, record or store a password.** Not in the log, the change record,
-    a backup, the settings or history. Tests check this.
-12. **Unofficial endpoints** (Power BI v2) stay isolated in their own function,
-    are optional, and degrade to empty columns - never to an error.
+11. **Never log, record or store a password or a token.** Not in the log, the change
+    record, a backup, the settings or history. Tokens and the refresh token live in
+    `$script:Auth`, in memory only. Tests check this.
+12. **Unofficial endpoints** (Power BI v2) and **web pages** (`Get-GLGatewayReleases`)
+    stay isolated in their own function, are optional, and degrade to empty columns -
+    never to an error. Never send a token to a web page.
 13. **Every change to a tenant** starts with `Get-GLRunAudit` (no record, no change)
     and records each item with `Write-GLChange` as it happens.
 14. **Bulk runs act on every listed row**, never on the selection, one item at a
@@ -87,6 +96,23 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
     route in `Invoke-GLDemoHttp` and a demo test.
 16. **WPF events bubble.** `SelectionChanged` on the tab control also fires for every
     list inside it - check `$e.OriginalSource`.
+17. **Tests must never open a real browser or reach Entra ID.** The sign-in tests
+    replace `Open-GLBrowser` and `Invoke-GLTokenEndpoint`. Do not stub a scriptblock
+    parameter through `$PSDefaultParameterValues`: it runs a scriptblock value to get
+    the default instead of passing it, the binding fails, and the real one runs.
+18. **A VNet gateway is never asked for its status unless the user unticks Skip VNet
+    status**: a status check starts a sleeping one, and it then uses capacity.
+    `Get-GLGatewayData` leaves VNet clusters alone unless given `-CheckVnet`.
+19. **Names ignore case, so a variable can be something else.** `$i` is `$I`, `$failed`
+    in the tests is the suite's `$script:Failed`, `$PId` is the read-only `$PID`.
+    Guards: no parameter spelled again with other capitals, none named like an
+    automatic variable. Give job parameters whole names (`$Items`, not `$I`).
+20. **An empty list that comes out of an `if` becomes `$null`.** `$x = if (...) { @() }`
+    leaves `$x` empty-handed - "nobody has access" turned into "could not be read".
+    Assign inside the branch, or wrap the result again with `@()`.
+21. **Move access removes the old role only where the new principal has it** - never
+    leave a connection without its owner. Match principals by id, UPN or email,
+    never by display name.
 
 ## Versions and changes
 
