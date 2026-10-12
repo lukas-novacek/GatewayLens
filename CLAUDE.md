@@ -40,11 +40,14 @@ safety come before features.
 pwsh -NoProfile -File tests/Run-Tests.ps1                # must pass before every commit
 pwsh -NoProfile -File GatewayLens.ps1 -Demo -SelfTest    # end to end on fictional data, any OS
 pwsh -NoProfile -File GatewayLens.ps1 -Demo              # the window on fictional data (Windows)
+pwsh -NoProfile -File GatewayLens.ps1 -Demo -SmokeTest   # drives the real window and the start page (Windows)
+pwsh -NoProfile -File GatewayLens.ps1 -Screenshots assets   # the README pictures, from the demo
 pwsh -NoProfile -File build/Build-Exe.ps1                # needs the .NET SDK
 ```
 
-The window cannot be tested automatically. After a change to it, say so and ask the
-user to check it with `-Demo`.
+The smoke test drives the real window but cannot judge how it looks. After a change
+to the window, look at the pictures `-Screenshots` makes, say what you could not
+check, and ask the user to try it with `-Demo`.
 
 ## Rules
 
@@ -63,7 +66,9 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
 4. **Uncaught output becomes a function's return value.** Discard what you do not
    mean to return: `$null = Add-Something ...`.
 5. **Rows of an array written one per line inside `@( )` are flattened** into loose
-   values. Start each row with a comma: `,@('a', 'b')`.
+   values. Start each row with a comma: `,@('a', 'b')`. On one line it is the other
+   way round: `@(@('a', 1), @('b', 2))` - a leading comma there, `@(, @(..), @(..))`,
+   wraps the first row once more, and a menu lost its first item. Guard.
 6. **Every function a background job calls must be in `$script:WorkerFunctions`.**
    A missing one only fails when the button is pressed. Guard.
 7. **Plain ASCII in every file. No GUID literals** - except the built-in public client
@@ -125,6 +130,15 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
     a redraw on every keystroke.
 24. **A button that changes something or reloads a list goes into `Update-GLActions`**,
     which switches it off while a change or a load runs.
+25. **An empty collection is false.** `if ($list)` skips an empty list, an empty
+    ObservableCollection, an empty grid's Items - the log panel stayed blank because
+    its first line was never added. Test for `$null -ne $x`, or `.Count`.
+26. **The start page runs on a thread of its own**, so the sign-in on the main thread
+    does not freeze it. They share one synchronized hashtable. A function the page
+    calls goes into `$script:StartPageFunctions` - guard.
+27. **An object id Graph does not know is a deleted account** - the portal hides it.
+    `Get-GLPrincipalNames` marks it `Missing`; show it as not in Entra ID, never as
+    a name, and never guess who it was.
 
 ## Versions and changes
 

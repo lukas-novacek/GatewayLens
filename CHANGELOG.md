@@ -4,6 +4,51 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-10-12
+
+From the second run on a real tenant.
+
+### Added
+- **A start page.** GatewayLens opens on a small page: sign in when you are ready -
+  with the account from last time, or another one - or try the demo first. A failed
+  sign-in is shown on the page, to try again, and the page stays alive while the
+  browser sign-in runs. `-Demo`, `-Kiosk`, `-SelfTest`, `-Inspect` and `-DeviceCode`
+  go straight in, as before.
+- **Help in the window**: the **?** button in the top bar - how to use GatewayLens,
+  what each action needs, what is new, report a problem (a GitHub issue with the
+  version filled in, nothing from the tenant), the project on GitHub, and About. F1
+  opens the guide. After an update, *What is new* shows once.
+- **Access left behind by deleted accounts.** An object id that Microsoft Entra ID
+  no longer knows is marked *Not in Microsoft Entra ID* in the access lists, the
+  Users column and the log. The portal leaves such principals out of its lists, so
+  they are easy to miss - and they still hold their roles. *Show > Access by
+  accounts not in Entra ID* lists every connection one of them can still use, and
+  the self-test counts them.
+- **Panels you can resize**: drag the grips between the list, the access panel and
+  the actions, and above the log. The sizes are kept for next time.
+- `-Screenshots <folder>`: pictures of the demo, for the README.
+
+### Changed
+- **The activity log is in colour** - green for what went well, amber for warnings,
+  red for failures, the time in grey - and follows the text size. Ctrl+C copies the
+  selected lines; right-click copies everything shown.
+- **Names in the Users column and the User filter.** On a real tenant the unofficial
+  directory gives only object ids; they are now named through Microsoft Graph while
+  the connections load. The User filter finds people by display name, email or id.
+- **Kiosk view** moved to the top bar, with its own look and an icon.
+
+### Fixed
+- **A remembered entry could not be picked again** in a search box after its text
+  was deleted: the entry stayed selected, and WPF ignores a click that does not
+  change the selection. Opening the list now lets go of it.
+- **The Account column emptied after Update credentials.** The column shows the
+  readable copy of the username that the portal saves next to the encrypted
+  credentials, and Microsoft's credentials API stores only the encrypted one. The
+  list now shows the new account straight away, and the log says that it can be
+  empty after the next refresh. The connections use the new account either way.
+- The first item of the gateway tiles' right-click menu did nothing: a list of menu
+  rows written on one line wrapped its first row once more. A guard test catches it.
+
 ## [0.7.0] - 2026-10-12
 
 From the first run on a real tenant with thousands of connections.

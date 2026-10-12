@@ -69,6 +69,12 @@
     theme and tab, closes it, and exits 0 only if nothing went wrong. Your own
     settings are not touched.
 
+.PARAMETER Screenshots
+    For the README: opens the real window on demo data, takes pictures of the
+    gateway wall, the connections, a test run, the kiosk view and more, saves them
+    as screenshot-*.png in this folder (assets, for the README) and closes. Contoso is fictional - nothing real
+    is in them.
+
 .PARAMETER Inspect
     Signs in and lists the fields Microsoft's APIs return for gateways and
     connections - names and dates only, no data. Safe to share.
@@ -110,6 +116,7 @@ param(
     [switch]$Demo,
     [switch]$Kiosk,
     [switch]$SmokeTest,
+    [string]$Screenshots,
     [switch]$Launched,
     [switch]$LoadOnly
 )
@@ -130,7 +137,21 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.7.0'
+$script:AppVersion = '0.8.0'
+# What is new, in a few lines for the window - shown once after an update. The full
+# list is CHANGELOG.md. The tests check that it is about the current version.
+$script:WhatsNew = @{
+    Version = '0.8.0'
+    Lines   = @(
+        'A start page: sign in when you are ready, or try the demo first.'
+        'Names everywhere: the Users column and the User filter show people, not object ids.'
+        'Access left behind by deleted accounts - the portal hides it, GatewayLens shows it: Show > Access by accounts not in Entra ID.'
+        'A coloured activity log that follows the text size - green done, amber warnings, red failures.'
+        'Panels you can resize by dragging, remembered for next time.'
+        'Kiosk view and help moved to the top bar. Press F1 for help.'
+        'Picking a remembered entry from a search box works again after its text was deleted.'
+    )
+}
 
 $script:GatewayRoles    = @('Admin', 'ConnectionCreator', 'ConnectionCreatorWithResharing')
 $script:ConnectionRoles = @('Owner', 'User', 'UserWithReshare')
@@ -801,7 +822,7 @@ function ConvertTo-GLTestOutcome {
         $status = 'Unverified'
         $detail = 'Skip test connection is on - the gateway may answer OK without trying the data source'
     }
-    $level = @{ OK = 'Info'; Failed = 'Error'; Timeout = 'Warn'; Unverified = 'Warn' }[$status]
+    $level = @{ OK = 'Ok'; Failed = 'Error'; Timeout = 'Warn'; Unverified = 'Warn' }[$status]
     if (-not $level) { $level = 'Warn' }
     $said = switch ($status) {
         'OK'         { 'OK' }
@@ -1027,6 +1048,8 @@ function ConvertTo-GLConnectionRows {
             Id           = [string]$c.id
             GatewayId    = $gid
             UserList     = @()
+            People       = @()
+            UnknownUsers = 0
         })
     }
     return , $rows.ToArray()
@@ -1050,9 +1073,11 @@ function Get-GLPrincipalNames {
         Names for object ids, from Microsoft Graph - Fabric's role assignments carry
         only each principal's id and type. One call answers up to 1,000 ids.
         Returns a hashtable keyed by lower-case id: Name, and Email (the UPN or mail,
-        or an app id). Ids in -Known are not asked again. An id Graph does not know -
-        an account that is deleted - is left out, and callers show the id instead.
-        Throws if Graph refuses: callers carry on without names.
+        or an app id). Ids in -Known are not asked again. An id Graph answered for
+        but does not know - an account that has been deleted - comes back with
+        Missing set: the portal leaves such a principal out of its lists, so it is
+        easy to miss that it still has access. Throws if Graph refuses: callers carry
+        on without names.
     #>
     param([string[]]$Ids, [string]$GraphToken, [hashtable]$Known = @{})
     $out  = @{}
@@ -1067,7 +1092,10 @@ function Get-GLPrincipalNames {
             if (-not $o -or -not $o.id) { continue }
             $mail = @($o.userPrincipalName, $o.mail) | Where-Object { $_ } | Select-Object -First 1
             if (-not $mail -and $o.appId) { $mail = "app $($o.appId)" }
-            $out[([string]$o.id).ToLowerInvariant()] = [pscustomobject]@{ Name = [string]$o.displayName; Email = [string]$mail }
+            $out[([string]$o.id).ToLowerInvariant()] = [pscustomobject]@{ Name = [string]$o.displayName; Email = [string]$mail; Missing = $false }
+        }
+        foreach ($id in $chunk) {
+            if (-not $out.ContainsKey($id)) { $out[$id] = [pscustomobject]@{ Name = ''; Email = ''; Missing = $true } }
         }
     }
     return $out
@@ -1102,14 +1130,51 @@ function Get-GLPrincipalLabel {
     param($Principal, [hashtable]$Names)
     $id = ([string]$Principal.id).ToLowerInvariant()
     $n  = if ($Names -and $id -and $Names.ContainsKey($id)) { $Names[$id] } else { $null }
+    $missing = [bool]($n -and $n.Missing)
     $app = if ($Principal.servicePrincipalDetails.aadAppId) { "app $($Principal.servicePrincipalDetails.aadAppId)" } else { '' }
     $name  = @($n.Name, $Principal.displayName) | Where-Object { $_ } | Select-Object -First 1
     $email = @($n.Email, $Principal.userDetails.userPrincipalName, $Principal.groupDetails.email, $app) | Where-Object { $_ } | Select-Object -First 1
     return [pscustomobject]@{
-        Name  = $(if ($name) { [string]$name } else { [string]$Principal.id })
-        Email = [string]$email
-        Key   = $(if ($email) { [string]$email } elseif ($name) { [string]$name } else { [string]$Principal.id })
+        Name    = $(if ($name) { [string]$name } elseif ($missing) { 'Not in Microsoft Entra ID' } else { [string]$Principal.id })
+        Email   = [string]$email
+        Key     = $(if ($email) { [string]$email } elseif ($name) { [string]$name } else { [string]$Principal.id })
+        Missing = $missing
     }
+}
+
+function ConvertTo-GLPeopleLabels {
+    <#
+        The users of one connection from the unofficial directory, as labels. The
+        directory gives an email on some tenants and only the object id on others -
+        an id is named through -Names, like a Fabric role assignment.
+    #>
+    param($Users, [hashtable]$Names)
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($u in @($Users | Where-Object { $_ })) {
+        $who = [string]$u.Principal
+        if (-not $who) { continue }
+        if (Test-GLGuid $who) { $out.Add((Get-GLPrincipalLabel -Principal ([pscustomobject]@{ id = $who }) -Names $Names)) }
+        else { $out.Add([pscustomobject]@{ Name = $who; Email = $who; Key = $who; Missing = $false }) }
+    }
+    return , $out.ToArray()
+}
+
+function Set-GLRowPeople {
+    <#
+        Who has access to one connection, in every form the list needs: UserList (one
+        key each - the email, else the name, else the id) for the handover, UserNames
+        to read, People for the User filter to search names, emails and ids alike, and
+        UnknownUsers - how many are not in Microsoft Entra ID.
+    #>
+    param($Row, $Labels)
+    $l = @($Labels | Where-Object { $_ })
+    $Row.UserList = @($l | ForEach-Object { [string]$_.Key } | Where-Object { $_ })
+    $Row.Users    = [string]$l.Count
+    $shown = @($l | ForEach-Object { if ($_.Missing -and -not $_.Email) { "$($_.Key) (not in Entra ID)" } elseif ($_.Email) { $_.Email } else { $_.Name } })
+    # rows made elsewhere - in the tests, by older code - may not have these yet
+    $Row | Add-Member -NotePropertyName UserNames -NotePropertyValue ($shown -join '; ') -Force
+    $Row | Add-Member -NotePropertyName People -NotePropertyValue $l -Force
+    $Row | Add-Member -NotePropertyName UnknownUsers -NotePropertyValue @($l | Where-Object { $_.Missing }).Count -Force
 }
 
 function Format-GLAccessList {
@@ -1117,7 +1182,10 @@ function Format-GLAccessList {
     param($Rows)
     $all = @($Rows | Where-Object { $_ })
     if ($all.Count -eq 0) { return 'nobody' }
-    return (@($all | ForEach-Object { "$(if ($_.Detail) { $_.Detail } else { $_.Principal }) ($($_.Role))" }) -join ', ')
+    return (@($all | ForEach-Object {
+        $who = if ($_.NotInEntra) { "$($_.PrincipalId) - not in Entra ID" } elseif ($_.Detail) { $_.Detail } else { $_.Principal }
+        "$who ($($_.Role))"
+    }) -join ', ')
 }
 
 function ConvertTo-GLRoleRows {
@@ -1126,13 +1194,15 @@ function ConvertTo-GLRoleRows {
     foreach ($a in $Assignments) {
         $p = $a.principal
         $label = Get-GLPrincipalLabel -Principal $p -Names $Names
+        $gone  = $label.Missing -and -not $label.Email
         $rows.Add([pscustomobject]@{
             Principal   = $label.Name
-            Detail      = $label.Email
+            Detail      = $(if ($gone) { 'Deleted? Entra ID does not know this id - the portal leaves it out' } else { $label.Email })
             Type        = [string]$p.type
             Role        = [string]$a.role
             Id          = [string]$a.id
             PrincipalId = [string]$p.id
+            NotInEntra  = [bool]$gone
         })
     }
     return , $rows.ToArray()
@@ -1154,6 +1224,9 @@ function Select-GLConnections {
                                                        another - listed side by side
                           'Failing tests'              failed or did not answer in Verify status
                           'Skip test connection on'    a test of these may say OK without trying
+                          'Access by accounts not in Entra ID'
+                                                       someone with access is not in the directory
+                                                       any more - deleted, and hidden by the portal
     #>
     param($Rows, [string]$Text, [string]$Gateway, [string]$Connectivity, [string]$Type,
           [string]$User, [string]$Account, [string[]]$States, $Excluded,
@@ -1189,7 +1262,8 @@ function Select-GLConnections {
         if ($a -and ([string]$r.Account).IndexOf($a, $ic) -lt 0) { continue }
         if ($u) {
             $hit = $false
-            foreach ($x in $r.UserList) { if (([string]$x).IndexOf($u, $ic) -ge 0) { $hit = $true; break } }
+            $people = if ($r.PSObject.Properties['People'] -and @($r.People).Count) { @($r.People | ForEach-Object { $_.Name; $_.Email; $_.Key }) } else { @($r.UserList) }
+            foreach ($x in $people) { if (([string]$x).IndexOf($u, $ic) -ge 0) { $hit = $true; break } }
             if (-not $hit) { continue }
         }
         if ($days -and -not ($null -ne $r.UnusedDays -and $r.UnusedDays -gt $days)) { continue }
@@ -1197,6 +1271,7 @@ function Select-GLConnections {
         if ($seen -and $seen[(& $dupKey $r)] -lt 2) { continue }
         if ($Show -eq 'Failing tests' -and $r.Status -notin 'Failed', 'Timeout') { continue }
         if ($Show -eq 'Skip test connection on' -and -not $r.SkipTest) { continue }
+        if ($Show -eq 'Access by accounts not in Entra ID' -and -not ($r.PSObject.Properties['UnknownUsers'] -and $r.UnknownUsers -gt 0)) { continue }
         $r
     }
     if ($seen) { $out = @($out | Sort-Object { & $dupKey $_ }, Name) }
@@ -1215,17 +1290,22 @@ function Set-GLRowGatewayState {
 }
 
 function Add-GLDirectoryInfo {
-    # Account and users from the unofficial bulk directory.
-    param($Rows, [hashtable]$Directory)
+    # Account and users from the unofficial bulk directory, the users named through -Names.
+    param($Rows, [hashtable]$Directory, [hashtable]$Names)
     if (-not $Directory) { return }
     foreach ($r in $Rows) {
         $d = $Directory[([string]$r.Id).ToLowerInvariant()]
         if (-not $d) { continue }
-        $r.Account   = [string]$d.Account
-        $r.UserList  = @($d.Users | ForEach-Object { [string]$_.Principal } | Where-Object { $_ })
-        $r.Users     = [string]$r.UserList.Count
-        $r | Add-Member -NotePropertyName UserNames -NotePropertyValue ($r.UserList -join '; ') -Force    # rows made elsewhere may not have it
+        $r.Account = [string]$d.Account
+        Set-GLRowPeople -Row $r -Labels (ConvertTo-GLPeopleLabels -Users $d.Users -Names $Names)
     }
+}
+
+function Get-GLDirectoryPrincipalIds {
+    # Every object id among the directory's users - to be named in one go.
+    param([hashtable]$Directory)
+    if (-not $Directory) { return , @() }
+    return , @($Directory.Values | ForEach-Object { $_.Users } | ForEach-Object { [string]$_.Principal } | Where-Object { Test-GLGuid $_ } | Sort-Object -Unique)
 }
 
 function Set-GLRowUsers {
@@ -1236,9 +1316,7 @@ function Set-GLRowUsers {
         if (-not $Assignments.ContainsKey([string]$r.Id)) { continue }
         $list = $Assignments[[string]$r.Id]
         if ($null -eq $list) { $r.Users = 'error'; continue }
-        $r.UserList  = @($list | ForEach-Object { (Get-GLPrincipalLabel -Principal $_.principal -Names $Names).Key } | Where-Object { $_ })
-        $r.Users     = [string]$r.UserList.Count
-        $r | Add-Member -NotePropertyName UserNames -NotePropertyValue ($r.UserList -join '; ') -Force    # rows made elsewhere may not have it
+        Set-GLRowPeople -Row $r -Labels @($list | ForEach-Object { Get-GLPrincipalLabel -Principal $_.principal -Names $Names })
     }
 }
 
@@ -2183,7 +2261,9 @@ function Get-GLRowHeight {
 }
 
 function New-GLDefaultSettings {
-    return [ordered]@{ Theme = 'Light'; FontSize = 12; History = [ordered]@{} }
+    # Layout: the panel sizes the user dragged to. SeenVersion: the last version whose
+    # news was shown. LastAccount: who signed in last, offered on the start page.
+    return [ordered]@{ Theme = 'Light'; FontSize = 12; History = [ordered]@{}; Layout = [ordered]@{}; SeenVersion = ''; LastAccount = '' }
 }
 
 function Read-GLSettings {
@@ -2195,6 +2275,16 @@ function Read-GLSettings {
         $j = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if ($j.Theme)    { $s.Theme = [string]$j.Theme }
         if ($j.FontSize) { $s.FontSize = [Math]::Max(9, [Math]::Min(20, [int]$j.FontSize)) }
+        if ($j.SeenVersion) { $s.SeenVersion = [string]$j.SeenVersion }
+        if ($j.LastAccount -and [string]$j.LastAccount -match '^[^\s@]+@[^\s@]+$') { $s.LastAccount = [string]$j.LastAccount }
+        if ($j.Layout) {
+            foreach ($p in $j.Layout.PSObject.Properties) {
+                # a size that makes no sense - a damaged file - is left out, never applied
+                $v = 0.0
+                try { $v = [double]$p.Value } catch { continue }
+                if ($p.Name -match '^[A-Za-z]+$' -and $v -ge 0 -and $v -le 4000) { $s.Layout[$p.Name] = [int]$v }
+            }
+        }
         if ($j.History) {
             foreach ($p in $j.History.PSObject.Properties) {
                 if ($p.Name -match 'pass|pwd|secret') { continue }
@@ -2203,6 +2293,35 @@ function Read-GLSettings {
         }
     } catch { }
     return $s
+}
+
+function Get-GLLayout {
+    # The panel sizes now - from before the kiosk view, if it is showing.
+    $k = $script:KioskSaved
+    $log = if ($k) { $k.Log } else { $script:UI.LogRow.Height }
+    $det = if ($k) { $k.Detail } else { $script:UI.GwDetailRow.Height }
+    $out = [ordered]@{}
+    foreach ($pair in @(@('LogHeight', $log), @('GatewayDetailHeight', $det), @('ConnectionsBottomHeight', $script:UI.CnBottomRow.Height), @('ActionsWidth', $script:UI.CnActionsCol.Width))) {
+        $g = $pair[1]
+        if ($g -and $g.IsAbsolute) { $out[$pair[0]] = [int]$g.Value }
+    }
+    return $out
+}
+
+function Set-GLLayout {
+    # The sizes from the settings, each one only if it fits the window.
+    param($Layout)
+    if (-not $Layout) { return }
+    $map = @{ LogHeight = 'LogRow'; GatewayDetailHeight = 'GwDetailRow'; ConnectionsBottomHeight = 'CnBottomRow'; ActionsWidth = 'CnActionsCol' }
+    foreach ($k in $map.Keys) {
+        if (-not $Layout.Contains($k)) { continue }
+        $v = [double]$Layout[$k]
+        if ($v -lt 0 -or $v -gt 1600) { continue }
+        $part = $script:UI[$map[$k]]
+        if (-not $part) { continue }
+        $len = [System.Windows.GridLength]::new($v)
+        if ($k -eq 'ActionsWidth') { if ($v -ge 380) { $part.Width = $len } } else { $part.Height = $len }
+    }
 }
 
 function Save-GLSettings {
@@ -2246,7 +2365,7 @@ $script:Themes = [ordered]@{
         Border = '#E2E8F0'; BorderStrong = '#CBD5E1'; Ink = '#0F172A'; InkMuted = '#64748B'; InkFaint = '#94A3B8'
         Accent = '#2563EB'; AccentHover = '#1D4ED8'; AccentInk = '#FFFFFF'; AccentSoft = '#DBEAFE'
         Danger = '#DC2626'; DangerSoft = '#FEE2E2'; Hover = '#F1F5F9'; Selection = '#DBEAFE'; SelectionInk = '#0F172A'
-        InputBg = '#FFFFFF'; LogBg = '#FFFFFF'; LogInk = '#334155'; Shadow = '#1A0F172A'; Warn = '#B45309'
+        InputBg = '#FFFFFF'; LogBg = '#FFFFFF'; LogInk = '#334155'; Shadow = '#1A0F172A'; Warn = '#B45309'; Good = '#15803D'
         TileOk = '#15803D'; TileWarn = '#B45309'; TileDown = '#B91C1C'; TileIdle = '#64748B'; TileVnet = '#1D4ED8'; TileInk = '#FFFFFF'; TileBadge = '#40000000'
     }
     Dark = [ordered]@{
@@ -2254,7 +2373,7 @@ $script:Themes = [ordered]@{
         Border = '#2A313C'; BorderStrong = '#3A4250'; Ink = '#E6EDF3'; InkMuted = '#9AA4B2'; InkFaint = '#6E7681'
         Accent = '#3B82F6'; AccentHover = '#60A5FA'; AccentInk = '#FFFFFF'; AccentSoft = '#1E3A5F'
         Danger = '#F87171'; DangerSoft = '#3B1D1D'; Hover = '#222A35'; Selection = '#1E3A5F'; SelectionInk = '#E6EDF3'
-        InputBg = '#0D1117'; LogBg = '#0D1117'; LogInk = '#C9D1D9'; Shadow = '#66000000'; Warn = '#FBBF24'
+        InputBg = '#0D1117'; LogBg = '#0D1117'; LogInk = '#C9D1D9'; Shadow = '#66000000'; Warn = '#FBBF24'; Good = '#4ADE80'
         TileOk = '#166534'; TileWarn = '#92400E'; TileDown = '#991B1B'; TileIdle = '#334155'; TileVnet = '#1E40AF'; TileInk = '#F8FAFC'; TileBadge = '#40000000'
     }
     Midnight = [ordered]@{
@@ -2262,7 +2381,7 @@ $script:Themes = [ordered]@{
         Border = '#22305C'; BorderStrong = '#2E3F75'; Ink = '#E2E8FF'; InkMuted = '#94A3D4'; InkFaint = '#6B78A8'
         Accent = '#8B5CF6'; AccentHover = '#A78BFA'; AccentInk = '#FFFFFF'; AccentSoft = '#2E2560'
         Danger = '#FB7185'; DangerSoft = '#3D1B2E'; Hover = '#1A2650'; Selection = '#2E2560'; SelectionInk = '#E2E8FF'
-        InputBg = '#0B1328'; LogBg = '#0B1328'; LogInk = '#C7D2FE'; Shadow = '#66000000'; Warn = '#FBBF24'
+        InputBg = '#0B1328'; LogBg = '#0B1328'; LogInk = '#C7D2FE'; Shadow = '#66000000'; Warn = '#FBBF24'; Good = '#34D399'
         TileOk = '#047857'; TileWarn = '#B45309'; TileDown = '#BE123C'; TileIdle = '#2E3F75'; TileVnet = '#6D28D9'; TileInk = '#FFFFFF'; TileBadge = '#40000000'
     }
     Contrast = [ordered]@{
@@ -2270,7 +2389,7 @@ $script:Themes = [ordered]@{
         Border = '#FFFFFF'; BorderStrong = '#FFFFFF'; Ink = '#FFFFFF'; InkMuted = '#FFFF00'; InkFaint = '#C0C0C0'
         Accent = '#00FFFF'; AccentHover = '#FFFF00'; AccentInk = '#000000'; AccentSoft = '#003333'
         Danger = '#FF6060'; DangerSoft = '#330000'; Hover = '#1A1A1A'; Selection = '#0000FF'; SelectionInk = '#FFFFFF'
-        InputBg = '#000000'; LogBg = '#000000'; LogInk = '#FFFFFF'; Shadow = '#00000000'; Warn = '#FFFF00'
+        InputBg = '#000000'; LogBg = '#000000'; LogInk = '#FFFFFF'; Shadow = '#00000000'; Warn = '#FFFF00'; Good = '#00FF00'
         TileOk = '#006400'; TileWarn = '#8B6B00'; TileDown = '#B00000'; TileIdle = '#333333'; TileVnet = '#00008B'; TileInk = '#FFFFFF'; TileBadge = '#80000000'
     }
 }
@@ -2482,6 +2601,9 @@ function New-GLDemoStore {
         [pscustomobject]@{ id = New-GLDemoId 'sp|reporting'; displayName = 'Contoso Reporting App'; appId = New-GLDemoId 'app|reporting' }
         [pscustomobject]@{ id = New-GLDemoId 'sp|pipelines'; displayName = 'Fabric Pipelines';      appId = New-GLDemoId 'app|pipelines' }
     )
+    # someone who left: their account is deleted, Graph no longer knows the id,
+    # and the portal leaves them out - but they still have access
+    $s.Deleted = @([pscustomobject]@{ id = New-GLDemoId 'user|tom.wright' })
 
     # ---- gateways: one of every state ----
     $s.Gateways = [System.Collections.Generic.List[object]]::new()
@@ -2610,6 +2732,10 @@ function New-GLDemoStore {
     # Joe Smith is leaving - his access is the demo's handover story
     $null = Add-GLDemoRole $s "connections/$($cn['Sales DW'])" $joe 'User'
     $null = Add-GLDemoRole $s "connections/$($cn['Sales Staging'])" $joe 'User'
+    # Tom Wright left last year - his deleted account still owns two connections
+    $tom = $s.Deleted[0]
+    $null = Add-GLDemoRole $s "connections/$($cn['AP Archive'])" $tom 'Owner'
+    $null = Add-GLDemoRole $s "connections/$($cn['Treasury Oracle'])" $tom 'User'
     return $s
 }
 
@@ -2620,6 +2746,8 @@ function Get-GLDemoPrincipal($Store, [string]$Id) {
     if ($g) { return [pscustomobject]@{ id = $g.id; displayName = $g.displayName; type = 'Group'; groupDetails = [pscustomobject]@{ groupType = 'SecurityGroup'; email = $g.mail } } }
     $p = $Store.Sps | Where-Object id -eq $Id | Select-Object -First 1
     if ($p) { return [pscustomobject]@{ id = $p.id; displayName = $p.displayName; type = 'ServicePrincipal'; servicePrincipalDetails = [pscustomobject]@{ aadAppId = $p.appId } } }
+    $d = @($Store.Deleted) | Where-Object { $_ -and $_.id -eq $Id } | Select-Object -First 1
+    if ($d) { return [pscustomobject]@{ id = $d.id; type = 'User' } }
     return $null
 }
 
@@ -2771,9 +2899,9 @@ function Invoke-GLDemoHttp {
                             id = $c.id; clusterId = $c.gatewayId; datasourceName = $c.displayName; datasourceType = $c.connectionDetails.type
                             credentialDetails = [pscustomobject]@{ credentialType = $c.credentialDetails.credentialType
                                 publicCredentialProperties = $(if ($acc) { (@(@{ name = 'username'; value = $acc }) | ConvertTo-Json -Compress -AsArray) } else { $null }) }
+                            # a real tenant answers with the object id only - no email, no name
                             users = @(foreach ($a in @($s.Roles["connections/$($c.id)"])) {
-                                [pscustomobject]@{ emailAddress = @($a.principal.userDetails.userPrincipalName, $a.principal.groupDetails.email) | Where-Object { $_ } | Select-Object -First 1
-                                                   displayName = $a.principal.displayName; identifier = $a.principal.id
+                                [pscustomobject]@{ identifier = $a.principal.id
                                                    datasourceAccessRight = $(if ($a.role -eq 'Owner') { 'ReadOverrideEffectiveIdentity' } else { 'Read' }) } })
                         }
                     }
@@ -2891,7 +3019,8 @@ $script:WorkerFunctions = @(
     'Set-GLConnectionCredential', 'Invoke-GLBulkMembers',
     'Remove-GLConnection', 'Set-GLMemberEnabled', 'Test-GLConnectionsBulk', 'Get-GLRoleAssignmentsBulk',
     'Get-GLDatasourceDirectory', 'Resolve-GLHostAddress', 'ConvertTo-GLConnectionRows', 'ConvertTo-GLLocalTime',
-    'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'ConvertFrom-GLDownloadPage', 'ConvertFrom-GLReleasePage', 'Get-GLGatewayReleases', 'Split-GLList', 'ConvertTo-GLEncryptionSetting',
+    'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'Get-GLDirectoryPrincipalIds', 'ConvertTo-GLPeopleLabels', 'Set-GLRowPeople',
+    'Get-GLPrincipalLabel', 'Test-GLGuid', 'ConvertFrom-GLDownloadPage', 'ConvertFrom-GLReleasePage', 'Get-GLGatewayReleases', 'Split-GLList', 'ConvertTo-GLEncryptionSetting',
     'New-GLResult', 'Invoke-GLBulkGrant', 'Invoke-GLBulkRevoke', 'Invoke-GLBulkCredentials',
     'Backup-GLConnections', 'Invoke-GLBulkDelete',
     'Get-GLSafeName', 'Get-GLChangePath', 'Write-GLChange', 'Read-GLChanges',
@@ -3475,7 +3604,11 @@ function Invoke-GLSelfTest {
         if ($ids.Count) {
             try {
                 $n = Get-GLPrincipalNames -Ids $ids -GraphToken $gr
-                Add-Result 'Graph: names in access lists' ($n.Count -gt 0) "$($n.Count) of $($ids.Count) id(s) named$(if ($n.Count -eq 0) { ' - access lists will show object ids' })"
+                $named = @($n.Values | Where-Object { -not $_.Missing }).Count
+                $gone  = $ids.Count - $named
+                $tail  = if ($named -eq 0) { ' - access lists will show object ids' }
+                         elseif ($gone) { "; $gone not in Microsoft Entra ID - deleted accounts, which the portal does not show" } else { '' }
+                Add-Result 'Graph: names in access lists' ($named -gt 0) "$named of $($ids.Count) id(s) named$tail"
             } catch { Add-Result 'Graph: names in access lists' $false "$($_.Exception.Message) - access lists will show object ids" }
         }
     }
@@ -3570,15 +3703,22 @@ $script:MainXaml = @'
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
-      <RowDefinition Height="6"/>
-      <RowDefinition Name="LogRow" Height="175"/>
+      <RowDefinition Height="8"/>
+      <RowDefinition Name="LogRow" Height="175" MinHeight="0"/>
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
     <Border Name="HeaderBar" Grid.Row="0" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Border}" BorderThickness="0,0,0,1" Padding="16,10">
       <DockPanel>
         <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-          <TextBlock Name="TxtIdentity" VerticalAlignment="Center" Foreground="{DynamicResource InkMuted}" Margin="0,0,18,0"/>
+          <TextBlock Name="TxtIdentity" VerticalAlignment="Center" Foreground="{DynamicResource InkMuted}" Margin="0,0,14,0"/>
+          <Button Name="BtnKiosk" Style="{DynamicResource KioskButton}" Margin="0,0,14,0"
+                  ToolTip="Kiosk view: full screen, gateway tiles only, nothing that changes anything - for a wall screen. F11 goes in and out, Esc leaves it.">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="&#xE7F4;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="15" VerticalAlignment="Center" Margin="0,1,8,0"/>
+              <TextBlock Text="Kiosk view" VerticalAlignment="Center"/>
+            </StackPanel>
+          </Button>
           <TextBlock Text="Theme" Style="{DynamicResource LabelText}" Margin="0,0,6,0"/>
           <ComboBox Name="CmbTheme" Width="110" MinHeight="28"/>
           <Button Name="BtnFontDown" Content="A-" MinWidth="34" Padding="6,2" Margin="12,0,2,0" ToolTip="Smaller text - also Ctrl + mouse wheel, or Ctrl + minus"/>
@@ -3586,6 +3726,9 @@ $script:MainXaml = @'
           <Button Name="BtnFontUp" Content="A+" MinWidth="34" Padding="6,2" Margin="2,0,0,0" ToolTip="Larger text - also Ctrl + mouse wheel, or Ctrl + plus. Ctrl + 0 goes back to the default."/>
           <Button Name="BtnClearHistory" Content="Clear history" Margin="12,0,0,0"
                   ToolTip="Forget everything typed into the search and name boxes. Passwords are never kept."/>
+          <Button Name="BtnHelp" Margin="8,0,0,0" MinWidth="34" Padding="8,2" ToolTip="Help, what is new, and where to report a problem (F1)">
+            <TextBlock Text="?" FontWeight="Bold" FontSize="14"/>
+          </Button>
         </StackPanel>
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
           <Image Name="ImgLogo" Width="30" Height="30" Margin="0,0,10,0" RenderOptions.BitmapScalingMode="HighQuality"/>
@@ -3604,8 +3747,8 @@ $script:MainXaml = @'
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
-            <RowDefinition Height="6"/>
-            <RowDefinition Name="GwDetailRow" Height="270"/>
+            <RowDefinition Height="8"/>
+            <RowDefinition Name="GwDetailRow" Height="270" MinHeight="0"/>
           </Grid.RowDefinitions>
 
           <WrapPanel Name="GwToolbar" Grid.Row="0" Margin="0,0,0,8">
@@ -3619,9 +3762,7 @@ $script:MainXaml = @'
             <ComboBox Name="CmbAutoRefresh" Width="80" MinHeight="26"/>
             <TextBlock Text="Filter" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="TxtGwFilter" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Width="180" MinHeight="26" VerticalContentAlignment="Center"/>
-            <Button Name="BtnKiosk" Content="Kiosk view" Margin="12,0,6,0"
-                    ToolTip="Full screen, gateways only, nothing that changes anything - for a wall screen. Esc leaves it."/>
-            <Button Name="BtnGwCopyAll" Content="Copy all"
+            <Button Name="BtnGwCopyAll" Content="Copy all" Margin="12,0,6,0"
                     ToolTip="Every gateway and member, tab-separated - pastes straight into Excel or a ticket."/>
             <Button Name="BtnGwIpsAll" Content="Resolve IPs"
                     ToolTip="Resolve every member machine to an IP address. One block per gateway in the log, and all of it on the clipboard."/>
@@ -3707,10 +3848,12 @@ $script:MainXaml = @'
 
           <Grid Name="GwDetail" Grid.Row="4">
             <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="3*"/>
+              <ColumnDefinition Width="3*" MinWidth="280"/>
               <ColumnDefinition Width="12"/>
-              <ColumnDefinition Width="2*"/>
+              <ColumnDefinition Width="2*" MinWidth="260"/>
             </Grid.ColumnDefinitions>
+            <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext"
+                          Background="Transparent" ToolTip="Drag to share the room between members and access"/>
             <DockPanel Grid.Column="0">
               <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -3743,9 +3886,9 @@ $script:MainXaml = @'
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="6"/>
-            <RowDefinition Height="330"/>
+            <RowDefinition Height="*" MinHeight="90"/>
+            <RowDefinition Height="8"/>
+            <RowDefinition Name="CnBottomRow" Height="330" MinHeight="120"/>
           </Grid.RowDefinitions>
 
           <WrapPanel Grid.Row="0" Margin="0,0,0,6">
@@ -3765,7 +3908,7 @@ $script:MainXaml = @'
             <TextBlock Text="Type" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="CmbCnType" Width="130" MinHeight="26"/>
             <TextBlock Text="Show" Style="{DynamicResource LabelText}"/>
-            <ComboBox Name="CmbCnShow" Width="200" MinHeight="26"
+            <ComboBox Name="CmbCnShow" Width="250" MinHeight="26"
                       ToolTip="Cleanup views. Last used and No use recorded come from Microsoft's connection recency (preview): it records use since spring 2026 and can be up to 30 minutes behind. Duplicates: same gateway, type, path and account. Failing tests: after Verify status."/>
           </WrapPanel>
 
@@ -3792,14 +3935,17 @@ $script:MainXaml = @'
           </DockPanel>
 
           <DataGrid IsReadOnly="False" CanUserAddRows="False" CanUserDeleteRows="False" CanUserSortColumns="True" AutoGenerateColumns="True" Name="GridConnections" Grid.Row="2" SelectionMode="Extended"/>
-          <GridSplitter Grid.Row="3" HorizontalAlignment="Stretch" ResizeDirection="Rows" Background="Transparent"/>
+          <GridSplitter Grid.Row="3" HorizontalAlignment="Stretch" ResizeDirection="Rows" Background="Transparent"
+                        ToolTip="Drag to give the list or the panels below more room"/>
 
           <Grid Grid.Row="4">
             <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="*" MinWidth="280"/>
               <ColumnDefinition Width="12"/>
-              <ColumnDefinition Width="520"/>
+              <ColumnDefinition Name="CnActionsCol" Width="520" MinWidth="380"/>
             </Grid.ColumnDefinitions>
+            <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext"
+                          Background="Transparent" ToolTip="Drag to make the actions wider or narrower"/>
 
             <DockPanel Grid.Column="0">
               <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
@@ -3927,9 +4073,53 @@ $script:MainXaml = @'
           </StackPanel>
           <TextBlock Text="Activity log" Style="{DynamicResource SectionText}"/>
         </DockPanel>
-        <TextBox Name="TxtLog" IsReadOnly="True" BorderThickness="0" Background="{DynamicResource LogBg}" Foreground="{DynamicResource LogInk}"
-                 VerticalContentAlignment="Top" Padding="8,2,8,6" FontFamily="Consolas" FontSize="11" TextWrapping="NoWrap"
-                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+        <ListBox Name="LstLog" BorderThickness="0" Background="{DynamicResource LogBg}" Foreground="{DynamicResource LogInk}"
+                 Padding="6,0,6,4" FontFamily="Consolas" SelectionMode="Extended"
+                 VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                 ToolTip="Ctrl+C copies the selected lines. Right-click for more.">
+          <ListBox.ItemContainerStyle>
+            <Style TargetType="ListBoxItem">
+              <Setter Property="Template">
+                <Setter.Value>
+                  <ControlTemplate TargetType="ListBoxItem">
+                    <Border Name="LineBg" Background="Transparent" Padding="2,0">
+                      <ContentPresenter/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsMouseOver" Value="True">
+                        <Setter TargetName="LineBg" Property="Background" Value="{DynamicResource Hover}"/>
+                      </Trigger>
+                      <Trigger Property="IsSelected" Value="True">
+                        <Setter TargetName="LineBg" Property="Background" Value="{DynamicResource Selection}"/>
+                      </Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </Setter.Value>
+              </Setter>
+            </Style>
+          </ListBox.ItemContainerStyle>
+          <ListBox.ItemTemplate>
+            <DataTemplate>
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="{Binding Time, Mode=OneWay}" Foreground="{DynamicResource InkFaint}" Margin="0,0,10,0"/>
+                <TextBlock Name="LineText" Text="{Binding Text, Mode=OneWay}" Foreground="{DynamicResource LogInk}"/>
+              </StackPanel>
+              <DataTemplate.Triggers>
+                <DataTrigger Binding="{Binding Level}" Value="Ok">
+                  <Setter TargetName="LineText" Property="Foreground" Value="{DynamicResource Good}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Level}" Value="Warn">
+                  <Setter TargetName="LineText" Property="Foreground" Value="{DynamicResource Warn}"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Level}" Value="Error">
+                  <Setter TargetName="LineText" Property="Foreground" Value="{DynamicResource Danger}"/>
+                  <Setter TargetName="LineText" Property="FontWeight" Value="SemiBold"/>
+                </DataTrigger>
+              </DataTemplate.Triggers>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
       </DockPanel>
     </Border>
 
@@ -3941,6 +4131,83 @@ $script:MainXaml = @'
       </DockPanel>
     </Border>
   </Grid>
+</Window>
+'@
+
+$script:StartXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="GatewayLens" Width="500" SizeToContent="Height" ResizeMode="CanMinimize"
+        WindowStartupLocation="CenterScreen" Background="{DynamicResource WindowBg}"
+        FontFamily="Segoe UI" FontSize="12" Foreground="{DynamicResource Ink}">
+  <StackPanel Margin="36,30,36,20">
+    <Image Name="StartLogo" Width="72" Height="72" HorizontalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality"/>
+    <TextBlock Text="GatewayLens" FontSize="28" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,12,0,0"/>
+    <TextBlock Text="The missing admin console for Power BI and Fabric data gateways" Foreground="{DynamicResource InkMuted}"
+               HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" Margin="0,4,0,24"/>
+
+    <TextBlock Text="Work account (optional)" Foreground="{DynamicResource InkMuted}" Margin="0,0,0,4"/>
+    <TextBox Name="StartAccount" MinHeight="32" VerticalContentAlignment="Center" Padding="6,0"
+             ToolTip="Leave it empty to choose in the browser, or type the account to sign in with - an admin account, for example."/>
+    <Button Name="StartSignIn" Content="Sign in" Style="{DynamicResource PrimaryButton}" MinHeight="38" FontSize="14" Margin="0,12,0,0" IsDefault="True"/>
+    <TextBlock Name="StartHow" Foreground="{DynamicResource InkFaint}" TextAlignment="Center" TextWrapping="Wrap" Margin="0,8,0,0"/>
+
+    <Border Name="StartBusy" Visibility="Collapsed" Margin="0,14,0,0" Padding="12,10" CornerRadius="8" Background="{DynamicResource AccentSoft}">
+      <StackPanel>
+        <TextBlock Name="StartBusyText" Text="Finish signing in in your browser - this window waits for it." TextWrapping="Wrap"/>
+        <ProgressBar IsIndeterminate="True" Height="4" Margin="0,8,0,0"/>
+      </StackPanel>
+    </Border>
+    <Border Name="StartError" Visibility="Collapsed" Margin="0,14,0,0" Padding="12,10" CornerRadius="8" Background="{DynamicResource DangerSoft}">
+      <TextBlock Name="StartErrorText" TextWrapping="Wrap"/>
+    </Border>
+
+    <Grid Margin="0,22,0,0">
+      <Border Height="1" Background="{DynamicResource Border}" VerticalAlignment="Center"/>
+      <TextBlock Text="  or  " HorizontalAlignment="Center" Background="{DynamicResource WindowBg}" Foreground="{DynamicResource InkFaint}"/>
+    </Grid>
+    <Button Name="StartDemo" Content="Try the demo - a fictional company, no sign-in" MinHeight="32" Margin="0,14,0,0"/>
+
+    <TextBlock Text="Signs in as you - it can do what you can do in the portal, nothing more. Nothing is installed, and nothing is sent anywhere but Microsoft."
+               Foreground="{DynamicResource InkFaint}" TextAlignment="Center" TextWrapping="Wrap" Margin="0,22,0,0"/>
+    <DockPanel Margin="0,14,0,0">
+      <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+        <Button Name="StartHelp" Content="Help" Padding="10,2" MinHeight="24"/>
+        <Button Name="StartGitHub" Content="GitHub" Padding="10,2" MinHeight="24" Margin="0"/>
+      </StackPanel>
+      <TextBlock Name="StartVersion" Foreground="{DynamicResource InkFaint}" VerticalAlignment="Center"/>
+    </DockPanel>
+  </StackPanel>
+</Window>
+'@
+
+$script:InfoXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="GatewayLens" Width="600" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" Background="{DynamicResource WindowBg}"
+        FontFamily="Segoe UI" FontSize="12" Foreground="{DynamicResource Ink}">
+  <StackPanel Margin="22,18,22,16">
+    <DockPanel Margin="0,0,0,14">
+      <Image Name="InfoLogo" Width="44" Height="44" Margin="0,0,14,0" DockPanel.Dock="Left" RenderOptions.BitmapScalingMode="HighQuality"/>
+      <StackPanel VerticalAlignment="Center">
+        <TextBlock Name="InfoTitle" FontSize="19" FontWeight="SemiBold"/>
+        <TextBlock Name="InfoSub" Foreground="{DynamicResource InkMuted}" TextWrapping="Wrap" Margin="0,2,0,0"/>
+      </StackPanel>
+    </DockPanel>
+    <ItemsControl Name="InfoLines">
+      <ItemsControl.ItemTemplate>
+        <DataTemplate>
+          <DockPanel Margin="0,3">
+            <TextBlock Text="-" DockPanel.Dock="Left" Margin="0,0,8,0" FontWeight="Bold" Foreground="{DynamicResource Accent}"/>
+            <TextBlock Text="{Binding}" TextWrapping="Wrap"/>
+          </DockPanel>
+        </DataTemplate>
+      </ItemsControl.ItemTemplate>
+    </ItemsControl>
+    <WrapPanel Name="InfoLinks" Margin="0,16,0,0"/>
+    <Button Name="InfoClose" Content="Close" HorizontalAlignment="Right" Style="{DynamicResource PrimaryButton}" Margin="0,8,0,0" MinWidth="90" IsDefault="True" IsCancel="True"/>
+  </StackPanel>
 </Window>
 '@
 
@@ -4062,6 +4329,38 @@ $script:ModernStylesXaml = @'
     <Setter Property="BorderBrush" Value="{DynamicResource Danger}"/>
     <Setter Property="Foreground" Value="{DynamicResource AccentInk}"/>
     <Setter Property="FontWeight" Value="SemiBold"/>
+  </Style>
+
+  <Style x:Key="KioskButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+    <Setter Property="Foreground" Value="{DynamicResource Accent}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource Accent}"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+  </Style>
+
+  <!-- ===== splitters: a small grip in the middle shows there is something to drag ===== -->
+  <Style TargetType="GridSplitter">
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="GridSplitter">
+          <Border Background="Transparent">
+            <Border Name="Grip" Background="{DynamicResource BorderStrong}" CornerRadius="2" Width="48" Height="4"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="ResizeDirection" Value="Columns">
+              <Setter TargetName="Grip" Property="Width" Value="4"/>
+              <Setter TargetName="Grip" Property="Height" Value="48"/>
+            </Trigger>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter TargetName="Grip" Property="Background" Value="{DynamicResource Accent}"/>
+            </Trigger>
+            <Trigger Property="IsDragging" Value="True">
+              <Setter TargetName="Grip" Property="Background" Value="{DynamicResource Accent}"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
   </Style>
 
   <!-- ===== text ===== -->
@@ -4556,6 +4855,12 @@ $script:ClassicStylesXaml = @'
     <Setter Property="Background" Value="{DynamicResource Danger}"/>
     <Setter Property="Foreground" Value="{DynamicResource AccentInk}"/>
   </Style>
+  <Style x:Key="KioskButton" TargetType="Button">
+    <Setter Property="Foreground" Value="{DynamicResource Accent}"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Padding" Value="12,3"/>
+    <Setter Property="Margin" Value="0,0,6,0"/>
+  </Style>
   <Style TargetType="Button">
     <Setter Property="Padding" Value="12,3"/>
     <Setter Property="Margin" Value="0,0,6,0"/>
@@ -4611,7 +4916,7 @@ $script:LogEntries = [System.Collections.Generic.List[object]]::new()
 
 function Test-GLLogVisible($Entry) {
     $lvl = [string]$script:UI.CmbLogLevel.SelectedItem
-    if ($lvl -eq 'Warnings and errors' -and $Entry.Level -eq 'Info') { return $false }
+    if ($lvl -eq 'Warnings and errors' -and $Entry.Level -in 'Info', 'Ok') { return $false }
     if ($lvl -eq 'Errors only' -and $Entry.Level -ne 'Error') { return $false }
     $f = [string]$script:UI.TxtLogFind.Text
     if ($f.Trim() -and $Entry.Line.IndexOf($f.Trim(), [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
@@ -4619,29 +4924,80 @@ function Test-GLLogVisible($Entry) {
 }
 
 function Update-GLLogView {
-    $shown = @($script:LogEntries | Where-Object { Test-GLLogVisible $_ } | ForEach-Object Line)
-    $script:UI.TxtLog.Text = if ($shown.Count) { ($shown -join [Environment]::NewLine) + [Environment]::NewLine } else { '' }
-    $script:UI.TxtLog.ScrollToEnd()
+    # The panel shows the lines the level and the Find box let through. One new
+    # collection, not thousands of adds - each add would redraw the list.
+    if (-not $script:UI.LstLog) { return }
+    $shown = [System.Collections.Generic.List[object]]::new()
+    foreach ($e in $script:LogEntries) { if (Test-GLLogVisible $e) { $shown.Add($e) } }
+    $script:LogView = [System.Collections.ObjectModel.ObservableCollection[object]]::new($shown)
+    try { $script:UI.LstLog.ItemsSource = $script:LogView } catch { }
+    Step-GLLogScroll
+}
+
+function Get-GLLogScroller {
+    # The list's own scroll viewer, found once the list is drawn.
+    if ($script:LogScroller) { return $script:LogScroller }
+    try {
+        $d = $script:UI.LstLog
+        if (-not ($d -is [System.Windows.DependencyObject])) { return $null }
+        while ($d -and -not ($d -is [System.Windows.Controls.ScrollViewer])) {
+            if ([System.Windows.Media.VisualTreeHelper]::GetChildrenCount($d) -eq 0) { return $null }
+            $d = [System.Windows.Media.VisualTreeHelper]::GetChild($d, 0)
+        }
+        $script:LogScroller = $d
+        return $d
+    } catch { return $null }     # no WPF here - the tests, or Linux
+}
+
+function Test-GLLogAtEnd {
+    # Is the newest line in view? Scrolled up to read, the view stays where it is.
+    $sv = Get-GLLogScroller
+    if (-not $sv) { return $true }
+    return ($sv.VerticalOffset -ge $sv.ScrollableHeight - 1)
+}
+
+function Step-GLLogScroll {
+    $sv = Get-GLLogScroller
+    if ($sv) { $sv.ScrollToEnd() }
+}
+
+function Get-GLLogText {
+    # The lines shown in the panel - or only the selected ones - as text.
+    param([switch]$Selected)
+    $src = if ($Selected -and $script:UI.LstLog) { @($script:UI.LstLog.SelectedItems) } else { @($script:LogView) }
+    if ($Selected) {
+        # in the order shown, not the order they were clicked
+        $pick = [System.Collections.Generic.HashSet[object]]::new()
+        foreach ($x in $src) { [void]$pick.Add($x) }
+        $src = @($script:LogView | Where-Object { $pick.Contains($_) })
+    }
+    $lines = @($src | Where-Object { $_ } | ForEach-Object { [string]$_.Line })
+    if ($lines.Count -eq 0) { return '' }
+    return (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
 function Write-GLLog {
     # The panel, and - once signed in - the daily log file. -FileOnly keeps detail
     # (every item of a bulk run) in the file without flooding the panel.
-    param([string]$Text, [ValidateSet('Info', 'Warn', 'Error')][string]$Level = 'Info', [switch]$FileOnly)
+    # Ok is Info that went well: green in the panel.
+    param([string]$Text, [ValidateSet('Info', 'Ok', 'Warn', 'Error')][string]$Level = 'Info', [switch]$FileOnly)
     if ($script:LogReady) {
         $path = Get-GLLogPath -Folder $script:LogFolder -User $script:SignedInAs
-        $null = Write-GLLogFile -Path $path -Level (@{ Info = 'INFO'; Warn = 'WARN'; Error = 'ERROR' }[$Level]) -Text $Text
+        $null = Write-GLLogFile -Path $path -Level (@{ Info = 'INFO'; Ok = 'OK'; Warn = 'WARN'; Error = 'ERROR' }[$Level]) -Text $Text
     }
     if ($FileOnly) { return }
-    $tag  = @{ Info = ''; Warn = 'WARN   '; Error = 'ERROR  ' }[$Level]
-    $line = '{0:HH:mm:ss}  {1}{2}' -f (Get-Date), $tag, $Text
-    if ($script:UI.TxtLog) {
-        $entry = [pscustomobject]@{ Level = $Level; Line = $line }
+    $tag  = @{ Info = ''; Ok = ''; Warn = 'WARN   '; Error = 'ERROR  ' }[$Level]
+    $now  = Get-Date
+    $line = '{0:HH:mm:ss}  {1}{2}' -f $now, $tag, $Text
+    if ($script:UI.LstLog) {
+        $entry = [pscustomobject]@{ Level = $Level; Line = $line; Time = $now.ToString('HH:mm:ss'); Text = "$tag$Text" }
         $script:LogEntries.Add($entry)
         if ($script:LogEntries.Count -gt 5000) { $script:LogEntries.RemoveRange(0, 1000); Update-GLLogView; return }
-        if (Test-GLLogVisible $entry) {
-            $script:UI.TxtLog.AppendText($line + [Environment]::NewLine)
-            $script:UI.TxtLog.ScrollToEnd()
+        # not "if ($script:LogView": an empty collection counts as false, and the first line would never show
+        if ($null -ne $script:LogView -and (Test-GLLogVisible $entry)) {
+            $follow = Test-GLLogAtEnd
+            $script:LogView.Add($entry)
+            if ($follow) { Step-GLLogScroll }
         }
     }
     else { Write-Host $line }
@@ -4656,7 +5012,8 @@ function Open-GLFolder([string]$Path) {
 $script:HistoryFields = @('TxtGwFilter', 'TxtCnSearch', 'TxtCnUser', 'TxtCnAccount', 'TxtBulkPrincipals', 'TxtCredUser', 'TxtLogFind', 'TxtMoveFrom', 'TxtMoveTo')
 # the Show views on the Connections tab - Select-GLConnections knows each by its words
 $script:ShowViews = @('All connections', 'Last used over 30 days ago', 'Last used over 90 days ago', 'Last used over 180 days ago',
-                      'Last used over 365 days ago', 'No use recorded', 'Duplicates', 'Failing tests', 'Skip test connection on')
+                      'Last used over 365 days ago', 'No use recorded', 'Duplicates', 'Failing tests', 'Skip test connection on',
+                      'Access by accounts not in Entra ID')
 
 function New-GLBrush([string]$Hex) {
     $c = ConvertTo-GLColorValue $Hex
@@ -4721,6 +5078,240 @@ function Get-GLIconImage {
     return $script:IconImage
 }
 
+$script:RepoUrl = 'https://github.com/lukas-novacek/GatewayLens'
+
+function Open-GLLink([string]$Url) {
+    # Only web pages, in the default browser - never a file or a program.
+    if ($Url -notmatch '^https://') { return }
+    if (-not (Open-GLBrowser $Url)) { Write-GLLog "Could not open $Url - copy it into your browser." 'Warn' }
+}
+
+function Get-GLIssueUrl {
+    # A new issue on GitHub, with what helps to answer it - and nothing about the tenant.
+    $body = "GatewayLens $($script:AppVersion), PowerShell $($PSVersionTable.PSVersion), sign-in via $($script:AuthMode)`n`nWhat happened:`n`nWhat I expected:`n`n(Please leave out names, ids and anything else from your tenant.)"
+    return "$($script:RepoUrl)/issues/new?body=$([uri]::EscapeDataString($body))"
+}
+
+# What the start page's own thread needs - it is a separate runspace.
+$script:StartPageFunctions = @('Add-GLStyles', 'Set-GLTheme', 'ConvertTo-GLColorValue', 'Get-GLIconImage', 'Open-GLBrowser', 'Save-GLWindowImage')
+
+function Get-GLStartPageScript {
+    <#
+        The start page, run on a thread of its own so it stays alive while the main
+        thread signs in - a sign-in waits for the browser, and a window on the same
+        thread would freeze. The two talk through one synchronized hashtable:
+        the page sets Choice ('SignIn' or 'Demo') and Account; the main thread sets
+        Error, or Done when the page can close. Closing the page sets Closed.
+    #>
+    return {
+        param($Sync)
+        try {
+            Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+            [xml]$x = $Sync.Xaml
+            $w = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($x))
+            $ui = @{}
+            foreach ($n in 'StartLogo', 'StartAccount', 'StartSignIn', 'StartHow', 'StartBusy', 'StartBusyText', 'StartError', 'StartErrorText', 'StartDemo', 'StartHelp', 'StartGitHub', 'StartVersion') {
+                $ui[$n] = $w.FindName($n)
+            }
+            $null = Add-GLStyles -Target $w
+            $null = Set-GLTheme -Target $w -Name $Sync.Theme
+            $w.FontSize = $Sync.FontSize
+            $img = Get-GLIconImage
+            if ($img) { $w.Icon = $img; $ui.StartLogo.Source = $img }
+            $ui.StartAccount.Text = $Sync.Account
+            $ui.StartHow.Text     = $Sync.How
+            $ui.StartVersion.Text = "Version $($Sync.Version) - free and open source"
+            $global:StartUi = $ui; $global:StartSync = $Sync; $global:StartWindow = $w
+
+            $ui.StartSignIn.Add_Click({
+                $global:StartSync.Account = ([string]$global:StartUi.StartAccount.Text).Trim()
+                $global:StartSync.Error   = ''
+                $global:StartSync.Choice  = 'SignIn'
+            })
+            $ui.StartDemo.Add_Click({ $global:StartSync.Choice = 'Demo' })
+            $ui.StartHelp.Add_Click({ $null = Open-GLBrowser "$($global:StartSync.RepoUrl)#readme" })
+            $ui.StartGitHub.Add_Click({ $null = Open-GLBrowser $global:StartSync.RepoUrl })
+            $w.Add_Closing({ param($s, $e) if (-not $global:StartSync.Done) { $global:StartSync.Closed = $true } })
+
+            $tm = [System.Windows.Threading.DispatcherTimer]::new()
+            $tm.Interval = [TimeSpan]::FromMilliseconds(150)
+            $tm.Add_Tick({
+                $s = $global:StartSync; $u = $global:StartUi
+                if ($s.Done) { $global:StartTimer.Stop(); $global:StartWindow.Close(); return }
+                if ($s.Auto -and -not $s.AutoDone -and ($s.ShotDone -or -not $s.Shot)) { $s.AutoDone = $true; $s.Choice = $s.Auto }
+                $busy = [bool]$s.Choice
+                $u.StartBusy.Visibility   = $(if ($s.Choice -eq 'SignIn') { 'Visible' } else { 'Collapsed' })
+                $u.StartError.Visibility  = $(if ($s.Error -and -not $busy) { 'Visible' } else { 'Collapsed' })
+                if ($s.Error) { $u.StartErrorText.Text = [string]$s.Error }
+                $u.StartSignIn.IsEnabled  = [bool]$s.CanSignIn -and -not $busy
+                $u.StartDemo.IsEnabled    = -not $busy
+                $u.StartAccount.IsEnabled = -not $busy
+                # the picture after the page shows its real state - on the next tick, once drawn
+                if ($s.Shot -and -not $s.ShotDone) {
+                    if ($s.ShotWait) { $s.ShotDone = $true; try { Save-GLWindowImage -Path $s.Shot -Window $global:StartWindow } catch { } }
+                    else { $s.ShotWait = $true }
+                }
+            })
+            $global:StartTimer = $tm
+            $w.Add_ContentRendered({ $global:StartSync.Shown = $true; $global:StartTimer.Start(); $null = $global:StartUi.StartAccount.Focus() })
+            $null = $w.ShowDialog()
+        }
+        catch { $Sync.Failed = $_.Exception.Message }
+    }
+}
+
+function Invoke-GLStartPage {
+    <#
+        Shows the start page and does what is chosen on it: signs in - on this, the
+        main, thread, exactly as without the page - or goes to the demo. A failed
+        sign-in is shown on the page, to try again. Returns 'SignedIn', 'Demo',
+        'Closed' (the page was closed), or 'Fallback' when the page could not be
+        shown - then the caller signs in the old way.
+        -Auto picks for the user, and -Shot saves a picture first: smoke test, README.
+    #>
+    param([string]$TenantId, [string]$ClientId, [string]$Account, [string]$SignIn = 'Auto', [switch]$NoWindow, [string]$Auto, [string]$Shot)
+    $settings = Read-GLSettings -Path $(if ($script:SettingsPath) { $script:SettingsPath } else { Get-GLSettingsPath })
+    $how = ''; $can = $true
+    try {
+        $plan = Select-GLSignIn -Requested $SignIn -ClientId $ClientId -BuiltInId $script:BuiltInClientId -AzAvailable (Test-GLAzAccounts)
+        $how = if ($plan -eq 'Az') { 'Signs in through Az.Accounts, in your browser - nothing to approve.' }
+               else { 'Signs in in your browser. Your organisation approves GatewayLens once.' }
+    }
+    catch { $how = $_.Exception.Message; $can = $false }
+    $theme = $settings.Theme
+    if ($Shot) {
+        # the README picture shows the page as most people see it
+        $how = 'Signs in through Az.Accounts, in your browser - nothing to approve.'; $can = $true; $theme = 'Dark'
+    }
+    $sync = [hashtable]::Synchronized(@{
+        Xaml = $script:StartXaml; Theme = $theme; FontSize = $settings.FontSize
+        Account = $(if ($Account) { $Account } else { $settings.LastAccount }); How = $how; CanSignIn = $can
+        Version = $script:AppVersion; RepoUrl = $script:RepoUrl
+        Choice = $null; Error = ''; Done = $false; Closed = $false; Shown = $false; Failed = ''
+        Auto = $Auto; AutoDone = $false; Shot = $Shot; ShotDone = $false; ShotWait = $false
+    })
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+    foreach ($n in $script:StartPageFunctions) {
+        $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($n, (Get-Item "function:$n").Definition))
+    }
+    foreach ($v in 'ModernStylesXaml', 'ClassicStylesXaml', 'Themes', 'IconPng') {
+        $iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new($v, (Get-Variable -Scope Script -Name $v -ValueOnly), ''))
+    }
+    $rs = [runspacefactory]::CreateRunspace($iss)
+    $rs.ApartmentState = 'STA'
+    $rs.ThreadOptions  = 'ReuseThread'
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    $null = $ps.AddScript((Get-GLStartPageScript).ToString()).AddArgument($sync)
+    $h = $ps.BeginInvoke()
+    $result = 'Fallback'
+    try {
+        while (-not $h.IsCompleted) {
+            if ($sync.Closed) { $result = 'Closed'; break }
+            if ($sync.Choice -eq 'Demo') { $result = 'Demo'; break }
+            if ($sync.Choice -eq 'SignIn') {
+                try {
+                    Connect-GL -TenantId $TenantId -ClientId $ClientId -Account $sync.Account -SignIn $SignIn -NoWindow:$NoWindow
+                    $result = if ($sync.Closed) { 'Closed' } else { 'SignedIn' }
+                    break
+                }
+                catch {
+                    $sync.Error  = "Sign-in did not work: $($_.Exception.Message)"
+                    $sync.Choice = $null
+                }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if ($result -eq 'Fallback' -and $sync.Closed) { $result = 'Closed' }
+    }
+    finally {
+        $sync.Done = $true
+        $until = (Get-Date).AddSeconds(5)
+        while (-not $h.IsCompleted -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 50 }
+        if ($h.IsCompleted) { try { $ps.Dispose(); $rs.Dispose() } catch { } }
+    }
+    if ($sync.Failed) { Write-Host "The start page could not be shown ($($sync.Failed)) - signing in without it." -ForegroundColor Yellow }
+    return $result
+}
+
+function Show-GLInfo {
+    # A small window: a title, a few lines, and buttons that open web pages.
+    param([string]$Title, [string]$Subtitle, [string[]]$Lines, $Links)
+    [xml]$x = $script:InfoXaml
+    $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($x))
+    Initialize-GLDialog -Dialog $dlg
+    if ($script:Window) { $dlg.Owner = $script:Window }
+    $dlg.Title = $Title
+    $dlg.FindName('InfoTitle').Text = $Title
+    $dlg.FindName('InfoSub').Text = $Subtitle
+    $dlg.FindName('InfoLines').ItemsSource = @($Lines)
+    $img = Get-GLIconImage
+    if ($img) { $dlg.FindName('InfoLogo').Source = $img }
+    $panel = $dlg.FindName('InfoLinks')
+    foreach ($l in @($Links)) {
+        $b = [System.Windows.Controls.Button]::new()
+        $b.Content = $l[0]
+        $b.Tag = $l[1]
+        $b.Margin = [System.Windows.Thickness]::new(0, 0, 6, 6)
+        $b.Add_Click({ param($s, $e) Open-GLLink ([string]$s.Tag) })
+        $null = $panel.Children.Add($b)
+    }
+    $dlg.FindName('InfoClose').Add_Click({ param($s, $e) [System.Windows.Window]::GetWindow($s).Close() })
+    $null = $dlg.ShowDialog()
+}
+
+function Show-GLWhatsNew {
+    Show-GLInfo -Title "What is new in $($script:AppName) $($script:WhatsNew.Version)" -Subtitle 'The highlights. The full list is on GitHub.' `
+        -Lines $script:WhatsNew.Lines -Links @(@('Full changelog', "$($script:RepoUrl)/blob/main/CHANGELOG.md"), @('All releases', "$($script:RepoUrl)/releases"))
+}
+
+function Show-GLAbout {
+    Show-GLInfo -Title "$($script:AppName) $($script:AppVersion)" -Subtitle 'The missing admin console for Power BI and Fabric data gateways.' -Lines @(
+        'Made by Lukas Novacek. Free and open source, under the MIT licence.'
+        'Signs in as you and acts with your permissions. Nothing is sent anywhere but Microsoft.'
+        'Not affiliated with, endorsed by or supported by Microsoft.'
+        'If it saves you time, star it on GitHub and tell a colleague who runs gateways.'
+    ) -Links @(@('GatewayLens on GitHub', $script:RepoUrl), @('Report a problem', (Get-GLIssueUrl)))
+}
+
+function Add-GLHelpMenu {
+    # The ? button: help pages, the news, where to report a problem, and who made it.
+    $menu = [System.Windows.Controls.ContextMenu]::new()
+    $items = @(
+        , @('How to use GatewayLens', 'F1', "$($script:RepoUrl)#readme")
+        , @('What each action needs - permissions', '', "$($script:RepoUrl)/blob/main/docs/permissions.md")
+        , @("What is new in $($script:AppVersion)", '', 'news')
+        , @('-', '', '')
+        , @('Report a problem or suggest an idea', '', 'issue')
+        , @('GatewayLens on GitHub', '', $script:RepoUrl)
+        , @('-', '', '')
+        , @('About GatewayLens', '', 'about')
+    )
+    foreach ($m in $items) {
+        if ($m[0] -eq '-') { $null = $menu.Items.Add([System.Windows.Controls.Separator]::new()); continue }
+        $item = [System.Windows.Controls.MenuItem]::new()
+        $item.Header = $m[0]
+        $item.InputGestureText = $m[1]
+        $item.Tag = $m[2]
+        $item.Add_Click({
+            param($s, $e)
+            switch ([string]$s.Tag) {
+                'news'  { Show-GLWhatsNew }
+                'about' { Show-GLAbout }
+                'issue' { Open-GLLink (Get-GLIssueUrl) }
+                default { Open-GLLink ([string]$s.Tag) }
+            }
+        })
+        $null = $menu.Items.Add($item)
+    }
+    $btn = $script:UI.BtnHelp
+    $menu.PlacementTarget = $btn
+    $menu.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $btn.ContextMenu = $menu
+    $btn.Add_Click({ param($s, $e) $s.ContextMenu.IsOpen = $true })
+}
+
 function Initialize-GLDialog {
     # Dialogs are separate windows: they need the same look, theme, size and icon.
     param([Parameter(Mandatory)]$Dialog)
@@ -4751,6 +5342,7 @@ function Set-GLFontSize([int]$Size) {
         $grid = $script:UI[$g]
         if ($grid) { $grid.RowHeight = $h.Row; $grid.ColumnHeaderHeight = $h.Header }
     }
+    if ($script:UI.LstLog) { $script:UI.LstLog.FontSize = [Math]::Max(9, $Size - 1) }
     # The tiles grow and shrink with the text, all of a tile at once - it is drawn
     # for text size 12. A layout transform, so the rows of tiles still wrap.
     $tiles = $script:UI.LstGwTiles
@@ -4783,6 +5375,19 @@ function Save-GLFieldHistory([string]$Field) {
     }
 }
 
+function Clear-GLStaleChoice {
+    <#
+        An entry picked from the list stays selected after its text is deleted, and
+        WPF only acts on a click that changes the selection - so picking it again did
+        nothing. When the list opens, an entry the text no longer shows is let go.
+    #>
+    param($Box)
+    if ($Box.SelectedIndex -lt 0 -or [string]$Box.Text -eq [string]$Box.SelectedItem) { return }
+    $keep = [string]$Box.Text
+    $Box.SelectedIndex = -1
+    if ([string]$Box.Text -ne $keep) { $Box.Text = $keep }
+}
+
 function Initialize-GLHistory {
     foreach ($f in $script:HistoryFields) {
         $box = $script:UI[$f]
@@ -4793,6 +5398,7 @@ function Initialize-GLHistory {
         # run in a module of its own, where the script's functions do not exist.
         $box.Add_LostKeyboardFocus({ param($s, $e) if (-not $s.IsKeyboardFocusWithin) { Save-GLFieldHistory $s.Name } })
         $box.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { Save-GLFieldHistory $s.Name } })
+        $box.Add_DropDownOpened({ param($s, $e) Clear-GLStaleChoice $s })
     }
 }
 
@@ -5000,12 +5606,12 @@ function Write-GLResults {
     $all = @($Results)
     $bad = @($all | Where-Object { -not $_.Ok })
     $ok  = $all.Count - $bad.Count
-    Write-GLLog "${What}: $ok done, $($bad.Count) not done." $(if ($bad.Count) { 'Warn' } else { 'Info' })
+    Write-GLLog "${What}: $ok done, $($bad.Count) not done." $(if ($bad.Count) { 'Warn' } else { 'Ok' })
     $n = 0
     foreach ($r in $all) {
         $n++
         $line = "    $($r.Name): $($r.Message)"
-        if ($n -le 1000) { Write-GLLog $line $(if ($r.Ok) { 'Info' } else { 'Error' }) } else { Write-GLLog $line -FileOnly }
+        if ($n -le 1000) { Write-GLLog $line $(if ($r.Ok) { 'Ok' } else { 'Error' }) } else { Write-GLLog $line -FileOnly }
     }
     if ($n -gt 1000) { Write-GLLog "    ... and $($n - 1000) more - all of them are in the log file (Open folder)." }
 }
@@ -5200,7 +5806,7 @@ function Add-GLTileCopy {
     # copy it, all of them, or its id. Ctrl+C copies the selected gateway.
     $list = $script:UI.LstGwTiles
     $menu = [System.Windows.Controls.ContextMenu]::new()
-    foreach ($m in @(, @('Copy this gateway', 'Ctrl+C', 'One'), @('Copy all gateways', '', 'All'), @('Copy id', '', 'Id'))) {
+    foreach ($m in @(@('Copy this gateway', 'Ctrl+C', 'One'), @('Copy all gateways', '', 'All'), @('Copy id', '', 'Id'))) {
         $item = [System.Windows.Controls.MenuItem]::new()
         $item.Header = $m[0]
         $item.InputGestureText = $m[1]
@@ -5445,7 +6051,7 @@ function Invoke-GLGatewayRefresh {
         Show-GLGateways
         Update-GLGatewayDetail
         $members = ($r.Members.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-        Write-GLLog "Loaded all $(@($script:State.GatewayRows).Count) gateway(s) with $([int]$members) member(s). $($script:UI.TxtGwSummary.Text)"
+        Write-GLLog "Loaded all $(@($script:State.GatewayRows).Count) gateway(s) with $([int]$members) member(s). $($script:UI.TxtGwSummary.Text)" 'Ok'
         Invoke-GLReleaseCheck
     }
 }
@@ -5705,23 +6311,31 @@ function Invoke-GLConnectionRefresh {
     if (-not $fab) { return }
     $dir = [bool]$script:UI.ChkDirectory.IsChecked
     $pbi = if ($dir) { Get-GLTokenSafe PowerBI } else { $null }
+    $gr  = if ($dir) { Get-GLTokenSafe Graph } else { $null }
     Write-GLLog "Reading connections: usernames and access from the unofficial API $(if ($dir) { 'on' } else { 'off' })."
-    Start-GLJob -Name 'Loading connections' -Arguments @{ F = $fab; P = $pbi; D = $dir } -Work {
-        param($F, $P, $D)
+    Start-GLJob -Name 'Loading connections' -Arguments @{ F = $fab; P = $pbi; G = $gr; D = $dir; Known = $script:State.Names } -Work {
+        param($F, $P, $G, $D, $Known)
         $data = Get-GLConnectionData -FabricToken $F
-        $directory = $null; $warn = $null
+        $directory = $null; $warn = $null; $names = @{}; $namesWarn = ''
         if ($D -and $P) {
             try { $directory = Get-GLDatasourceDirectory -PbiToken $P }
             catch { $warn = "Usernames and access are unavailable (unofficial API): $($_.Exception.Message)" }
         }
+        if ($directory) {
+            # the directory may give only object ids - the names come from Graph
+            $ids = Get-GLDirectoryPrincipalIds -Directory $directory
+            try { $names = Get-GLPrincipalNames -Ids $ids -GraphToken $G -Known $Known } catch { $namesWarn = $_.Exception.Message }
+            foreach ($k in $Known.Keys) { if (-not $names.ContainsKey($k)) { $names[$k] = $Known[$k] } }
+        }
         # the rows are made here: thousands of them would hold up the window
         $rows = ConvertTo-GLConnectionRows -Connections $data.Connections -GatewayNames (Get-GLGatewayNameMap -Gateways $data.Gateways)
-        Add-GLDirectoryInfo -Rows $rows -Directory $directory
-        @{ Gateways = $data.Gateways; Connections = $data.Connections; Directory = $directory; Rows = $rows; Warn = $warn }
+        Add-GLDirectoryInfo -Rows $rows -Directory $directory -Names $names
+        @{ Gateways = $data.Gateways; Connections = $data.Connections; Directory = $directory; Rows = $rows; Warn = $warn; Names = $names; NamesWarn = $namesWarn }
     } -OnDone {
         param($r, $err, $ctx)
         if ($err -or -not $r) { return }
         if ($r.Warn) { Write-GLLog $r.Warn 'Warn' }
+        if ($r.Names) { Add-GLNames $r.Names $r.NamesWarn }
         Set-GLGatewayList $r.Gateways
         $rows = @($r.Rows | Where-Object { $_ })
         $script:State.ConnRows  = $rows
@@ -5737,10 +6351,12 @@ function Invoke-GLConnectionRefresh {
         if ($r.Directory) {
             $acc = @($rows | Where-Object { $_.Account }).Count
             $note = "; usernames for $acc, users for $(@($rows | Where-Object { $_.Users -ne '' }).Count)"
+            $gone = @($rows | Where-Object { $_.UnknownUsers -gt 0 }).Count
+            if ($gone) { $note += ". $gone connection(s) give access to accounts that are not in Microsoft Entra ID - deleted ones, which the portal does not show: Show > Access by accounts not in Entra ID" }
         }
         $cloudRows = @($rows | Where-Object Connectivity -eq 'ShareableCloud').Count
         if ($cloudRows -and -not $script:UI.ChkCnCloud.IsChecked) { $note += ". $cloudRows cloud connection(s) are hidden - tick Include cloud connections to see them" }
-        Write-GLLog "Loaded $($rows.Count) connection(s)$note."
+        Write-GLLog "Loaded $($rows.Count) connection(s)$note." 'Ok'
     }
 }
 
@@ -5939,7 +6555,9 @@ function Invoke-GLHandoverUi {
         # The User filter matches part of a name; a handover must name one person.
         # So: the one person on the listed connections the filter matches.
         $ic    = [System.StringComparison]::OrdinalIgnoreCase
-        $names = @($items | ForEach-Object { $_.UserList } | Where-Object { $_ -and ([string]$_).IndexOf($filter, $ic) -ge 0 } | Sort-Object -Unique)
+        $names = @($items | ForEach-Object { if ($_.PSObject.Properties['People'] -and @($_.People).Count) { $_.People } else { $_.UserList | ForEach-Object { [pscustomobject]@{ Name = $_; Email = ''; Key = $_ } } } } |
+                   Where-Object { $_ -and (@($_.Name, $_.Email, $_.Key) | Where-Object { $_ -and ([string]$_).IndexOf($filter, $ic) -ge 0 }) } |
+                   ForEach-Object { [string]$_.Key } | Sort-Object -Unique)
         if ($names.Count -eq 0) { Write-GLLog "No one with access to the listed connections matches '$filter'. Press Verify users, or type From." 'Warn'; return }
         if ($names.Count -gt 1) { Write-GLLog "'$filter' matches $($names.Count) people: $(($names | Select-Object -First 5) -join ', '). Type the one who hands over in From." 'Warn'; return }
         $fromText = [string]$names[0]
@@ -6049,16 +6667,24 @@ function Invoke-GLBulkCredentialsUi {
     $keys = @{} + $script:State.PublicKeys
     Start-GLJob -Bulk -Name "Updating credentials on $($gwItems.Count) connection(s)" `
         -Arguments @{ P = $pbi; I = $items; T = $type; U = $user; S = $secret; E = $encChoice; K = $keys; A = $audit } `
-        -Context @{ Items = $gwItems; Retest = [bool]$script:UI.ChkCredRetest.IsChecked } -Work {
+        -Context @{ Items = $gwItems; Retest = [bool]$script:UI.ChkCredRetest.IsChecked; User = $user } -Work {
         param($P, $I, $T, $U, $S, $E, $K, $A, $Progress)
         Invoke-GLBulkCredentials -Items $I -CredentialType $T -Username $U -Password $S -EncryptionChoice $E -PublicKeys $K -PbiToken $P -Progress $Progress -Audit $A
     } -OnDone {
         param($r, $err, $ctx)
         if ($err) { return }
         Write-GLResults 'Update credentials' $r
+        $done = @($r | Where-Object Ok | ForEach-Object { [string]$_.Id })
+        if ($ctx.User -and $done.Count) {
+            # The list shows the account they use now. Microsoft's credentials API keeps
+            # only the encrypted copy, not the readable username the portal saves next
+            # to it - so a later refresh can show the Account empty.
+            foreach ($row in $ctx.Items) { if ($done -contains [string]$row.Id) { $row.Account = $ctx.User } }
+            try { $script:UI.GridConnections.Items.Refresh() } catch { }
+            Write-GLLog "The Account column shows $($ctx.User) for the $($done.Count) updated connection(s). After the next refresh it can be empty: Microsoft's API stores the username encrypted only. The connections use it all the same - Verify status shows it." 'Warn'
+        }
         if ($ctx.Retest -and -not $script:Progress.Cancel) {
             # exactly the ones that took the new credentials - a test shows whether they work
-            $done  = @($r | Where-Object Ok | ForEach-Object { [string]$_.Id })
             $again = @($ctx.Items | Where-Object { $done -contains [string]$_.Id })
             if ($again.Count) { Invoke-GLBulkStatusUi -Only $again -Retest }
         }
@@ -6288,19 +6914,41 @@ function Invoke-GLTestConnection {
     } -OnDone {
         param($r, $err, $ctx)
         if ($err -or -not $r) { return }
-        Write-GLLog "'$($ctx.Name)': $($r.Message)" $(if ($r.Ok) { 'Info' } else { 'Error' })
+        Write-GLLog "'$($ctx.Name)': $($r.Message)" $(if ($r.Ok) { 'Ok' } else { 'Error' })
     }
 }
 
 # ---- log panel --------------------------------------------------------------------
 function Copy-GLLog {
-    $t = $script:UI.TxtLog.Text
-    if (-not $t) { Write-GLLog 'Nothing to copy.' 'Warn'; return }
+    param([switch]$Selected)
+    $t = Get-GLLogText -Selected:$Selected
+    if (-not $t) { Write-GLLog $(if ($Selected) { 'Select the lines to copy first.' } else { 'Nothing to copy.' }) 'Warn'; return }
     [System.Windows.Clipboard]::SetText($t)
 }
 
+function Add-GLLogMenu {
+    # Right-click and Ctrl+C on the log: the selected lines, or everything shown.
+    $list = $script:UI.LstLog
+    $menu = [System.Windows.Controls.ContextMenu]::new()
+    foreach ($m in @(@('Copy selected lines', 'Ctrl+C', 'Sel'), @('Copy everything shown', '', 'All'))) {
+        $item = [System.Windows.Controls.MenuItem]::new()
+        $item.Header = $m[0]
+        $item.InputGestureText = $m[1]
+        $item.Tag = $m[2]
+        $item.Add_Click({ param($s, $e) if ([string]$s.Tag -eq 'Sel') { Copy-GLLog -Selected } else { Copy-GLLog } })
+        $null = $menu.Items.Add($item)
+    }
+    $list.ContextMenu = $menu
+    $list.Add_PreviewKeyDown({
+        param($s, $e)
+        $ctrl = ([System.Windows.Input.Keyboard]::Modifiers -band [System.Windows.Input.ModifierKeys]::Control) -eq [System.Windows.Input.ModifierKeys]::Control
+        if ($ctrl -and $e.Key -eq 'C') { Copy-GLLog -Selected; $e.Handled = $true }
+        elseif ($ctrl -and $e.Key -eq 'A') { $s.SelectAll(); $e.Handled = $true }
+    })
+}
+
 function Save-GLLog {
-    $t = $script:UI.TxtLog.Text
+    $t = Get-GLLogText
     if (-not $t) { Write-GLLog 'Nothing to save.' 'Warn'; return }
     $dlg = [Microsoft.Win32.SaveFileDialog]::new()
     $dlg.FileName = 'gatewaylens-log-{0:yyyyMMdd-HHmm}.txt' -f (Get-Date)
@@ -6314,6 +6962,68 @@ function Save-GLLog {
 # -SmokeTest drives the real window on demo data: waits for each load to finish, then
 # every theme, every tab, two text sizes, and closes. Main reports the verdict.
 function Start-GLSmokeTest {
+    param([switch]$Screenshots)
+    if ($Screenshots) { $plan = Get-GLScreenshotPlan }
+    else { $plan = Get-GLSmokePlan }
+    $script:Smoke = @{ Plan = $plan; Next = 0; Deadline = (Get-Date).AddSeconds(180) }
+    $script:SmokeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:SmokeTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+    $script:SmokeTimer.Add_Tick({ Step-GLSmokeTest })
+    $script:SmokeTimer.Start()
+}
+
+function Get-GLScreenshotPlan {
+    # What the README shows, in the order it is taken. Dark first: it looks best on GitHub.
+    $plan = [System.Collections.Generic.List[object]]::new()
+    $plan.Add(@{ Kind = 'Size'; Value = @(1600, 1040) })
+    $plan.Add(@{ Kind = 'Theme'; Value = 'Dark' })
+    $plan.Add(@{ Kind = 'Tab'; Value = 0 })
+    $plan.Add(@{ Kind = 'Tile'; Value = 'Contoso Prod Cluster' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-gateways' })
+    $plan.Add(@{ Kind = 'Tab'; Value = 1 })
+    $plan.Add(@{ Kind = 'Row'; Value = 'Sales DW' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-connections' })
+    $plan.Add(@{ Kind = 'Run'; Value = 'Status' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-verify-status' })
+    $plan.Add(@{ Kind = 'ShowView'; Value = 'Access by accounts not in Entra ID' })
+    $plan.Add(@{ Kind = 'Row'; Value = 'AP Archive' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-deleted-accounts' })
+    $plan.Add(@{ Kind = 'ShowView'; Value = 'All connections' })
+    $plan.Add(@{ Kind = 'Tab'; Value = 0 })
+    $plan.Add(@{ Kind = 'Font'; Value = 20 })          # a wall screen is read from across the room
+    $plan.Add(@{ Kind = 'Kiosk' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-kiosk' })
+    $plan.Add(@{ Kind = 'KioskOff' })
+    $plan.Add(@{ Kind = 'Font'; Value = 12 })
+    $plan.Add(@{ Kind = 'Theme'; Value = 'Light' })
+    $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-gateways-light' })
+    $plan.Add(@{ Kind = 'Close' })
+    return , $plan
+}
+
+function Save-GLWindowImage {
+    # The window as a PNG, drawn by WPF itself - no screen capture, so nothing else
+    # on the screen gets in, and it works with the window behind others.
+    param([Parameter(Mandatory)][string]$Path, $Window)
+    $w = if ($Window) { $Window } else { $script:Window }
+    # the window's own frame inside the title bar: background, margins and all
+    $root = [System.Windows.Media.VisualTreeHelper]::GetChild($w, 0)
+    $wd = [Math]::Max(1, [int]$root.ActualWidth); $ht = [Math]::Max(1, [int]$root.ActualHeight)
+    $bmp = [System.Windows.Media.Imaging.RenderTargetBitmap]::new($wd, $ht, 96, 96, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $bmp.Render($root)
+    $enc = [System.Windows.Media.Imaging.PngBitmapEncoder]::new()
+    $enc.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
+    $fs = [System.IO.File]::Create($Path)
+    try { $enc.Save($fs) } finally { $fs.Dispose() }
+}
+
+function Get-GLSmokePlan {
     $plan = [System.Collections.Generic.List[object]]::new()
     foreach ($t in $script:Themes.Keys) { $plan.Add(@{ Kind = 'Theme'; Value = $t }) }
     for ($i = 0; $i -lt $script:UI.Tabs.Items.Count; $i++) { $plan.Add(@{ Kind = 'Tab'; Value = $i }) }
@@ -6327,6 +7037,9 @@ function Start-GLSmokeTest {
     $plan.Add(@{ Kind = 'FilterCheck' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'FilterBack' })
+    $plan.Add(@{ Kind = 'HistoryPick' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'HistoryBack' })
     $plan.Add(@{ Kind = 'GridChecks' })
     $plan.Add(@{ Kind = 'Tab'; Value = 0 })
     $plan.Add(@{ Kind = 'Kiosk' })
@@ -6335,11 +7048,7 @@ function Start-GLSmokeTest {
     $plan.Add(@{ Kind = 'Font'; Value = 12 })
     $plan.Add(@{ Kind = 'Theme'; Value = 'Light' })
     $plan.Add(@{ Kind = 'Close' })
-    $script:Smoke = @{ Plan = $plan; Next = 0; Deadline = (Get-Date).AddSeconds(120) }
-    $script:SmokeTimer = [System.Windows.Threading.DispatcherTimer]::new()
-    $script:SmokeTimer.Interval = [TimeSpan]::FromMilliseconds(400)
-    $script:SmokeTimer.Add_Tick({ Step-GLSmokeTest })
-    $script:SmokeTimer.Start()
+    return , $plan
 }
 
 function Step-GLSmokeTest {
@@ -6370,6 +7079,19 @@ function Step-GLSmokeTest {
             $script:UI.TxtCnSearch.Text = ''
         }
         'FilterBack' { $sm.FilterOk = $sm.FilterOk -and @($script:UI.GridConnections.ItemsSource).Count -eq $sm.FilterAll }
+        'HistoryPick' {
+            # chosen once, text deleted, then chosen again from the open list
+            $b = $script:UI.TxtCnAccount
+            $sm.HistoryKeep = $b.ItemsSource
+            $b.ItemsSource = @('svc_sales', 'svc_hr')
+            $b.SelectedItem = 'svc_sales'
+            $b.Text = ''
+            $b.IsDropDownOpen = $true
+            $b.SelectedItem = 'svc_sales'
+            $sm.HistoryOk = ([string]$b.Text -eq 'svc_sales')
+            $b.IsDropDownOpen = $false
+        }
+        'HistoryBack' { $b = $script:UI.TxtCnAccount; $b.Text = ''; $b.ItemsSource = $sm.HistoryKeep }
         'ShowView' {
             $script:UI.CmbCnShow.SelectedItem = $p.Value
             if ($p.Value -eq 'Duplicates') { $sm.Duplicates = @($script:UI.GridConnections.ItemsSource).Count }
@@ -6385,6 +7107,20 @@ function Step-GLSmokeTest {
                           [string]$script:UI.CmbAutoRefresh.SelectedItem -eq $sm.AutoBefore
         }
         'Close' { $script:SmokeTimer.Stop(); $script:Window.Close() }
+        'Size'  { $script:Window.WindowState = 'Normal'; $script:Window.Width = $p.Value[0]; $script:Window.Height = $p.Value[1] }
+        'Tile'  {
+            $tile = @($script:UI.LstGwTiles.ItemsSource) | Where-Object { $_.Name -eq $p.Value } | Select-Object -First 1
+            if ($tile) { $script:UI.LstGwTiles.SelectedItem = $tile }
+        }
+        'Row'   {
+            $row = @($script:UI.GridConnections.ItemsSource) | Where-Object { $_.Name -eq $p.Value } | Select-Object -First 1
+            if ($row) { $script:UI.GridConnections.SelectedItem = $row; $script:UI.GridConnections.ScrollIntoView($row) }
+        }
+        'Run'   { if ($p.Value -eq 'Status') { Invoke-GLBulkStatusUi } }
+        'Shot'  {
+            try { Save-GLWindowImage -Path (Join-Path $script:ShotFolder "$($p.Value).png") }
+            catch { Write-GLLog "Screenshot $($p.Value): $($_.Exception.Message)" 'Error' }
+        }
     }
 }
 
@@ -6400,6 +7136,8 @@ function Get-GLSmokeVerdict {
     if (-not ($script:State.Releases -and $script:State.Releases.Newest)) { $problems.Add('the newest gateway version was not read from the demo''s copy of Microsoft''s pages') }
     $st = @($script:State.Tiles | ForEach-Object Status | Sort-Object -Unique)
     if (@($script:State.Tiles).Count -ne 5 -or ($st -notcontains 'Offline') -or ($st -notcontains 'VNet')) { $problems.Add("gateway tiles: $(@($script:State.Tiles).Count) with $($st -join ', '), expected 5 including Offline and VNet") }
+    if ($script:Smoke -and $script:StartPageResult -ne 'Demo') { $problems.Add("the start page did not open, or Try the demo did not work (it gave '$($script:StartPageResult)')") }
+    if ($script:Smoke -and -not $script:Smoke.HistoryOk) { $problems.Add('a remembered entry could not be picked again after its text was deleted') }
     if ($script:Smoke -and -not $script:Smoke.FilterOk) { $problems.Add('the search box did not filter the connections once typing stopped, or did not give them all back when cleared') }
     if ($script:Smoke -and -not $script:Smoke.KioskOk) { $problems.Add('kiosk view did not hide and restore the window parts and the auto-refresh') }
     if ($script:Smoke -and [math]::Abs([double]$script:Smoke.TileScale - 16 / 12) -gt 0.01) { $problems.Add("tiles at text size 16 were drawn at $($script:Smoke.TileScale) of their size, expected 1.33") }
@@ -6428,8 +7166,8 @@ function Export-GLGrid {
     if (-not $dlg.ShowDialog($script:Window)) { return }
     $hasUsers = $rows[0].PSObject.Properties.Name -contains 'UserList'
     $rows | ForEach-Object {
-        $o = $_ | Select-Object -Property * -ExcludeProperty UserList, Source
-        if ($hasUsers) { $o | Add-Member -NotePropertyName UserNames -NotePropertyValue (@($_.UserList) -join '; ') -Force }
+        $o = $_ | Select-Object -Property * -ExcludeProperty UserList, Source, People, UnknownUsers, NotInEntra
+        if ($hasUsers -and -not $_.PSObject.Properties['UserNames']) { $o | Add-Member -NotePropertyName UserNames -NotePropertyValue (@($_.UserList) -join '; ') -Force }
         $o
     } | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding utf8BOM
     Write-GLLog "Exported $($rows.Count) row(s) to $($dlg.FileName)"
@@ -6447,7 +7185,9 @@ function Copy-GLId {
 function Show-GLWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     if (-not $script:SettingsPath) { $script:SettingsPath = Get-GLSettingsPath }
+    $script:SettingsExisted = Test-Path -LiteralPath $script:SettingsPath
     $script:Settings = Read-GLSettings -Path $script:SettingsPath
+    if ($script:AuthMode -ne 'Demo' -and [string]$script:SignedInAs -match '^[^\s@]+@[^\s@]+$') { $script:Settings.LastAccount = [string]$script:SignedInAs }
     # from here on, everything logged also goes to today's log file
     $script:LogReady = $true
     $pruned = Remove-GLOldLogs -Folder $script:LogFolder -User $script:SignedInAs -Days 30
@@ -6470,6 +7210,7 @@ function Show-GLWindow {
     $script:UI.CmbTheme.SelectedItem = $script:Settings.Theme
     Set-GLFontSize $script:Settings.FontSize
     Initialize-GLHistory
+    try { Set-GLLayout $script:Settings.Layout } catch { }
 
     $script:Window.Title        = "$($script:AppName) $($script:AppVersion)"
     if ($script:AuthMode -eq 'Demo') {
@@ -6482,7 +7223,7 @@ function Show-GLWindow {
     foreach ($g in $script:Grids) {
         $script:UI[$g].Add_AutoGeneratingColumn({
             param($s, $e)
-            if ($e.PropertyName -in 'GatewayId', 'PrincipalId', 'UserList', 'Source') { $e.Cancel = $true; return }
+            if ($e.PropertyName -in 'GatewayId', 'PrincipalId', 'UserList', 'Source', 'People', 'UnknownUsers', 'NotInEntra') { $e.Cancel = $true; return }
             # read-only text that can be selected and copied, sorted as the user left it
             $col = New-GLGridColumn -Property $e.PropertyName -Header $e.Column.Header
             $sorted = @($script:GridSort[[string]$s.Name]) | Where-Object { $_.PropertyName -eq $e.PropertyName } | Select-Object -First 1
@@ -6571,6 +7312,7 @@ function Show-GLWindow {
     $script:UI.BtnGwCopyId.Add_Click({ Copy-GLId -Grid $script:UI.LstGwTiles })
     $script:UI.BtnKiosk.Add_Click({ Enter-GLKiosk })
     $script:UI.BtnKioskExit.Add_Click({ Exit-GLKiosk })
+    Add-GLHelpMenu
     $script:UI.BtnGwCopyAll.Add_Click({ Copy-GLGateways })
     $script:UI.BtnGwCopyCluster.Add_Click({ Copy-GLGateways -SelectedOnly })
     $script:UI.BtnGwIpsAll.Add_Click({ Invoke-GLResolveIps })
@@ -6616,7 +7358,8 @@ function Show-GLWindow {
     $script:UI.BtnLogCopy.Add_Click({ Copy-GLLog })
     $script:UI.BtnLogSave.Add_Click({ Save-GLLog })
     $script:UI.BtnLogFolder.Add_Click({ Open-GLFolder $script:LogFolder })
-    $script:UI.BtnLogClear.Add_Click({ $script:LogEntries.Clear(); $script:UI.TxtLog.Clear() })
+    $script:UI.BtnLogClear.Add_Click({ $script:LogEntries.Clear(); Update-GLLogView })
+    Add-GLLogMenu
 
     $script:UI.BtnCancel.Add_Click({
         $script:Progress.Cancel = $true
@@ -6653,10 +7396,12 @@ function Show-GLWindow {
         }
         elseif ($e.Key -eq 'Escape' -and $script:KioskSaved) { Exit-GLKiosk; $e.Handled = $true }
         elseif ($e.Key -eq 'F11') { if ($script:KioskSaved) { Exit-GLKiosk } else { Enter-GLKiosk }; $e.Handled = $true }
+        elseif ($e.Key -eq 'F1' -and -not $script:KioskSaved) { Open-GLLink "$($script:RepoUrl)#readme"; $e.Handled = $true }
     })
 
     $script:Window.Add_Loaded({
-        Write-GLLog "$($script:AppName) $($script:AppVersion) - signed in as $($script:SignedInAs) via $($script:AuthMode)."
+        Update-GLLogView
+        Write-GLLog "$($script:AppName) $($script:AppVersion) - signed in as $($script:SignedInAs) via $($script:AuthMode)." 'Ok'
         if ($script:AuthMode -eq 'Demo') {
             Write-GLLog 'DEMO: Contoso is fictional. Nothing leaves this computer, and changes last until the window closes.' 'Warn'
             Write-GLLog 'Try: Kiosk view (or F11) - the gateways as a wall screen. Esc leaves it.'
@@ -6671,7 +7416,14 @@ function Show-GLWindow {
         Invoke-GLGatewayRefresh
         Invoke-GLConnectionRefresh
         if ($Kiosk) { Enter-GLKiosk }
+        # after an update, once: what is new. Not on the very first start, not when driven.
+        $seen = [string]$script:Settings.SeenVersion
+        $script:Settings.SeenVersion = $script:AppVersion
+        if (-not ($script:SmokeTest -or $script:ShotFolder -or $Kiosk) -and $script:SettingsExisted -and $seen -ne $script:AppVersion) {
+            $null = $script:Window.Dispatcher.BeginInvoke([Action]{ Show-GLWhatsNew }, [System.Windows.Threading.DispatcherPriority]::ApplicationIdle)
+        }
         if ($script:SmokeTest) { Start-GLSmokeTest }
+        elseif ($script:ShotFolder) { Start-GLSmokeTest -Screenshots }
     })
     $script:Window.Add_Closing({
         param($s, $e)
@@ -6684,6 +7436,7 @@ function Show-GLWindow {
     $script:Window.Add_Closed({
         Write-GLLog 'Session ended.' -FileOnly
         foreach ($f in $script:HistoryFields) { Save-GLFieldHistory $f }
+        try { $script:Settings.Layout = Get-GLLayout } catch { }
         $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath
         try { $script:Timer.Stop() } catch { }
         try { if ($script:AutoTimer) { $script:AutoTimer.Stop() } } catch { }
@@ -6699,9 +7452,13 @@ function Show-GLWindow {
 # ============================================================================
 if ($LoadOnly) { return }
 
-if ($SmokeTest) {
+if ($SmokeTest -or $Screenshots) {
     $Demo = $true      # -SmokeTest is the demo, driven - and $SmokeTest is already the script variable functions read
     $script:SettingsPath = Join-Path ([System.IO.Path]::GetTempPath()) ('gatewaylens-smoke-{0}.json' -f [guid]::NewGuid().ToString('N'))
+}
+if ($Screenshots) {
+    $script:ShotFolder = [System.IO.Path]::GetFullPath($Screenshots)
+    if (-not (Test-Path -LiteralPath $script:ShotFolder)) { $null = New-Item -ItemType Directory -Path $script:ShotFolder -Force }
 }
 
 function Stop-GL([string]$Message) {
@@ -6733,11 +7490,24 @@ if (-not ($SelfTest -or $Inspect) -and [System.Threading.Thread]::CurrentThread.
     if ($PSBoundParameters.ContainsKey('BackupFolder')) { $relaunch += @('-BackupFolder', $BackupFolder) }
     if ($PSBoundParameters.ContainsKey('LogFolder'))    { $relaunch += @('-LogFolder', $LogFolder) }
     if ($Launched)              { $relaunch += '-Launched' }
-    if ($Demo -and -not $SmokeTest) { $relaunch += '-Demo' }
+    if ($Demo -and -not ($SmokeTest -or $Screenshots)) { $relaunch += '-Demo' }
     if ($Kiosk)                 { $relaunch += '-Kiosk' }
     if ($SmokeTest)             { $relaunch += '-SmokeTest' }
+    if ($Screenshots)           { $relaunch += @('-Screenshots', $Screenshots) }
     & $exe @relaunch
     exit $LASTEXITCODE
+}
+
+# The start page: sign in when ready, or try the demo. Not for -Demo (straight in),
+# a wall screen (-Kiosk), the console modes or -DeviceCode, which prints its code there.
+$startResult = ''
+if ($IsWindows -and -not ($SelfTest -or $Inspect -or $DeviceCode -or $Kiosk) -and (-not $Demo -or $SmokeTest -or $Screenshots)) {
+    $auto = if ($SmokeTest -or $Screenshots) { 'Demo' } else { '' }
+    $shot = if ($Screenshots) { Join-Path $script:ShotFolder 'screenshot-start.png' } else { '' }
+    $startResult = Invoke-GLStartPage -TenantId $TenantId -ClientId $ClientId -Account $Account -SignIn $SignIn -NoWindow:$Launched -Auto $auto -Shot $shot
+    $script:StartPageResult = $startResult
+    if ($startResult -eq 'Closed') { exit 0 }
+    if ($startResult -eq 'Demo') { $Demo = $true }
 }
 
 if ($Demo) {
@@ -6751,7 +7521,7 @@ if ($Demo) {
     Enable-GLDemo
     Write-Host 'Demo mode: Contoso is fictional - no sign-in, nothing leaves this computer.' -ForegroundColor Yellow
 }
-else {
+elseif ($startResult -ne 'SignedIn') {
     try {
         Write-Host "Signing in..." -ForegroundColor Cyan
         # GatewayLens.exe hides the console unless -SelfTest, -Inspect or -DeviceCode needs it
@@ -6776,6 +7546,12 @@ if ($Inspect) {
 try { Show-GLWindow }
 catch { Stop-GL "$($script:AppName) stopped: $($_.Exception.Message)" }
 
+if ($Screenshots) {
+    Remove-Item -LiteralPath $script:SettingsPath -ErrorAction SilentlyContinue
+    $made = @(Get-ChildItem -LiteralPath $script:ShotFolder -Filter '*.png' | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) })
+    Write-Host "$($made.Count) screenshot(s) in $($script:ShotFolder)" -ForegroundColor Green
+    exit 0
+}
 if ($SmokeTest) {
     $problems = Get-GLSmokeVerdict
     Remove-Item -LiteralPath $script:SettingsPath -ErrorAction SilentlyContinue

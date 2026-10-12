@@ -1,31 +1,36 @@
-<img src="assets/icon-256.png" width="96" align="right" alt="">
+<p align="center"><img src="assets/icon-256.png" width="112" alt="GatewayLens"></p>
 
-# GatewayLens
+<h1 align="center">GatewayLens</h1>
 
-### The missing admin console for Power BI and Fabric data gateways
+<p align="center"><b>The missing admin console for Power BI and Fabric data gateways.</b><br>
+Hundreds of gateway connections? Do in minutes what takes days in the portal.</p>
 
-**Hundreds of gateway connections? Do in minutes what takes days in the portal.**
+<p align="center">
+  <a href="../../releases/latest"><b>Download GatewayLens.exe</b></a> &nbsp;|&nbsp;
+  <a href="#try-it-in-two-minutes"><b>Try the demo in two minutes</b></a> &nbsp;|&nbsp;
+  <a href="#what-it-does"><b>See everything it does</b></a>
+</p>
 
-- A service account password changed? **Update every connection that uses it in one run** - and see straight away which ones work.
-- Someone leaving? **Move all their access** - every connection, every gateway, the same roles - to their successor.
-- A gateway cluster filling up? **Find the connections nobody has used for months**, and the duplicates, before you hit Microsoft's limit of 1,000.
-- Need to know what is down? **A live wall of every gateway cluster**, on any screen.
+<p align="center">
+  <img src="https://img.shields.io/github/v/release/lukas-novacek/GatewayLens" alt="release">
+  <img src="https://img.shields.io/github/downloads/lukas-novacek/GatewayLens/total" alt="downloads">
+  <img src="https://github.com/lukas-novacek/GatewayLens/actions/workflows/tests.yml/badge.svg" alt="tests">
+  <img src="https://img.shields.io/badge/licence-MIT-blue" alt="licence">
+</p>
 
-Free and open source. One exe, nothing installed on the gateways, signs in as you.
+![The gateway wall: every cluster at a glance, problems first](assets/screenshot-gateways.png)
 
-**[Download GatewayLens.exe](../../releases/latest)** - **[Try the demo in two minutes](#try-it-in-two-minutes)** - **[See everything it does](#what-it-does)**
+- **A service account password changed?** Update every connection that uses it in
+  one run - and see straight away which ones work.
+- **Someone leaving?** Move all their access - every connection, every gateway, the
+  same roles - to their successor.
+- **Access nobody can see?** Find the roles still held by accounts that were deleted
+  from Microsoft Entra ID. The portal hides them; GatewayLens lists them.
+- **A cluster filling up?** Find the connections nobody has used for months, and the
+  duplicates, before you hit Microsoft's limit of 1,000.
+- **What is down right now?** A live wall of every gateway cluster, on any screen.
 
-![release](https://img.shields.io/github/v/release/lukas-novacek/GatewayLens)
-![downloads](https://img.shields.io/github/downloads/lukas-novacek/GatewayLens/total)
-![tests](https://github.com/lukas-novacek/GatewayLens/actions/workflows/tests.yml/badge.svg)
-![licence](https://img.shields.io/badge/licence-MIT-blue)
-
-<!-- Screenshots and a short GIF sell this more than any text. Take them in demo mode
-(.\GatewayLens.ps1 -Demo) - Contoso is fictional, so nothing real is shown. Save them
-as docs/gateways.png, docs/connections.png and docs/demo.gif, then uncomment:
-![The gateway wall](docs/gateways.png)
-![Connections, filtered by the account in their credentials](docs/connections.png)
--->
+Free and open source. One exe, nothing to install on the gateways, signs in as you.
 
 ## Built for big tenants
 
@@ -42,6 +47,40 @@ time. GatewayLens does the same work in bulk, safely:
 | **Make room on a cluster** | Check connections one by one | Connections counted per cluster against the 1,000 limit; *not used for 90 days*, *no use recorded*, *duplicates*, *failing* - then delete, with a backup written first |
 | **Is every gateway up, current and supported?** | Open each gateway | One coloured tile per cluster, a kiosk mode for a wall screen, versions checked against Microsoft's list of supported releases |
 | **What changed, and who did it?** | - | Every change is recorded the moment it happens: who, when, what, and the result |
+| **Who still has access after leaving?** | Not shown - the portal leaves deleted accounts out | *Access by accounts not in Entra ID* lists every connection they can still use |
+
+## See it
+
+**Find any connection** - by who has access, the account in its credentials, the
+server or database - and see who can use it, by name.
+
+![Connections, filtered, with who has access to the selected one](assets/screenshot-connections.png)
+
+**Test hundreds at once** - every result in the log as it comes, in colour, with the
+gateway's own reason for each failure.
+
+![Verify status: the results in the log, failures in red](assets/screenshot-verify-status.png)
+
+**Find what the portal hides** - roles still held by accounts deleted from Microsoft
+Entra ID.
+
+![Access by accounts not in Entra ID](assets/screenshot-deleted-accounts.png)
+
+**A wall screen** - the kiosk view: full screen, nothing that changes anything,
+refreshing every minute.
+
+![The kiosk view](assets/screenshot-kiosk.png)
+
+<details>
+<summary>More: the start page, and the light theme</summary>
+
+![The start page: sign in, or try the demo](assets/screenshot-start.png)
+
+![The gateway wall in the light theme](assets/screenshot-gateways-light.png)
+
+</details>
+
+Every picture is the built-in demo - Contoso is fictional.
 
 ## What it does
 
@@ -71,6 +110,8 @@ time. GatewayLens does the same work in bulk, safely:
 Filters you can combine, which the portal does not have:
 - **who has access** - one person, a group, anyone whose name or email contains a
   word. Fabric gives only object ids; GatewayLens shows the names, from Microsoft Graph
+- **access by accounts that no longer exist** - deleted from Microsoft Entra ID, but
+  still holding their roles
 - **the account stored in the credentials** - every connection that uses `svc_sales`
 - **the server, database or path** - several values at once: `sql01; sql02; ora-prd`
 - gateway, connectivity, type, and whether the connection's gateway is online
@@ -113,6 +154,8 @@ ones to remove:
 - **Duplicates** - the same gateway, type, path and account, side by side
 - **Failing tests** - after Verify status
 - **Skip test connection on** - connections whose test always passes
+- **Access by accounts not in Entra ID** - roles still held by deleted accounts,
+  which the portal does not show
 
 Connection recency is also in the connections export and the access report: when
 each connection was created, last linked to an item, and last used at run time.
@@ -157,6 +200,9 @@ Unblock-File .\GatewayLens.ps1      # allow the downloaded script to run
 .\GatewayLens.ps1 -SelfTest         # what works for your account - read-only, changes nothing
 .\GatewayLens.ps1                   # the console
 ```
+
+It opens on a start page: sign in when you are ready - with an admin account, if
+you keep one - or try the demo first.
 
 Run the self-test first - `GatewayLens.exe -SelfTest` works too. It signs you in,
 calls every API once and reports what your account can and cannot do, so a missing
@@ -256,8 +302,9 @@ format byte for byte.
 
 ## Log, change record and look
 
-- The **log panel** says what happens as it happens: every item of a bulk run with
-  its result, how long each load took, what the list shows after a filter changes.
+- The **log panel** says what happens as it happens, in colour - green done, amber
+  warnings, red failures: every item of a bulk run with its result, how long each
+  load took, what the list shows after a filter changes.
   It filters by text or level, and copies or saves what it shows. Everything in it
   also goes to a daily log file, kept for 30 days. The change record is kept for good.
 - Both live in `%LOCALAPPDATA%\GatewayLens\logs` - **Open folder** takes you there.
@@ -265,7 +312,11 @@ format byte for byte.
   place; each person writes only to files with their own name in them.
 - **Themes**: Light, Dark, Midnight and Contrast. **Text size**: A- and A+, Ctrl + mouse
   wheel, or Ctrl + plus and minus - Ctrl + 0 goes back to the default. Rows and tiles
-  follow the text size, and rows stay compact, so more of a long list fits on the screen. The
+  follow the text size, and rows stay compact, so more of a long list fits on the screen.
+  Drag the grips between the panels to give the list or the actions more room - the
+  sizes are kept.
+- **Help is one click away**: the **?** button (or F1) - the guide, what each action
+  needs, what is new, and where to report a problem. The
   search and name boxes remember their last 20 entries; password boxes never do.
 
 ## Questions
@@ -282,6 +333,11 @@ you, and the gateways are only reached through Microsoft's APIs.
 same as the portal. See [What you will see](#what-you-will-see).
 
 **Will it wake up my VNet gateways?** Not unless you untick *Skip VNet status*.
+
+**Why does GatewayLens list more people than the portal?** The portal leaves out
+accounts that were deleted from Microsoft Entra ID - but they still hold their role
+on the gateway or connection. GatewayLens shows them, marked *Not in Microsoft Entra
+ID*, so you can remove them.
 
 **Does it send my data anywhere?** Only to Microsoft's APIs, which it needs to do its
 job, and it reads two public Microsoft pages for the newest gateway version. There is
@@ -332,6 +388,7 @@ GatewayLens is made by **Lukas Novacek**. <!-- one line about you: what you do, 
 ```powershell
 .\tests\Run-Tests.ps1          # the test suite - no tenant, no sign-in
 .\build\Build-Exe.ps1          # builds dist\GatewayLens.exe (needs the .NET SDK)
+.\GatewayLens.ps1 -Screenshots assets   # the pictures in this README, from the demo
 ```
 
 The tests replace every call to Microsoft with a stand-in, so they run on every push

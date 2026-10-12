@@ -27,7 +27,9 @@ it publicly.
 
 ## 2. Read-only: the window
 
-- [ ] `.\GatewayLens.ps1` - signs in, and the gateways and connections load.
+- [ ] `.\GatewayLens.ps1` (or the exe) - the start page opens. *Sign in* opens the
+      browser, the page waits, and the gateways and connections load. Close the
+      browser tab half way once: the page says so, and *Sign in* works again.
 - [ ] **Gateways tab:** every cluster you expect is there, and none is personal-mode.
       Online, degraded and offline match the portal.
 - [ ] Versions: the banner names the newest build, and *Update available* and
@@ -36,7 +38,9 @@ it publicly.
 - [ ] VNet tiles say *Not checked, so it is not woken up* - and a sleeping VNet
       gateway stays asleep.
 - [ ] Each tile counts its connections. Compare one cluster with the portal.
-- [ ] **Gateway access:** select a tile - the access list shows names and emails, not ids.
+- [ ] **Gateway access:** select a tile - the access list shows names and emails. An id
+      marked *Not in Microsoft Entra ID* should be a deleted account: look it up in
+      the Entra admin center (Users, search by object id) to be sure.
 - [ ] **Text size** (Ctrl + mouse wheel): the tiles grow and shrink with the text.
 - [ ] **Kiosk view** (F11) on a second screen; Esc leaves it. Auto-refresh is back to
       what it was afterwards.
@@ -48,7 +52,13 @@ it publicly.
 - [ ] *Refresh connections* - while it loads, the change buttons are greyed out.
 - [ ] Recency: compare *LastUsed* on two or three connections with the portal.
 - [ ] **Show:** each view - *Last used over 90 days ago*, *No use recorded*,
-      *Duplicates*, *Skip test connection on*, *Failing tests* (after step 3).
+      *Duplicates*, *Skip test connection on*, *Access by accounts not in Entra ID*,
+      *Failing tests* (after step 3).
+- [ ] *UserNames* shows emails, not ids, and the *User* filter finds a colleague by
+      their display name.
+- [ ] Pick an entry from a search box's history, delete the text, pick it again.
+- [ ] Drag the grips to resize the panels; close and start again - they keep the size.
+- [ ] The log is in colour and follows Ctrl + mouse wheel. **?** opens the help menu.
 - [ ] **Export CSV**, and **Access report...** - with and without the User filter.
       Both open cleanly in Excel, accents included.
 

@@ -116,6 +116,12 @@ $trap = foreach ($line in (($text + "`n" + (Get-Content $PSCommandPath -Raw)) -s
 }
 Assert (-not $trap) "no array-returning function is piped or wrapped directly - in the script or the tests ($($commaFns.Count) checked) $(if ($trap) { '- ' + ($trap -join ' | ') })"
 
+# "@(, @(a), @(b))" on one line wraps the first row once more - the leading comma binds
+# tighter than the list - and a menu built that way lost its first item. Rows on one
+# line are written "@(@(a), @(b))"; the leading comma is for a single row, or one per line.
+$wrapRows = @(($text -split "`n") | Where-Object { $_ -match '@\(\s*,\s*@\(.*?\)\s*,\s*@\(' -and $_ -notmatch 'deliberate-trap' } | ForEach-Object { $_.Trim() })
+Assert ($wrapRows.Count -eq 0) "no list of rows on one line starts with a comma - it wraps the first row $(if ($wrapRows.Count) { '- ' + ($wrapRows -join ' | ') })"
+
 # Every function a background worker calls must be handed to the worker - a missing
 # one only fails when the button is pressed, on a real tenant.
 $wf = $null
@@ -138,8 +144,19 @@ $workCalls  = foreach ($b in $workBlocks) { [regex]::Matches($b, '\b([A-Z][a-z]+
 $notGiven   = @($workCalls | Sort-Object -Unique | Where-Object { $wf -notcontains $_ })
 Assert ($workBlocks.Count -gt 5 -and -not $notGiven) "every function used in a background job is given to the workers ($($workBlocks.Count) jobs checked) $(if ($notGiven) { '- missing: ' + ($notGiven -join ', ') })"
 
-$hereStrings = [regex]::Matches($text, "(?s)\`$script:(MainXaml|DialogXaml|PromptXaml|ModernStylesXaml|ClassicStylesXaml) = @'\r?\n(.*?)\r?\n'@")
-Assert ($hereStrings.Count -eq 5) 'all five XAML blocks found (three windows, two style sets)'
+# The start page runs on a thread of its own: every function it calls, and every one
+# those call, must be handed to it - or the page fails only when it opens.
+$spf = @()
+$m = [regex]::Match($text, "\`$script:StartPageFunctions = @\((.*?)\)")
+if ($m.Success) { $spf = @([regex]::Matches($m.Groups[1].Value, "'([A-Za-z-]+)'") | ForEach-Object { $_.Groups[1].Value }) }
+$spBlock = $defs['Get-GLStartPageScript'].Body
+$spNeed = @($spBlock.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ -and $defs.ContainsKey($_) })
+foreach ($f in $spf) { if ($defs.ContainsKey($f)) { $spNeed += @($defs[$f].Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ -and $defs.ContainsKey($_) }) } }
+$spMissing = @($spNeed | Sort-Object -Unique | Where-Object { $spf -notcontains $_ })
+Assert ($spf.Count -ge 4 -and -not $spMissing) "every function the start page calls is given to its thread $(if ($spMissing) { '- missing: ' + ($spMissing -join ', ') })"
+
+$hereStrings = [regex]::Matches($text, "(?s)\`$script:(MainXaml|StartXaml|InfoXaml|DialogXaml|PromptXaml|ModernStylesXaml|ClassicStylesXaml) = @'\r?\n(.*?)\r?\n'@")
+Assert ($hereStrings.Count -eq 7 -and $hereStrings[0].Groups[1].Value -eq 'MainXaml') 'all seven XAML blocks found (five windows, two style sets), the main window first'
 foreach ($m in $hereStrings) {
     $ok = $true
     try { [void][xml]$m.Groups[2].Value } catch { $ok = $false }
@@ -162,6 +179,7 @@ $changelog = Join-Path $root 'CHANGELOG.md'
 if (Test-Path $changelog) {
     Assert ((Get-Content $changelog -Raw) -match "\[$([regex]::Escape($version))\]") "CHANGELOG.md has an entry for $version"
 }
+Assert ($script:WhatsNew.Version -eq $version -and @($script:WhatsNew.Lines).Count -ge 3) "the What is new window is about $version, not an older release"
 # PowerShell names ignore case: a job with param($I) that loops with $i overwrites its
 # own input - which is how Verify status and Verify users tested nothing at all.
 $shadow = foreach ($b in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ScriptBlockAst] -and $n.ParamBlock -and $n.Parent }, $true)) {
@@ -520,6 +538,16 @@ $st.Theme = 'Dark'; $st.FontSize = 14
 Assert (Save-GLSettings -Settings $st -Path $sp) 'settings are saved, creating the folder'
 $rt = Read-GLSettings -Path $sp
 Assert ($rt.Theme -eq 'Dark' -and $rt.FontSize -eq 14 -and ((Get-GLHistory -Settings $rt -Field 'TxtCnSearch') -join ',') -eq 'SQL01,ora01') 'and read back intact'
+# the panel sizes and the last account are kept; nonsense in the file is left out
+$lay = New-GLDefaultSettings
+$lay.Layout = [ordered]@{ LogHeight = 220; ActionsWidth = 610 }
+$lay.LastAccount = 'jane@contoso.com'; $lay.SeenVersion = '0.7.0'
+$null = Save-GLSettings -Settings $lay -Path $sp
+$lr = Read-GLSettings -Path $sp
+Assert ($lr.Layout.LogHeight -eq 220 -and $lr.Layout.ActionsWidth -eq 610 -and $lr.LastAccount -eq 'jane@contoso.com' -and $lr.SeenVersion -eq '0.7.0') 'panel sizes, the last account and the last version seen are read back'
+Set-Content -LiteralPath $sp -Value '{"Layout":{"LogHeight":"wide","ActionsWidth":99999,"Bad Name":5},"LastAccount":"not an email"}'
+$lb = Read-GLSettings -Path $sp
+Assert ($lb.Layout.Count -eq 0 -and $lb.LastAccount -eq '') 'sizes that make no sense, and an account that is no email, are left out'
 Assert (-not ((Get-Content $sp -Raw) -match 'hunter2')) 'the saved file contains no password'
 
 Set-Content -Path $sp -Value '{ this is not json'
@@ -760,7 +788,7 @@ $o1 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'OK'; Detail 
 $o2 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'OK'; Detail = '' }) -SkipTest $true -Name 'Sandbox'
 $o3 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'Failed'; Detail = 'Login failed' }) -SkipTest $true -Name 'HR'
 $o4 = ConvertTo-GLTestOutcome -Result ([pscustomobject]@{ Status = 'Timeout'; Detail = '' }) -SkipTest $false -Name 'Slow'
-Assert ($o1.Status -eq 'OK' -and $o1.Level -eq 'Info' -and $o1.Text -eq '    Sales: OK') 'a working connection: OK'
+Assert ($o1.Status -eq 'OK' -and $o1.Level -eq 'Ok' -and $o1.Text -eq '    Sales: OK') 'a working connection: OK'
 Assert ($o2.Status -eq 'Unverified' -and $o2.Level -eq 'Warn' -and $o2.Text -match 'not verified' -and $o2.Detail -match 'Skip test connection') 'Skip test connection on: an OK is Unverified - the gateway may not have tried'
 Assert ($o3.Status -eq 'Failed' -and $o3.Level -eq 'Error' -and $o3.Text -match 'failed - Login failed') 'a failure stays a failure, with its reason, whatever the flag'
 Assert ($o4.Status -eq 'Timeout' -and $o4.Text -match 'did not answer') 'no answer in time says so'
@@ -1385,6 +1413,25 @@ Add-GLDirectoryInfo -Rows $crow -Directory (Get-GLDatasourceDirectory -PbiToken 
 $byN  = @{}; foreach ($r in $crow) { $byN[$r.Name] = $r }
 $hr   = $byN['HR Core']
 Assert ($crow.Count -eq 27 -and $hr.Gateway -eq 'Contoso Prod Cluster' -and $hr.Account -eq 'CONTOSO\svc_hr') 'connections come with gateway names and the account in their credentials'
+# the directory gives only object ids, like a real tenant - the names come from Graph
+$ddir   = Get-GLDatasourceDirectory -PbiToken $T
+$dids   = Get-GLDirectoryPrincipalIds -Directory $ddir
+$dnames = Get-GLPrincipalNames -Ids $dids -GraphToken $T
+$tomKey = ([string]$s.Deleted[0].id).ToLowerInvariant()
+$janeU  = $s.Users[1]
+Assert ($dids.Count -ge 5 -and $dnames[$tomKey].Missing -and -not $dnames[([string]$janeU.id).ToLowerInvariant()].Missing) "an id Graph answers for but does not know is remembered as not in Entra ID ($($dids.Count) ids)"
+Add-GLDirectoryInfo -Rows $crow -Directory $ddir -Names $dnames
+$sdw = $byN['Sales DW']; $apa = $byN['AP Archive']
+Assert ($sdw.UserNames -match [regex]::Escape($janeU.userPrincipalName) -and $sdw.UserNames -notmatch '[0-9a-f]{8}-[0-9a-f]{4}') "the users column shows emails, not ids ($($sdw.UserNames))"
+Assert ($apa.UnknownUsers -eq 1 -and $apa.UserNames -match 'not in Entra ID' -and $sdw.UnknownUsers -eq 0) 'a deleted account that still has access is marked as not in Entra ID'
+$byDisplay = Select-GLConnections -Rows $crow -User $janeU.displayName
+Assert (@($byDisplay | Where-Object Name -eq 'Sales DW').Count -eq 1) "the User filter finds people by their display name too ('$($janeU.displayName)')"
+$orphans = Select-GLConnections -Rows $crow -Show 'Access by accounts not in Entra ID' -IncludeCloud
+Assert ((@($orphans | ForEach-Object Name | Sort-Object) -join ',') -eq 'AP Archive,Treasury Oracle') "Show > Access by accounts not in Entra ID lists the connections a deleted account can still use ($(@($orphans | ForEach-Object Name) -join ', '))"
+$apaRoles = Get-GLRoleAssignments -Kind connections -Id $apa.Id -FabricToken $T
+$apaRows  = ConvertTo-GLRoleRows -Assignments $apaRoles -Names $dnames
+$goneRow  = @($apaRows | Where-Object NotInEntra)
+Assert ($goneRow.Count -eq 1 -and $goneRow[0].Principal -eq 'Not in Microsoft Entra ID' -and $goneRow[0].Detail -match 'portal' -and (Format-GLAccessList $apaRows) -match 'not in Entra ID \(Owner\)') 'the access panel and the log say who is not in Entra ID, and that the portal leaves them out'
 $idle  = @($crow | Where-Object { $_.UnusedDays -gt 30 })
 $never = @($crow | Where-Object { -not $_.LastUsed })
 Assert (@($crow | Where-Object Created).Count -eq 27 -and $idle.Count -ge 2 -and $never.Count -ge 2) "the demo has connection recency: all created, $($idle.Count) idle for over a month, $($never.Count) never used"
@@ -1566,7 +1613,7 @@ foreach ($name in $script:Themes.Keys) {
     $miss = @($brushesUsed | Where-Object { -not $script:Themes[$name].Contains($_) })
     Assert (-not $miss) "theme '$name' defines all $($brushesUsed.Count) brushes the windows use $(if ($miss) { '- missing: ' + ($miss -join ', ') })"
 }
-$windowsXaml = $xamlBy.MainXaml + $xamlBy.DialogXaml + $xamlBy.PromptXaml
+$windowsXaml = $xamlBy.MainXaml + $xamlBy.StartXaml + $xamlBy.InfoXaml + $xamlBy.DialogXaml + $xamlBy.PromptXaml
 $asked = @([regex]::Matches($windowsXaml, 'Style="\{DynamicResource (\w+)\}"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 foreach ($set in 'ModernStylesXaml', 'ClassicStylesXaml') {
     $have = @([regex]::Matches($xamlBy[$set], 'x:Key="(\w+)"') | ForEach-Object { $_.Groups[1].Value })
@@ -1651,7 +1698,8 @@ Assert ($newObj.Count -eq 0) "no New-Object in the script - it wraps objects, an
 $keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
 $keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
 $script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
-$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true }
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true }
+$keepStart = $script:StartPageResult; $script:StartPageResult = 'Demo'
 $keepTiles = $script:State.Tiles
 $script:State.GatewayRows = @(1..5); $script:State.ConnRows = @(1..27)
 $script:State.Tiles = @('Offline', 'Degraded', 'Online', 'Online', 'VNet' | ForEach-Object { [pscustomobject]@{ Status = $_ } })
@@ -1670,6 +1718,12 @@ Assert (((Get-GLSmokeVerdict) -join ' ') -match 'kiosk view') 'smoke verdict: a 
 $script:Smoke.KioskOk = $true; $script:Smoke.GridChecks = 'a cell wrote its text back into the row'
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'grids: a cell wrote') 'smoke verdict: a grid that sorts, opens or copies wrongly fails'
 $script:Smoke.GridChecks = ''
+$script:StartPageResult = 'Fallback'
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'start page') 'smoke verdict: a start page that did not open, or whose demo button did nothing, fails'
+$script:StartPageResult = 'Demo'
+$script:Smoke.HistoryOk = $false
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'remembered entry') 'smoke verdict: a remembered entry that cannot be picked again fails'
+$script:Smoke.HistoryOk = $true
 $script:Smoke.FilterOk = $false
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'search box') 'smoke verdict: a search box that does not filter fails'
 $script:Smoke.FilterOk = $true
@@ -1678,7 +1732,7 @@ Assert (((Get-GLSmokeVerdict) -join ' ') -match 'tiles at text size 16') 'smoke 
 $script:Smoke.TileScale = 16 / 12
 $script:Smoke.KioskOk = $true; $script:State.Releases = $null
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'newest gateway version') 'smoke verdict: the newest gateway version not read fails'
-$script:StyleMode = $keepStyle; $script:StyleError = $keepErr; $script:Smoke = $keepSmoke; $script:LogEntries.Clear()
+$script:StyleMode = $keepStyle; $script:StyleError = $keepErr; $script:Smoke = $keepSmoke; $script:StartPageResult = $keepStart; $script:LogEntries.Clear()
 $script:State.GatewayRows = $keepRows.G; $script:State.ConnRows = $keepRows.C; $script:State.Changes = $keepRows.A; $script:State.Tiles = $keepTiles; $script:State.Releases = $keepReleases
 
 if ($IsWindows -and -not $env:GATEWAYLENS_NO_WINDOW_TEST) {
@@ -1935,10 +1989,10 @@ $pwBox | Add-Member -MemberType ScriptMethod -Name Clear -Value { $this.Password
 $script:UI.PwdCred           = $pwBox
 $script:UI.CmbCredEncryption = [pscustomobject]@{ SelectedItem = 'Keep current' }
 $script:UI.ChkCredRetest     = [pscustomobject]@{ IsChecked = $true }
-$logBox = [pscustomobject]@{ Text = '' }
-$logBox | Add-Member -MemberType ScriptMethod -Name AppendText -Value { param($x) $this.Text += $x }
-$logBox | Add-Member -MemberType ScriptMethod -Name ScrollToEnd -Value { }
-$script:UI.TxtLog = $logBox
+$script:UI.LstLog = [pscustomobject]@{ ItemsSource = $null }    # the log list, as far as Write-GLLog needs one
+$script:LogEntries.Clear()
+$logBox = [pscustomobject]@{}
+$logBox | Add-Member -MemberType ScriptProperty -Name Text -Value { (@($script:LogEntries | ForEach-Object Line) -join "`n") + "`n" }
 $script:State.PublicKeys = @{}
 foreach ($g in $cdw.Gateways) { if ($g.publicKey) { $script:State.PublicKeys[([string]$g.id).ToLowerInvariant()] = $g.publicKey } }
 Invoke-GLBulkCredentialsUi 6>$null
