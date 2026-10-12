@@ -274,7 +274,29 @@ Assert ((Get-GLToken Fabric) -eq 'tok-https://api.fabric.microsoft.com' -and (Ge
 Assert ($null -eq (Get-GLToken Graph)) 'Az.Accounts without Graph: no token - name lookups fall back to object ids'
 $secure = ConvertTo-SecureString 'plain-token' -AsPlainText -Force
 Assert ((ConvertFrom-GLToken $secure) -eq 'plain-token' -and (ConvertFrom-GLToken 'already-text') -eq 'already-text') 'a token is text whichever form Az.Accounts uses'
-foreach ($f in 'Import-Module', 'Connect-AzAccount', 'Get-AzContext', 'Get-AzAccessToken') { Remove-Item "function:$f" }
+# started from GatewayLens.exe there is no console window for the Windows broker
+function Update-AzConfig {
+    param($EnableLoginByWam, $LoginExperienceV2, $Scope)
+    if ($null -ne $EnableLoginByWam) { $script:AzCalls.Add("config wam=$EnableLoginByWam scope=$Scope") }
+    if ($null -ne $LoginExperienceV2) { $script:AzCalls.Add("config picker=$LoginExperienceV2 scope=$Scope") }
+}
+$script:AzCalls.Clear()
+Connect-GL -NoWindow
+Assert (($script:AzCalls -join '|') -match 'config wam=False scope=Process\|config picker=Off scope=Process\|connect') 'without a console window, Az.Accounts signs in through the browser and asks no subscription question - for this process only, before signing in'
+$script:AzCalls.Clear()
+$script:BrokerFails = 1
+function Connect-AzAccount {
+    param($TenantId, [switch]$UseDeviceAuthentication, $AccountId)
+    $script:AzCalls.Add('connect')
+    if ($script:BrokerFails-- -gt 0) { throw 'InteractiveBrowserCredential authentication failed: A window handle must be configured.' }
+}
+Connect-GL
+Assert (($script:AzCalls -join '|') -eq 'import Az.Accounts|connect|config wam=False scope=Process|connect' -and $script:AuthMode -eq 'Az.Accounts') "the broker failing for want of a window: the browser gets one more try ($($script:AzCalls -join ', '))"
+$script:BrokerFails = 1
+function Connect-AzAccount { param($TenantId, [switch]$UseDeviceAuthentication, $AccountId) throw 'AADSTS50126: Invalid username or password.' }
+$err = ''; try { Connect-GL } catch { $err = $_.Exception.Message }
+Assert ($err -match 'AADSTS50126') 'any other sign-in error is not retried - it is shown as it is'
+foreach ($f in 'Import-Module', 'Connect-AzAccount', 'Get-AzContext', 'Get-AzAccessToken', 'Update-AzConfig') { Remove-Item "function:$f" }
 $script:AzInstalled = $false
 
 # ---- the built-in sign-in, with Entra replaced by a stand-in ----

@@ -4,6 +4,19 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-10-12
+
+### Fixed
+- **GatewayLens.exe could not sign in with Az.Accounts**: "A window handle must be
+  configured". Az.Accounts signs in through the Windows account broker, which needs a
+  window to show its dialog on, and the exe hides the console. Without a console
+  window GatewayLens now has Az.Accounts sign in through the browser - for its own
+  process only, the user's Az setting is left as it is - and if the broker fails that
+  way anyway, the browser gets one more try. Without a console it also skips the
+  subscription question Az.Accounts asks after signing in, which would otherwise
+  wait for an answer no one can give. The script, started from a console, keeps
+  using the broker.
+
 ## [0.6.0] - 2026-10-12
 
 ### Changed

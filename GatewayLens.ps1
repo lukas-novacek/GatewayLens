@@ -130,7 +130,7 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.6.0'
+$script:AppVersion = '0.6.1'
 
 $script:GatewayRoles    = @('Admin', 'ConnectionCreator', 'ConnectionCreatorWithResharing')
 $script:ConnectionRoles = @('Owner', 'User', 'UserWithReshare')
@@ -3075,14 +3075,37 @@ function Connect-GLDeviceCode {
     throw 'The device code expired before sign-in finished. Start GatewayLens again to get a new one.'
 }
 
+function Disable-GLAzBroker {
+    # Az.Accounts signs in through the Windows account broker (WAM), which needs a
+    # window to show its dialog on. -NoPicker also skips the subscription and tenant
+    # question Az.Accounts asks in the console after signing in - with no console,
+    # it would wait for an answer forever. This process only: the user's own Az
+    # settings are left as they are. Versions without a setting do not need it.
+    param([switch]$NoPicker)
+    try { $null = Update-AzConfig -EnableLoginByWam $false -Scope Process -ErrorAction Stop -WarningAction SilentlyContinue } catch { }
+    if ($NoPicker) {
+        try { $null = Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction Stop -WarningAction SilentlyContinue } catch { }
+    }
+}
+
 function Connect-GLAz {
-    param([string]$TenantId, [switch]$DeviceCode, [string]$Account)
+    # -NoWindow: started from GatewayLens.exe, there is no console window for the
+    # broker, which then fails with "A window handle must be configured" - so the
+    # browser signs in instead. Should the broker fail that way anyway, the browser
+    # gets one more try.
+    param([string]$TenantId, [switch]$DeviceCode, [string]$Account, [switch]$NoWindow)
     Import-Module Az.Accounts -ErrorAction Stop
+    if ($NoWindow) { Disable-GLAzBroker -NoPicker }
     $p = @{ ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
     if ($TenantId)   { $p.TenantId = $TenantId }
     if ($DeviceCode) { $p.UseDeviceAuthentication = $true }
     if ($Account)    { $p.AccountId = $Account }
-    $null = Connect-AzAccount @p
+    try { $null = Connect-AzAccount @p }
+    catch {
+        if ($_.Exception.Message -notmatch 'window handle') { throw }
+        Disable-GLAzBroker
+        $null = Connect-AzAccount @p
+    }
     $ctx = Get-AzContext
     $script:SignedInAs  = [string]$ctx.Account.Id
     $script:TenantShown = [string]$ctx.Tenant.Id
@@ -3092,11 +3115,11 @@ function Connect-GLAz {
 
 function Connect-GL {
     [CmdletBinding()]
-    param([string]$TenantId, [switch]$DeviceCode, [string]$ClientId, [string]$Account, [string]$SignIn = 'Auto')
+    param([string]$TenantId, [switch]$DeviceCode, [string]$ClientId, [string]$Account, [string]$SignIn = 'Auto', [switch]$NoWindow)
 
     $how = Select-GLSignIn -Requested $SignIn -ClientId $ClientId -BuiltInId $script:BuiltInClientId -AzAvailable (Test-GLAzAccounts)
     if ($how -eq 'Az') {
-        Connect-GLAz -TenantId $TenantId -DeviceCode:$DeviceCode -Account $Account
+        Connect-GLAz -TenantId $TenantId -DeviceCode:$DeviceCode -Account $Account -NoWindow:$NoWindow
         return
     }
 
@@ -6269,7 +6292,9 @@ if ($Demo) {
 else {
     try {
         Write-Host "Signing in..." -ForegroundColor Cyan
-        Connect-GL -TenantId $TenantId -DeviceCode:$DeviceCode -ClientId $ClientId -Account $Account -SignIn $SignIn
+        # GatewayLens.exe hides the console unless -SelfTest, -Inspect or -DeviceCode needs it
+        $noWindow = $Launched -and -not ($SelfTest -or $Inspect -or $DeviceCode)
+        Connect-GL -TenantId $TenantId -DeviceCode:$DeviceCode -ClientId $ClientId -Account $Account -SignIn $SignIn -NoWindow:$noWindow
         Write-Host "Signed in as $($script:SignedInAs) via $($script:AuthMode)." -ForegroundColor Green
     }
     catch {
