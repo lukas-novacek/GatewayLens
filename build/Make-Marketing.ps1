@@ -226,7 +226,8 @@ foreach ($c in @(
     [System.Windows.Controls.Canvas]::SetTop($b, $c.Y)
     $null = $cards.Children.Add($b)
 }
-foreach ($chip in 'Bulk credentials', 'Hand over access', 'Deleted-account access', 'Live gateway wall', 'Teams alerts') {
+# the jobs admins do every week, the biggest time-saver first
+foreach ($chip in 'Bulk credential updates', 'Bulk access grants', 'Access migration', 'Live gateway monitoring', 'Offline alerts', 'Access audit') {
     $b = [System.Windows.Controls.Border]::new()
     $b.CornerRadius = [System.Windows.CornerRadius]::new(19)
     $b.Padding = [System.Windows.Thickness]::new(16, 6, 16, 7)
