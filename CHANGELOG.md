@@ -4,6 +4,39 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-10-13
+
+### Added
+- **Cleanup for the 1,000 limit.** Microsoft allows 1,000 data sources on a gateway
+  cluster; GatewayLens now says what could make room, from Microsoft's connection
+  recency:
+  - a **Cleanup** column with the reason: *not used for 212 days*, *no use recorded
+    since it was made on 2026-02-01*, or *a copy of 'Sales DW', which was used on
+    2026-10-12*
+  - **Show > Cleanup candidates** - what can go now: not used for more than four
+    months (120 days, so a quarterly refresh is never mistaken for unused), or never
+    used since it was made. Nothing made or linked to an item in the last 30 days
+    can go, and a connection without recency data never can. A copy that is still in
+    use is *merge first*, never *can go*: the copy used most recently stays.
+- **What counts as a copy is stricter** - in *Show > Duplicates* too: the same
+  gateway, type, path and account, and the same credential type, single sign-on,
+  privacy level and encryption. The same path with other credentials is often on
+  purpose, and a connection whose account is not known is never called a copy.
+  - every **tile** says how many could go - "940 of 1,000 connections - 312 unused" -
+    and right-click > **List the unused connections** jumps straight to them
+  - **Cleanup report...** - a page to forward and print, with how full each cluster
+    is now and after cleanup, how recently its connections were used, what can go
+    and why, the copies to merge first, and **who to ask**: each owner with theirs,
+    read fresh from Fabric. A table next to it, for Excel or a mail merge. The page
+    needs nothing from the network and runs no script.
+- **Right-click on connections**: *Verify status of the selected* and *Verify users of
+  the selected*. Both only read, so the selection is enough.
+
+### Changed
+- The README and `docs/sign-in.md` say what works today: Az.Accounts, or your
+  organisation's own app registration with `-ClientId`. The built-in app
+  registration - nothing to install - is not published yet.
+
 ## [0.9.0] - 2026-10-12
 
 ### Added

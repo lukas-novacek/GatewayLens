@@ -173,9 +173,71 @@ if (Test-Path -LiteralPath $manifest) {
     $tour = Join-Path $assets 'screenshot-tour.png'
     [GlApng]::Write([string[]]@($files), [int[]]@($frames | ForEach-Object { [int]$_.Delay }), $tour)
     Write-Host ("Tour: {0} frames, {1:N1} MB -> {2}" -f @($files).Count, ((Get-Item $tour).Length / 1MB), $tour) -ForegroundColor Green
-    Remove-Item -LiteralPath $frameDir -Recurse -Force
+    Remove-Item -LiteralPath $frameDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 else { Write-Host 'No tour frames found - run without -SkipScreenshots first.' -ForegroundColor Yellow }
+
+# ---- 2b. the cleanup report, on a tenant the size the report is made for
+# The demo has a few dozen connections - its clusters look empty against 1,000.
+# This is a larger Contoso, made up here, put through the app's own report.
+$edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") |
+    Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if ($edge) {
+    $rng  = [System.Random]::new(7)
+    $now  = Get-Date
+    $fmt  = { param($d) $d.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
+    $what = 'Sales DW', 'HR Core', 'Finance Budget', 'Supply Chain', 'Customer 360', 'Marketing Files', 'Inventory', 'Treasury', 'Payroll', 'Logistics', 'Pricing', 'Service Desk'
+    $kind = 'SQL', 'SQL', 'SQL', 'Oracle', 'File', 'SharePoint'
+    $people = 'jane.doe@contoso.com', 'joe.smith@contoso.com', 'ana.novak@contoso.com', 'bi-admins@contoso.com', 'finance-analysts@contoso.com', 'li.wei@contoso.com', 'omar.haddad@contoso.com'
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $counts = @{}
+    $n = 0
+    foreach ($c in @(@('Contoso EMEA Cluster', 1000), @('Contoso Prod Cluster', 968), @('Contoso Finance Cluster', 641), @('Contoso Sales Cluster', 412), @('Contoso Test Cluster', 187))) {
+        $gid = 'cluster-' + ($c[0] -replace '\W', '').ToLowerInvariant()
+        $counts[$gid] = $c[1]
+        for ($i = 1; $i -le $c[1]; $i++) {
+            $n++
+            $made = $now.AddDays(-$rng.Next(200, 1100)).AddMinutes(-$rng.Next(0, 1440))
+            $roll = $rng.NextDouble()
+            $used = if ($roll -lt 0.52) { $now.AddDays(-$rng.Next(0, 30)) } elseif ($roll -lt 0.64) { $now.AddDays(-$rng.Next(31, 120)) }
+                    elseif ($roll -lt 0.75) { $now.AddDays(-$rng.Next(121, 365)) } elseif ($roll -lt 0.84) { $now.AddDays(-$rng.Next(366, 700)) }
+                    elseif ($roll -lt 0.97) { $null } else { 'none' }
+            $base = $what[$rng.Next(0, $what.Count)]
+            $path = 'sql{0:000}.contoso.local;{1}' -f $rng.Next(1, 400), ($base -replace '\W', '').ToLowerInvariant()
+            $type = $kind[$rng.Next(0, $kind.Count)]
+            # a few copies of the one before - the duplicates a big tenant collects
+            if ($rng.NextDouble() -lt 0.04 -and $rows.Count) {
+                $twin = $rows[$rows.Count - 1]
+                if ($twin.GatewayId -eq $gid) { $path = $twin.Path; $base = $twin.Name -replace ' \d+$', ''; $type = $twin.Type }
+            }
+            $noData = ($used -eq 'none')
+            $u = if ($noData -or $null -eq $used) { $null } else { $used }
+            $rows.Add([pscustomobject]@{
+                Name = "$base $i"; Connectivity = 'OnPremisesGateway'; Gateway = $c[0]; GatewayId = $gid; Type = $type
+                Path = $path; Account = 'CONTOSO\svc_' + ($base -replace '\W', '').ToLowerInvariant()
+                Created = $(if ($noData) { '' } else { & $fmt $made }); LastLinked = $(if ($noData) { '' } else { & $fmt $made.AddDays(2) })
+                LastUsed = $(if ($u) { & $fmt $u } else { '' }); UnusedDays = $(if ($u) { [int][math]::Floor(($now - $u).TotalDays) } else { $null })
+                Id = "c$n"; Users = [string]$rng.Next(1, 9); Cleanup = ''; CanGo = $false
+            })
+        }
+    }
+    Set-GLCleanupReasons -Rows $rows -Now $now
+    $owners = @{}
+    foreach ($r in @($rows | Where-Object { $_.Cleanup })) { $owners[$r.Id] = @($people[$rng.Next(0, $people.Count)]) }
+    $reportDir = Join-Path ([System.IO.Path]::GetTempPath()) ('gatewaylens-report-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $reportDir -Force
+    $report = Join-Path $reportDir 'cleanup-report.html'
+    $null = Save-GLCleanupReport -Path $report -Rows $rows -Owners $owners -Counts $counts -NoOpen `
+        -Meta @{ Version = $script:AppVersion; Who = 'demo.user@contoso.com'; Tenant = 'contoso.example'; When = $now }
+    $shotFile = Join-Path $assets 'screenshot-cleanup-report.png'
+    # one quoted line: a temp folder can have a space in it, and Start-Process does not quote
+    $argLine = "--headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=1 `"--user-data-dir=$(Join-Path $reportDir 'edge')`" " +
+               "--window-size=1280,1240 `"--screenshot=$shotFile`" `"$(([Uri]::new($report)).AbsoluteUri)`""
+    $null = Start-Process -FilePath $edge -PassThru -Wait -WindowStyle Hidden -ArgumentList $argLine
+    if (Test-Path -LiteralPath $shotFile) { Write-Host "Cleanup report -> $shotFile" -ForegroundColor Green } else { Write-Host 'Edge did not draw the cleanup report.' -ForegroundColor Yellow }
+    Remove-Item -LiteralPath $reportDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+else { Write-Host 'No Edge to draw the cleanup report with.' -ForegroundColor Yellow }
 
 # ---- 3. the social preview: what a shared link shows
 $xaml = @'
@@ -227,7 +289,7 @@ foreach ($c in @(
     $null = $cards.Children.Add($b)
 }
 # the jobs admins do every week, the biggest time-saver first
-foreach ($chip in 'Bulk credential updates', 'Bulk access grants', 'Access migration', 'Live gateway monitoring', 'Offline alerts', 'Access audit') {
+foreach ($chip in 'Bulk credential updates', 'Bulk access grants', 'Access migration', 'Cleanup for the 1,000 limit', 'Live gateway monitoring', 'Offline alerts') {
     $b = [System.Windows.Controls.Border]::new()
     $b.CornerRadius = [System.Windows.CornerRadius]::new(19)
     $b.Padding = [System.Windows.Thickness]::new(16, 6, 16, 7)

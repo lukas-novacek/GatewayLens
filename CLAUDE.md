@@ -103,7 +103,8 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
 14. **Bulk runs act on every listed row**, never on the selection, one item at a
     time, and can be cancelled. Delete always writes a backup first and refuses
     without one. The one exception: Enable and Disable act on the selected members
-    of one cluster - a handful, each named in the confirmation.
+    of one cluster - a handful, each named in the confirmation. What only reads -
+    Verify status, Verify users - may act on the selection, from the right-click menu.
 15. **Demo mode must answer every endpoint the app calls.** A new API call needs a
     route in `Invoke-GLDemoHttp` and a demo test.
 16. **WPF events bubble.** `SelectionChanged` on the tab control also fires for every
@@ -152,6 +153,10 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
 29. **Alerts never stop a refresh, and never alert on one check.** `Get-GLAlertEvents`
     needs two checks in a row, and a refresh of one cluster leaves the others' counts
     alone. An alert that fails to go out is logged as a warning.
+31. **"Can go" comes from recency, and only from rules in `Get-GLCleanupRules`.**
+    Nothing made or linked in the grace days, nothing without recency data, and no
+    copy still in use is ever a candidate. The tiles, the view and the report all
+    read the same CanGo - never their own idea of it.
 30. **The tests have their own variables.** `$ast`, `$text`, `$root`, `$s` and others
     belong to the suite: a test that reuses one breaks the checks after it. Give a
     test's variables names of their own.

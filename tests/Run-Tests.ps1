@@ -828,7 +828,12 @@ Assert ($v.Count -eq 1 -and $v[0].Id -eq 'D3') 'no use recorded: gateway connect
 $v = Select-GLConnections -Rows $cl -Show 'Duplicates'
 Assert ((($v | ForEach-Object Id) -join ',') -eq 'D1,D2') 'duplicates: same gateway, type, path and account, whatever the case or spaces - side by side'
 $v = Select-GLConnections -Rows $cl -Show 'Duplicates' -IncludeCloud
-Assert ($v.Count -eq 4) 'duplicates among cloud connections too, when they are included'
+Assert ($v.Count -eq 2) 'two cloud connections to the same address, accounts unknown, are not called copies - the same path with other credentials is often on purpose'
+$dupSame  = [pscustomobject]@{ GatewayId = 'G1'; Type = 'SQL'; Path = 'srv;db'; Account = 'svc'; Credential = 'Basic';   SingleSignOn = 'None'; Privacy = 'Organizational'; Encryption = 'Encrypted' }
+$dupOther = [pscustomobject]@{ GatewayId = 'G1'; Type = 'SQL'; Path = 'srv;db'; Account = 'svc'; Credential = 'Windows'; SingleSignOn = 'None'; Privacy = 'Organizational'; Encryption = 'Encrypted' }
+$dupSso   = [pscustomobject]@{ GatewayId = 'G1'; Type = 'SQL'; Path = 'srv;db'; Account = 'svc'; Credential = 'Basic';   SingleSignOn = 'Kerberos'; Privacy = 'Organizational'; Encryption = 'Encrypted' }
+$dupNone  = [pscustomobject]@{ GatewayId = 'G1'; Type = 'SQL'; Path = 'srv;db'; Account = '';    Credential = 'Basic';   SingleSignOn = 'None'; Privacy = 'Organizational'; Encryption = 'Encrypted' }
+Assert ((Get-GLDuplicateKey $dupSame) -and (Get-GLDuplicateKey $dupSame) -ne (Get-GLDuplicateKey $dupOther) -and (Get-GLDuplicateKey $dupSame) -ne (Get-GLDuplicateKey $dupSso) -and -not (Get-GLDuplicateKey $dupNone)) 'a copy signs in the same way: another credential type or single sign-on is not a copy, and an unknown account is never one'
 $v = Select-GLConnections -Rows $cl -Show 'Failing tests'
 Assert ((($v | ForEach-Object Id) -join ',') -eq 'D2,D3') 'failing tests: failed or did not answer'
 $v = Select-GLConnections -Rows $cl -Show 'All connections'
@@ -1122,6 +1127,59 @@ Assert ((Get-GLGatewayState 'n/a')   -eq 'Unknown') 'gateway state: no live stat
 
 $txt = Format-GLClusterText -GatewayName 'Cluster A' -MemberRows @([pscustomobject]@{ Member = 'n1'; Machine = 'H1'; Version = '1'; Enabled = $true; Status = 'Live' })
 Assert ($txt -eq "Cluster A`tn1`tH1`t1`tTrue`tLive") 'copied cluster text is tab-separated, one line per member'
+
+# ============================================================================
+Section 'Cleanup - what can go before the 1,000 limit'
+# ============================================================================
+$cuNow = Get-Date '2026-10-12 12:00'
+$cuRow = {
+    param([string]$Name, [string]$Made, [string]$Linked, [string]$Used, [string]$Path)
+    $ud = if ($Used) { [int][math]::Floor(($cuNow - [datetime]::ParseExact($Used, 'yyyy-MM-dd HH:mm', $null)).TotalDays) } else { $null }
+    [pscustomobject]@{ Name = $Name; Connectivity = 'OnPremisesGateway'; Gateway = 'Gateway 1'; GatewayId = 'G1'; Type = 'SQL'; Path = $Path; Account = 'svc'
+                       Created = $Made; LastLinked = $Linked; LastUsed = $Used; UnusedDays = $ud; Id = "id-$Name"; Users = '2'; Cleanup = ''; CanGo = $false }
+}
+$cuRows = @(
+    (& $cuRow 'old'      '2025-01-01 08:00' '2025-01-02 08:00' '2026-05-01 08:00' 'a')
+    (& $cuRow 'quarter'  '2025-01-01 08:00' '2025-01-02 08:00' '2026-07-15 08:00' 'b')
+    (& $cuRow 'never'    '2026-01-01 08:00' '2026-01-02 08:00' ''                 'c')
+    (& $cuRow 'newbie'   '2026-10-01 08:00' ''                 ''                 'd')
+    (& $cuRow 'relinked' '2025-01-01 08:00' '2026-10-10 08:00' '2026-01-01 08:00' 'e')
+    (& $cuRow 'nodata'   ''                 ''                 ''                 'f')
+    (& $cuRow 'copyA'    '2025-01-01 08:00' '2025-01-02 08:00' '2026-10-11 08:00' 'g')
+    (& $cuRow 'copyB'    '2025-02-01 08:00' '2025-02-02 08:00' '2026-10-05 08:00' 'g')
+    (& $cuRow 'copyC'    '2025-03-01 08:00' '2025-03-02 08:00' '2026-02-01 08:00' 'g')
+)
+$cuCloud = [pscustomobject]@{ Name = 'cloud'; Connectivity = 'ShareableCloud'; GatewayId = ''; Type = 'Web'; Path = 'x'; Account = ''; Created = '2024-01-01 08:00'; LastLinked = ''; LastUsed = '2024-02-01 08:00'; UnusedDays = 900; Id = 'id-cloud'; Cleanup = ''; CanGo = $false }
+Set-GLCleanupReasons -Rows (@($cuRows) + @($cuCloud)) -Now $cuNow
+$cuBy = @{}; foreach ($r in $cuRows) { $cuBy[$r.Name] = $r }
+Assert ($cuBy.old.CanGo -and $cuBy.old.Cleanup -eq 'not used for 164 days') "not used for more than four months: it can go, and the column says why ($($cuBy.old.Cleanup))"
+Assert (-not $cuBy.quarter.CanGo -and -not $cuBy.quarter.Cleanup) 'used 89 days ago - a quarterly refresh - stays'
+Assert ($cuBy.never.CanGo -and $cuBy.never.Cleanup -eq 'no use recorded since it was made on 2026-01-01') 'never used since it was made, months ago: it can go'
+Assert (-not $cuBy.newbie.CanGo -and -not $cuBy.relinked.CanGo -and -not $cuBy.nodata.CanGo) 'made or linked to an item in the last 30 days, or no recency data at all: never a candidate'
+Assert (-not $cuBy.copyA.Cleanup -and -not $cuBy.copyB.CanGo -and $cuBy.copyB.Cleanup -match "a copy of 'copyA', which was used on 2026-10-11 - point its items at that one") "duplicates: the copy used most recently stays; a copy still in use is merged first, never 'can go' ($($cuBy.copyB.Cleanup))"
+Assert ($cuBy.copyC.CanGo -and $cuBy.copyC.Cleanup -match "^not used for 253 days - a copy of 'copyA'") 'an unused copy can go, and says what it copies'
+Assert (-not $cuCloud.CanGo -and -not $cuCloud.Cleanup) 'cloud connections are left out - the limit is per gateway cluster'
+$cuView = Select-GLConnections -Rows $cuRows -Show 'Cleanup candidates'
+Assert ((@($cuView | ForEach-Object Name | Sort-Object) -join ',') -eq 'copyC,never,old') "Show > Cleanup candidates lists exactly what can go ($(@($cuView | ForEach-Object Name) -join ', '))"
+$cuCounts = Get-GLCleanupCounts -Rows $cuRows
+Assert ($cuCounts['g1'] -eq 3) 'the tiles count what can go on each gateway'
+$cuSum = Get-GLCleanupSummary -Rows $cuRows -Counts @{ g1 = 940 }
+$cuB = $cuSum[0].Buckets
+Assert ($cuSum.Count -eq 1 -and $cuSum[0].Total -eq 940 -and $cuSum[0].CanGo -eq 3 -and $cuSum[0].Merge -eq 1 -and $cuSum[0].After -eq 937 -and
+        $cuB.Recent -eq 2 -and $cuB.Months -eq 1 -and $cuB.Year -eq 3 -and $cuB.Older -eq 0 -and $cuB.Never -eq 2 -and $cuB.NoData -eq 1) 'each cluster: how full, what can go, and how recently its connections were used'
+$cuOwners = @{ 'id-old' = @('jane@contoso.com'); 'id-never' = @('<b>sneaky</b>'); 'id-copyC' = @('jane@contoso.com'); 'id-copyB' = @('ana@contoso.com') }
+$cuHtml = ConvertTo-GLCleanupHtml -Summary $cuSum -Rows $cuRows -Owners $cuOwners -Meta @{ Version = '9.9.9'; Who = 'demo.user@contoso.com'; Tenant = 'contoso.example'; When = $cuNow }
+Assert ($cuHtml -match 'Room on each cluster' -and $cuHtml -match 'How recently connections were used' -and $cuHtml -match 'Gateway 1</b> - 3 can go' -and $cuHtml -match 'Near the limit' -and $cuHtml -match 'Merge first' -and $cuHtml -match 'Who to ask') 'the report: room on each cluster, recency, what can go, what to merge, whom to ask'
+Assert ($cuHtml -match '&lt;b&gt;sneaky&lt;/b&gt;' -and $cuHtml -notmatch '<b>sneaky</b>') 'every name from the tenant is HTML-encoded in the report'
+Assert ($cuHtml -match 'jane@contoso\.com</td><td class="num">2</td>') 'whom to ask: each owner with how many of theirs can go'
+Assert ($cuHtml -notmatch 'https?://(?!www\.w3\.org)' -and $cuHtml -notmatch '<script') 'the report loads nothing from anywhere and runs no script'
+$cuCsv = ConvertTo-GLCleanupCsvRows -Rows $cuRows -Owners $cuOwners
+Assert ($cuCsv.Count -eq 4 -and @($cuCsv | Where-Object Action -eq 'Merge first').Count -eq 1 -and ($cuCsv | Where-Object Connection -eq 'old').Owners -eq 'jane@contoso.com') 'the table: one row per connection to clean up, with its owners'
+$cuFile = Join-Path ([System.IO.Path]::GetTempPath()) ('gl-cleanup-' + [guid]::NewGuid().ToString('N') + '.html')
+$cuRes = Save-GLCleanupReport -Path $cuFile -Rows $cuRows -Owners $cuOwners -Counts @{ g1 = 940 } -Meta @{ Version = '9.9.9'; Who = 'x'; When = $cuNow } -NoOpen
+$cuBytes = [System.IO.File]::ReadAllBytes($cuRes.Csv)
+Assert ((Test-Path $cuRes.Html) -and $cuBytes[0] -eq 0xEF -and $cuBytes[1] -eq 0xBB -and $cuRes.CanGo -eq 3 -and $cuRes.Merge -eq 1) 'saved side by side: the page, and the table with a BOM for Excel'
+Remove-Item -LiteralPath $cuRes.Html, $cuRes.Csv -ErrorAction SilentlyContinue
 
 # ============================================================================
 Section 'Progress and the meter'
@@ -1494,6 +1552,9 @@ Add-GLDirectoryInfo -Rows $crow -Directory (Get-GLDatasourceDirectory -PbiToken 
 $byN  = @{}; foreach ($r in $crow) { $byN[$r.Name] = $r }
 $hr   = $byN['HR Core']
 Assert ($crow.Count -eq 27 -and $hr.Gateway -eq 'Contoso Prod Cluster' -and $hr.Account -eq 'CONTOSO\svc_hr') 'connections come with gateway names and the account in their credentials'
+Set-GLCleanupReasons -Rows $crow
+$cuTiles = ConvertTo-GLGatewayTiles -Rows $grow -Members $gd.Members -DownSince @{} -VnetSkipped -Live $gd.Live -ConnectionCounts (Get-GLConnectionCounts -Rows $crow) -CleanupCounts (Get-GLCleanupCounts -Rows $crow)
+Assert (@($crow | Where-Object CanGo).Count -ge 2 -and @($cuTiles | Where-Object { $_.ConnectionsText -match '\d unused$' }).Count -ge 1) "the demo has connections that can go, and a tile says how many ($(@($crow | Where-Object CanGo).Count))"
 # the directory gives only object ids, like a real tenant - the names come from Graph
 $ddir   = Get-GLDatasourceDirectory -PbiToken $T
 $dids   = Get-GLDirectoryPrincipalIds -Directory $ddir
@@ -1832,7 +1893,7 @@ $script:AuthMode = $keepReset.Mode; $script:TenantShown = $keepReset.Tenant; $sc
 $keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
 $keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
 $script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
-$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true; GoneOk = $true; CountdownOk = $true; AgainOk = $true; AlertsOk = $true; TaskbarOk = $true; MeterOk = $true }
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true; GoneOk = $true; CountdownOk = $true; AgainOk = $true; AlertsOk = $true; TaskbarOk = $true; MeterOk = $true; CleanupOk = $true; MenuOk = $true }
 $keepStart = $script:StartPageResult; $script:StartPageResult = 'Demo'
 $keepTiles = $script:State.Tiles
 $script:State.GatewayRows = @(1..5); $script:State.ConnRows = @(1..27)
@@ -1852,7 +1913,7 @@ Assert (((Get-GLSmokeVerdict) -join ' ') -match 'kiosk view') 'smoke verdict: a 
 $script:Smoke.KioskOk = $true; $script:Smoke.GridChecks = 'a cell wrote its text back into the row'
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'grids: a cell wrote') 'smoke verdict: a grid that sorts, opens or copies wrongly fails'
 $script:Smoke.GridChecks = ''
-foreach ($k in 'GoneOk', 'CountdownOk', 'AgainOk', 'AlertsOk', 'TaskbarOk', 'MeterOk') {
+foreach ($k in 'GoneOk', 'CountdownOk', 'AgainOk', 'AlertsOk', 'TaskbarOk', 'MeterOk', 'CleanupOk', 'MenuOk') {
     $script:Smoke[$k] = $false
     Assert ((Get-GLSmokeVerdict).Count -ge 1) "smoke verdict: $k false fails"
     $script:Smoke[$k] = $true

@@ -137,12 +137,14 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.9.0'
+$script:AppVersion = '0.10.0'
 # What is new, in a few lines for the window - shown once after an update. The full
 # list is CHANGELOG.md. The tests check that it is about the current version.
 $script:WhatsNew = @{
-    Version = '0.9.0'
+    Version = '0.10.0'
     Lines   = @(
+        'Make room before a gateway cluster reaches 1,000: every tile says how many connections are unused, Show > Cleanup candidates lists them with the reason, and Cleanup report... makes a page for the owners.'
+        'Right-click connections to verify the status or the users of just the selected ones.'
         'Alerts when a gateway member goes down, and when it is back: a Windows notification, a sound, or a message in Teams or a Power Automate flow. Off until you turn them on - Alerts on the Gateways tab.'
         'The taskbar button turns yellow while a gateway is degraded, red while one is offline.'
         'The status bar says what is loading and how far it is, and shows what GatewayLens uses - CPU, memory, workers, calls to Microsoft.'
@@ -894,7 +896,7 @@ function ConvertTo-GLGatewayTiles {
         come first - offline, then degraded, then no status - so they are seen first.
     #>
     param($Rows, [hashtable]$Members, [hashtable]$DownSince, [datetime]$Now = (Get-Date), [switch]$VnetSkipped, [hashtable]$Live, $Releases,
-          [hashtable]$ConnectionCounts, [int]$ConnectionLimit = 1000)
+          [hashtable]$ConnectionCounts, [int]$ConnectionLimit = 1000, [hashtable]$CleanupCounts)
     $parse = { param($v) $p = $null; if ([version]::TryParse([string]$v, [ref]$p)) { $p } }
     $inv   = [System.Globalization.CultureInfo]::InvariantCulture
     $countOf = { param($Row) if ($ConnectionCounts) { [int]$ConnectionCounts[([string]$Row.Id).ToLowerInvariant()] } else { 0 } }
@@ -938,6 +940,9 @@ function ConvertTo-GLGatewayTiles {
         $connText = if (-not $ConnectionCounts) { '' }
                     elseif ($r.Type -eq 'VirtualNetwork') { "$n connection$(if ($n -ne 1) { 's' })" }
                     else { [string]::Format($inv, '{0:N0} of {1:N0} connections', $n, $ConnectionLimit) }
+        # what could make room - "312 unused" - from the connections' recency
+        $unused = if ($CleanupCounts) { [int]$CleanupCounts[([string]$r.Id).ToLowerInvariant()] } else { 0 }
+        if ($connText -and $unused -and $r.Type -ne 'VirtualNetwork') { $connText += [string]::Format($inv, ' - {0:N0} unused', $unused) }
         $badge = if ($limitBadge -eq 'AT CONNECTION LIMIT') { $limitBadge }
                  elseif ($infos | Where-Object State -eq 'Unsupported') { 'UNSUPPORTED VERSION' }
                  elseif ($limitBadge) { $limitBadge }
@@ -1105,6 +1110,211 @@ function ConvertTo-GLAccessReportRows {
     return , $rows.ToArray()
 }
 
+function Get-GLCleanupSummary {
+    # Per cluster: how full it is, what can go, and how recently its connections were used.
+    param($Rows, [hashtable]$Counts, [int]$Limit = (Get-GLCleanupRules).Limit)
+    $groups = @($Rows | Where-Object { $_ -and $_.GatewayId -and $_.Connectivity -ne 'ShareableCloud' } | Group-Object { ([string]$_.GatewayId).ToLowerInvariant() })
+    $out = foreach ($g in $groups) {
+        $rs = @($g.Group)
+        $total = $rs.Count
+        if ($Counts -and $Counts.ContainsKey($g.Name)) { $total = [Math]::Max([int]$Counts[$g.Name], $rs.Count) }
+        $b = [ordered]@{ Recent = 0; Months = 0; Year = 0; Older = 0; Never = 0; NoData = 0 }
+        foreach ($r in $rs) {
+            $k = if (-not $r.Created -and -not $r.LastUsed) { 'NoData' } elseif (-not $r.LastUsed) { 'Never' }
+                 elseif ([int]$r.UnusedDays -le 30) { 'Recent' } elseif ([int]$r.UnusedDays -le 120) { 'Months' }
+                 elseif ([int]$r.UnusedDays -le 365) { 'Year' } else { 'Older' }
+            $b[$k] = [int]$b[$k] + 1
+        }
+        $go = @($rs | Where-Object { $_.CanGo }).Count
+        [pscustomobject]@{
+            ClusterId = $g.Name; Cluster = [string]$rs[0].Gateway; Total = $total; Listed = $rs.Count
+            CanGo = $go; Merge = @($rs | Where-Object { $_.Cleanup -and -not $_.CanGo }).Count; After = $total - $go; Limit = $Limit; Buckets = $b
+        }
+    }
+    return , @($out | Sort-Object @{ Expression = 'Total'; Descending = $true }, Cluster)
+}
+
+function Get-GLOwnerLabels {
+    # Who owns each connection, as people read it - an email, a name, or that the account is gone.
+    param([hashtable]$Assignments, [hashtable]$Names)
+    $out = @{}
+    if (-not $Assignments) { return $out }
+    foreach ($k in $Assignments.Keys) {
+        $list = $Assignments[$k]
+        if ($null -eq $list) { $out[$k] = @('(could not be read)'); continue }
+        $out[$k] = @($list | Where-Object { [string]$_.role -eq 'Owner' } | ForEach-Object {
+            $l = Get-GLPrincipalLabel -Principal $_.principal -Names $Names
+            if ($l.Missing) { "$($l.Name) [$($_.principal.id)]" } elseif ($l.Email) { $l.Email } else { $l.Name }
+        })
+    }
+    return $out
+}
+
+function ConvertTo-GLCleanupCsvRows {
+    # One row per connection that could go, with its owners - for Excel, or a mail merge.
+    param($Rows, [hashtable]$Owners)
+    $out = foreach ($r in @($Rows | Where-Object { $_ -and $_.Cleanup })) {
+        [pscustomobject][ordered]@{
+            Cluster = [string]$r.Gateway; Connection = [string]$r.Name
+            Action = $(if ($r.CanGo) { 'Can go' } else { 'Merge first' }); Why = [string]$r.Cleanup
+            Type = [string]$r.Type; Path = [string]$r.Path; Account = [string]$r.Account
+            Created = [string]$r.Created; LastLinked = [string]$r.LastLinked; LastUsed = [string]$r.LastUsed; UnusedDays = $r.UnusedDays
+            Owners = $(if ($Owners -and $Owners[[string]$r.Id]) { @($Owners[[string]$r.Id]) -join '; ' } else { '' })
+            Users = [string]$r.Users; ConnectionId = [string]$r.Id
+        }
+    }
+    return , @($out)
+}
+
+function ConvertTo-GLCleanupHtml {
+    <#
+        The cleanup report as one page that needs nothing from anywhere: how full each
+        cluster is and what can go, how recently its connections were used, what can
+        go now, the copies to merge first, and whom to ask. Light and dark follow the
+        reader's system; it prints light. Every name from the tenant is HTML-encoded.
+    #>
+    param($Summary, $Rows, [hashtable]$Owners, [hashtable]$Meta)
+    $inv  = [System.Globalization.CultureInfo]::InvariantCulture
+    $h    = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+    $num  = { param($v) ([long]$v).ToString('N0', $inv) }
+    $pct  = { param($Part, $Whole) if ($Whole -le 0) { '0' } else { ([Math]::Round(100.0 * $Part / $Whole, 2)).ToString($inv) } }
+    $own  = { param($id) if ($Owners -and $Owners[[string]$id]) { (@($Owners[[string]$id]) -join ', ') } else { '' } }
+    $rule = Get-GLCleanupRules
+    $sum  = @($Summary | Where-Object { $_ })
+    $all  = @($Rows | Where-Object { $_ })
+    $go   = @($all | Where-Object { $_.CanGo })
+    $merge = @($all | Where-Object { $_.Cleanup -and -not $_.CanGo })
+    $near = @($sum | Where-Object { $_.Total -ge [Math]::Ceiling($_.Limit * 0.8) }).Count
+    $when = ([datetime]$Meta.When).ToString('d MMMM yyyy, HH:mm', $inv)
+    $limit = & $num $rule.Limit
+    $sb = [System.Text.StringBuilder]::new()
+    $null = $sb.Append('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">')
+    $null = $sb.Append("<title>Gateway cleanup report - $(& $h $when)</title><style>$($script:CleanupReportCss)</style></head><body><main>")
+    $tenant = if ($Meta.Tenant) { " in $(& $h $Meta.Tenant)" } else { '' }
+    $null = $sb.Append("<header><h1>Gateway cleanup report</h1><p class=`"sub`">$(& $num $all.Count) gateway connections on $(& $num $sum.Count) clusters, as $(& $h $Meta.Who) sees them$tenant - $(& $h $when). Made with GatewayLens $(& $h $Meta.Version).</p></header>")
+
+    # the four numbers first
+    $tile = { param($Label, $Value, $Hint) "<div class=`"kpi`"><div class=`"label`">$Label</div><div class=`"value`">$Value</div><div class=`"hint`">$Hint</div></div>" }
+    $null = $sb.Append('<section class="kpis">')
+    $null = $sb.Append((& $tile 'Gateway connections' (& $num $all.Count) "on $(& $num $sum.Count) cluster(s)"))
+    $null = $sb.Append((& $tile 'Can go now' (& $num $go.Count) "not used for $($rule.UnusedDays) days, or never"))
+    $null = $sb.Append((& $tile 'Merge first' (& $num $merge.Count) 'copies still in use'))
+    $null = $sb.Append((& $tile 'Clusters near the limit' (& $num $near) "$(& $num ([Math]::Ceiling($rule.Limit * 0.8))) or more of $limit"))
+    $null = $sb.Append('</section>')
+
+    # room on each cluster: one bar, the whole of it the limit
+    $null = $sb.Append("<section class=`"card`"><h2>Room on each cluster</h2><p class=`"note`">Microsoft allows $limit data sources on a gateway cluster - each bar is the whole $limit.</p>")
+    $null = $sb.Append('<div class="legend"><span><i class="sw stays"></i>Stays</span><span><i class="sw go"></i>Can go</span></div>')
+    $null = $sb.Append("<table><thead><tr><th>Cluster</th><th class=`"barcol`">Of $limit</th><th class=`"num`">Connections</th><th class=`"num`">Can go</th><th class=`"num`">After cleanup</th><th></th></tr></thead><tbody>")
+    foreach ($c in $sum) {
+        $stay  = [Math]::Max(0, $c.Total - $c.CanGo)
+        $wStay = & $pct ([Math]::Min($stay, $c.Limit)) $c.Limit
+        $wGo   = & $pct ([Math]::Min($c.CanGo, [Math]::Max(0, $c.Limit - $stay))) $c.Limit
+        $segs  = ''
+        if ($stay) { $segs += "<span class=`"seg stays$(if (-not $c.CanGo) { ' end' })`" style=`"width:$wStay%`" title=`"$(& $h $c.Cluster): $(& $num $stay) stay`"></span>" }
+        if ($c.CanGo) { $segs += "<span class=`"seg go end`" style=`"width:$wGo%`" title=`"$(& $h $c.Cluster): $(& $num $c.CanGo) can go`"></span>" }
+        $status = if ($c.Total -ge $c.Limit) { '<span class="status crit"><i>&#9632;</i>At the limit</span>' }
+                  elseif ($c.Total -ge [Math]::Ceiling($c.Limit * 0.8)) { '<span class="status warn"><i>&#9650;</i>Near the limit</span>' } else { '' }
+        $null = $sb.Append("<tr><td>$(& $h $c.Cluster)</td><td class=`"barcol`"><div class=`"track`"><div class=`"fill`">$segs</div></div></td><td class=`"num`">$(& $num $c.Total)</td><td class=`"num`">$(& $num $c.CanGo)</td><td class=`"num`">$(& $num $c.After)</td><td>$status</td></tr>")
+    }
+    $null = $sb.Append('</tbody></table></section>')
+
+    # how recently: the share of each cluster's connections, oldest use darkest
+    $keys = @(
+        , @('Recent', 'r1', 'Used in the last 30 days')
+        , @('Months', 'r2', '31 to 120 days ago')
+        , @('Year', 'r3', '121 to 365 days ago')
+        , @('Older', 'r4', 'Over a year ago')
+        , @('Never', 'r5', 'No use recorded')
+        , @('NoData', 'nodata', 'No recency data')
+    )
+    $null = $sb.Append('<section class="card"><h2>How recently connections were used</h2><p class="note">As Microsoft records it: connection recency, a preview in Fabric, recorded since spring 2026.</p><div class="legend">')
+    foreach ($k in $keys) { $null = $sb.Append("<span><i class=`"sw $($k[1])`"></i>$($k[2])</span>") }
+    $null = $sb.Append('</div><table><thead><tr><th>Cluster</th><th class="barcol">Its connections</th><th class="num">30 days</th><th class="num">31-120</th><th class="num">121-365</th><th class="num">Over a year</th><th class="num">Never</th><th class="num">No data</th></tr></thead><tbody>')
+    foreach ($c in $sum) {
+        $shown = @($keys | Where-Object { [int]$c.Buckets[$_[0]] -gt 0 })
+        $segs = ''
+        for ($i = 0; $i -lt $shown.Count; $i++) {
+            $k = $shown[$i]; $v = [int]$c.Buckets[$k[0]]
+            $segs += "<span class=`"seg $($k[1])$(if ($i -eq $shown.Count - 1) { ' end' })`" style=`"width:$(& $pct $v $c.Listed)%`" title=`"$(& $h $c.Cluster) - $($k[2]): $(& $num $v)`"></span>"
+        }
+        $cells = (@($keys | ForEach-Object { "<td class=`"num`">$(& $num ([int]$c.Buckets[$_[0]]))</td>" }) -join '')
+        $null = $sb.Append("<tr><td>$(& $h $c.Cluster)</td><td class=`"barcol`"><div class=`"fill`">$segs</div></td>$cells</tr>")
+    }
+    $null = $sb.Append('</tbody></table></section>')
+
+    # what can go, cluster by cluster
+    $null = $sb.Append("<section class=`"card`"><h2>Can go now</h2><p class=`"note`">Not used for more than $($rule.UnusedDays) days, or never used since it was made - and neither made nor linked to an item in the last $($rule.GraceDays) days. Ask the owners first: a deleted connection breaks whatever still points to it. GatewayLens writes a backup before it deletes anything.</p>")
+    $first = $true
+    foreach ($c in $sum) {
+        $mine = @($go | Where-Object { ([string]$_.GatewayId).ToLowerInvariant() -eq $c.ClusterId } | Sort-Object @{ Expression = { if ($null -eq $_.UnusedDays) { [int]::MaxValue } else { [int]$_.UnusedDays } }; Descending = $true }, Name)
+        if ($mine.Count -eq 0) { continue }
+        $null = $sb.Append("<details$(if ($first) { ' open' })><summary><b>$(& $h $c.Cluster)</b> - $(& $num $mine.Count) can go</summary><table><thead><tr><th>Connection</th><th>Type</th><th>Server or path</th><th>Account</th><th>Made</th><th>Last used</th><th>Why</th><th>Owners</th></tr></thead><tbody>")
+        foreach ($r in $mine) {
+            $last = if ($r.LastUsed) { ([string]$r.LastUsed).Substring(0, 10) } else { '<span class="muted">never</span>' }
+            $made = if ($r.Created) { ([string]$r.Created).Substring(0, 10) } else { '' }
+            $null = $sb.Append("<tr><td>$(& $h $r.Name)</td><td>$(& $h $r.Type)</td><td>$(& $h $r.Path)</td><td>$(& $h $r.Account)</td><td class=`"num`">$made</td><td class=`"num`">$last</td><td class=`"why`">$(& $h $r.Cleanup)</td><td>$(& $h (& $own $r.Id))</td></tr>")
+        }
+        $null = $sb.Append('</tbody></table></details>')
+        $first = $false
+    }
+    if ($go.Count -eq 0) { $null = $sb.Append("<p>Nothing can go: every connection here was used in the last $($rule.UnusedDays) days, or is new.</p>") }
+    $null = $sb.Append('</section>')
+
+    if ($merge.Count) {
+        $null = $sb.Append('<section class="card"><h2>Merge first</h2><p class="note">Copies of another connection that are still in use - the same gateway, path and account, and the same sign-in settings. The same path with other credentials is never counted as a copy. Point their items at the copy that stays, then they can go too.</p>')
+        $null = $sb.Append('<table><thead><tr><th>Connection</th><th>Cluster</th><th>Last used</th><th>Why</th><th>Owners</th></tr></thead><tbody>')
+        foreach ($r in @($merge | Sort-Object Gateway, Name)) {
+            $last = if ($r.LastUsed) { ([string]$r.LastUsed).Substring(0, 10) } else { '<span class="muted">never</span>' }
+            $null = $sb.Append("<tr><td>$(& $h $r.Name)</td><td>$(& $h $r.Gateway)</td><td class=`"num`">$last</td><td class=`"why`">$(& $h $r.Cleanup)</td><td>$(& $h (& $own $r.Id))</td></tr>")
+        }
+        $null = $sb.Append('</tbody></table></section>')
+    }
+
+    # whom to ask: each owner, with theirs
+    $byOwner = @{}
+    foreach ($r in @($go) + @($merge)) {
+        $who = @(if ($Owners -and $Owners[[string]$r.Id]) { $Owners[[string]$r.Id] })
+        if ($who.Count -eq 0) { $who = @('(no owner read)') }
+        foreach ($o in $who) {
+            if (-not $byOwner.ContainsKey($o)) { $byOwner[$o] = [pscustomobject]@{ Owner = $o; Go = [System.Collections.Generic.List[string]]::new(); Merge = [System.Collections.Generic.List[string]]::new() } }
+            if ($r.CanGo) { $byOwner[$o].Go.Add([string]$r.Name) } else { $byOwner[$o].Merge.Add([string]$r.Name) }
+        }
+    }
+    if ($byOwner.Count) {
+        $null = $sb.Append('<section class="card"><h2>Who to ask</h2><p class="note">The owners of the connections above, so each one hears about theirs. The table file next to this page has a row per connection, with its owners - for a mail merge.</p>')
+        $null = $sb.Append('<table><thead><tr><th>Owner</th><th class="num">Can go</th><th class="num">Merge first</th><th>Connections</th></tr></thead><tbody>')
+        foreach ($o in @($byOwner.Values | Sort-Object @{ Expression = { $_.Go.Count + $_.Merge.Count }; Descending = $true }, Owner)) {
+            $names = @($o.Go) + @($o.Merge)
+            $list = (@($names | Select-Object -First 12 | ForEach-Object { & $h $_ }) -join ', ')
+            if ($names.Count -gt 12) { $list += " <span class=`"muted`">and $(& $num ($names.Count - 12)) more</span>" }
+            $null = $sb.Append("<tr><td>$(& $h $o.Owner)</td><td class=`"num`">$(& $num $o.Go.Count)</td><td class=`"num`">$(& $num $o.Merge.Count)</td><td>$list</td></tr>")
+        }
+        $null = $sb.Append('</tbody></table></section>')
+    }
+
+    $null = $sb.Append("<footer><p>To clean up in GatewayLens: Connections, Show &gt; Cleanup candidates - or right-click a gateway tile, List the unused connections - then Delete all listed connections. A backup of every one is written first.</p><p>Counts are what $(& $h $Meta.Who) can see; a cluster can hold more. Connection recency can be up to 30 minutes behind.</p></footer></main></body></html>")
+    return $sb.ToString()
+}
+
+function Save-GLCleanupReport {
+    # The report as a page for people (.html) and a table for Excel (.csv), side by side.
+    param([Parameter(Mandatory)][string]$Path, $Rows, [hashtable]$Owners, [hashtable]$Counts, [hashtable]$Meta, [switch]$NoOpen)
+    $summary = Get-GLCleanupSummary -Rows $Rows -Counts $Counts
+    $html = ConvertTo-GLCleanupHtml -Summary $summary -Rows $Rows -Owners $Owners -Meta $Meta
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force }
+    [System.IO.File]::WriteAllText($Path, $html, [System.Text.UTF8Encoding]::new($false))
+    $csv = [System.IO.Path]::ChangeExtension($Path, '.csv')
+    $table = ConvertTo-GLCleanupCsvRows -Rows $Rows -Owners $Owners
+    if ($table.Count) { $table | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding utf8BOM }
+    if (-not $NoOpen) { try { Invoke-Item -LiteralPath $Path } catch { } }
+    return [pscustomobject]@{
+        Html = $Path; Csv = $(if ($table.Count) { $csv } else { '' }); Clusters = @($summary).Count
+        CanGo = @($Rows | Where-Object { $_.CanGo }).Count; Merge = @($Rows | Where-Object { $_.Cleanup -and -not $_.CanGo }).Count
+    }
+}
+
 function ConvertTo-GLClipboardText {
     <#
         Rows as tab-separated text, the way Excel pastes them into cells: one line
@@ -1214,11 +1424,13 @@ function ConvertTo-GLConnectionRows {
             LastLinked   = & $fmt $linked
             LastUsed     = & $fmt $used
             UnusedDays   = $(if ($used) { [int][math]::Floor(($Now - $used).TotalDays) } else { $null })
+            Cleanup      = ''
             Id           = [string]$c.id
             GatewayId    = $gid
             UserList     = @()
             People       = @()
             UnknownUsers = 0
+            CanGo        = $false
         })
     }
     return , $rows.ToArray()
@@ -1474,6 +1686,87 @@ function ConvertTo-GLRoleRows {
     return , $rows.ToArray()
 }
 
+function Get-GLDuplicateKey {
+    <#
+        When two connections are the same one: the same gateway, type and path, and
+        the same way in - the same account, credential type, single sign-on, privacy
+        level and encryption. The same path with other credentials is often on
+        purpose, so a connection whose account is not known is never called a copy:
+        this returns nothing for it.
+    #>
+    param($Row)
+    $acc = ([string]$Row.Account).Trim()
+    if (-not $acc) { return $null }
+    return (@($Row.GatewayId, $Row.Type, $Row.Path, $acc, $Row.Credential, $Row.SingleSignOn, $Row.Privacy, $Row.Encryption) |
+            ForEach-Object { ([string]$_).Trim().ToLowerInvariant() }) -join '|'
+}
+
+function Get-GLCleanupRules {
+    # One place for what "can go" means - the rows, the view, the tiles and the report.
+    # Four months, not three: a quarterly refresh comes about every 90 days.
+    return @{ UnusedDays = 120; GraceDays = 30; Limit = 1000 }
+}
+
+function Set-GLCleanupReasons {
+    <#
+        Why a connection could make room on its cluster - in its Cleanup column - and
+        whether it can go now (CanGo). From Microsoft's connection recency (preview):
+          not used for more than UnusedDays days                        can go
+          no use recorded since it was made                             can go
+          a copy of another one - Get-GLDuplicateKey: the same way in      merge first
+        The copy used most recently is the one that stays. Nothing made or linked to
+        an item in the last GraceDays days can go, and a connection without recency
+        data never can: nothing says it is unused. Cloud connections are left out -
+        the limit is per gateway cluster.
+    #>
+    param($Rows, [datetime]$Now = (Get-Date), [int]$UnusedDays = (Get-GLCleanupRules).UnusedDays, [int]$GraceDays = (Get-GLCleanupRules).GraceDays)
+    $all = @($Rows | Where-Object { $_ })
+    $gw  = @($all | Where-Object { $_.Connectivity -ne 'ShareableCloud' -and $_.GatewayId })
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $stays = @{}
+    $known = @($gw | Where-Object { Get-GLDuplicateKey $_ })
+    foreach ($g in @($known | Group-Object { Get-GLDuplicateKey $_ } | Where-Object { $_.Count -gt 1 })) {
+        $first = @($g.Group | Sort-Object @{ Expression = { [string]$_.LastUsed }; Descending = $true }, @{ Expression = { [string]$_.Created } })[0]
+        foreach ($o in $g.Group) { if (-not [object]::ReferenceEquals($o, $first)) { $stays[[string]$o.Id] = $first } }
+    }
+    $daysAgo = {
+        param([string]$Stamp)
+        $d = [datetime]::MinValue
+        if ($Stamp -and [datetime]::TryParseExact($Stamp, 'yyyy-MM-dd HH:mm', $inv, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return ($Now - $d).TotalDays }
+        return $null
+    }
+    foreach ($r in $all) {
+        $why = ''; $go = $false
+        if ($r.Connectivity -ne 'ShareableCloud' -and $r.GatewayId) {
+            $made   = & $daysAgo ([string]$r.Created)
+            $linked = & $daysAgo ([string]$r.LastLinked)
+            $fresh  = ($null -ne $made -and $made -le $GraceDays) -or ($null -ne $linked -and $linked -le $GraceDays)
+            if (-not $fresh) {
+                if ($null -ne $r.UnusedDays -and [int]$r.UnusedDays -gt $UnusedDays) { $why = "not used for $($r.UnusedDays) days"; $go = $true }
+                elseif (-not $r.LastUsed -and $null -ne $made) { $why = "no use recorded since it was made on $(([string]$r.Created).Substring(0, 10))"; $go = $true }
+            }
+            if ($stays.ContainsKey([string]$r.Id)) {
+                $k = $stays[[string]$r.Id]
+                $copy = "a copy of '$($k.Name)'" + $(if ($k.LastUsed) { ", which was used on $(([string]$k.LastUsed).Substring(0, 10))" } else { '' })
+                $why = if ($why) { "$why - $copy" } else { "$copy - point its items at that one, then this can go" }
+            }
+        }
+        $r | Add-Member -NotePropertyName Cleanup -NotePropertyValue $why -Force
+        $r | Add-Member -NotePropertyName CanGo -NotePropertyValue $go -Force
+    }
+}
+
+function Get-GLCleanupCounts {
+    # How many connections on each gateway could go now - for the tiles. Keyed by lower-case id.
+    param($Rows)
+    $out = @{}
+    foreach ($r in @($Rows | Where-Object { $_ -and $_.PSObject.Properties['CanGo'] -and $_.CanGo -and $_.GatewayId })) {
+        $k = ([string]$r.GatewayId).ToLowerInvariant()
+        $out[$k] = 1 + [int]$out[$k]
+    }
+    return $out
+}
+
 function Select-GLConnections {
     <#
         The Connections tab filters. '(all)' or empty means "no filter".
@@ -1486,13 +1779,14 @@ function Select-GLConnections {
           Show          a cleanup view:
                           'Last used over N days ago'  credentials last used more than N days ago
                           'No use recorded'            no use since Microsoft began recording
-                          'Duplicates'                 same gateway, type, path and account as
-                                                       another - listed side by side
+                          'Duplicates'                 the same way in as another - see
+                                                       Get-GLDuplicateKey - listed side by side
                           'Failing tests'              failed or did not answer in Verify status
                           'Skip test connection on'    a test of these may say OK without trying
                           'Access by accounts not in Entra ID'
                                                        someone with access is not in the directory
                                                        any more - deleted, and hidden by the portal
+                          'Cleanup candidates'         can go now - see Set-GLCleanupReasons
     #>
     param($Rows, [string]$Text, [string]$Gateway, [string]$Connectivity, [string]$Type,
           [string]$User, [string]$Account, [string[]]$States, $Excluded,
@@ -1504,11 +1798,11 @@ function Select-GLConnections {
     $a = if ($Account) { $Account.Trim() } else { '' }
     $ic = [System.StringComparison]::OrdinalIgnoreCase
     $days = if ($Show -match '(\d+) days') { [int]$Matches[1] } else { 0 }
-    $dupKey = { param($r) (@($r.GatewayId, $r.Type, $r.Path, $r.Account) | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() }) -join '|' }
+    $dupKey = { param($r) [string](Get-GLDuplicateKey $r) }
     $seen = $null
     if ($Show -eq 'Duplicates') {
         $seen = @{}
-        foreach ($r in $scope) { $k = & $dupKey $r; $seen[$k] = 1 + [int]$seen[$k] }
+        foreach ($r in $scope) { $k = & $dupKey $r; if ($k) { $seen[$k] = 1 + [int]$seen[$k] } }
     }
     $out = foreach ($r in $scope) {
         if ($Excluded -and $Excluded.Contains([string]$r.Id)) { continue }
@@ -1534,10 +1828,11 @@ function Select-GLConnections {
         }
         if ($days -and -not ($null -ne $r.UnusedDays -and $r.UnusedDays -gt $days)) { continue }
         if ($Show -eq 'No use recorded' -and $r.LastUsed) { continue }
-        if ($seen -and $seen[(& $dupKey $r)] -lt 2) { continue }
+        if ($seen) { $k = & $dupKey $r; if (-not $k -or $seen[$k] -lt 2) { continue } }
         if ($Show -eq 'Failing tests' -and $r.Status -notin 'Failed', 'Timeout') { continue }
         if ($Show -eq 'Skip test connection on' -and -not $r.SkipTest) { continue }
         if ($Show -eq 'Access by accounts not in Entra ID' -and -not ($r.PSObject.Properties['UnknownUsers'] -and $r.UnknownUsers -gt 0)) { continue }
+        if ($Show -eq 'Cleanup candidates' -and -not ($r.PSObject.Properties['CanGo'] -and $r.CanGo)) { continue }
         $r
     }
     if ($seen) { $out = @($out | Sort-Object { & $dupKey $_ }, Name) }
@@ -3484,6 +3779,7 @@ $script:WorkerFunctions = @(
     'Remove-GLConnection', 'Set-GLMemberEnabled', 'Test-GLConnectionsBulk', 'Get-GLRoleAssignmentsBulk',
     'Get-GLDatasourceDirectory', 'Resolve-GLHostAddress', 'ConvertTo-GLConnectionRows', 'ConvertTo-GLLocalTime',
     'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'Get-GLDirectoryPrincipalIds', 'ConvertTo-GLPeopleLabels', 'Set-GLRowPeople', 'Set-GLReport',
+    'Set-GLCleanupReasons', 'Get-GLCleanupRules', 'Get-GLDuplicateKey',
     'Get-GLPrincipalLabel', 'Test-GLGuid', 'ConvertFrom-GLDownloadPage', 'ConvertFrom-GLReleasePage', 'Get-GLGatewayReleases', 'Split-GLList', 'ConvertTo-GLEncryptionSetting',
     'New-GLResult', 'Invoke-GLBulkGrant', 'Invoke-GLBulkRevoke', 'Invoke-GLBulkCredentials',
     'Backup-GLConnections', 'Invoke-GLBulkDelete',
@@ -4412,7 +4708,7 @@ $script:MainXaml = @'
             <ComboBox Name="CmbCnType" Width="130" MinHeight="26"/>
             <TextBlock Text="Show" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="CmbCnShow" Width="250" MinHeight="26"
-                      ToolTip="Cleanup views. Last used and No use recorded come from Microsoft's connection recency (preview): it records use since spring 2026 and can be up to 30 minutes behind. Duplicates: same gateway, type, path and account. Failing tests: after Verify status."/>
+                      ToolTip="Cleanup views. Last used and No use recorded come from Microsoft's connection recency (preview): it records use since spring 2026 and can be up to 30 minutes behind. Duplicates: the same gateway, path and account and the same sign-in settings - the same path with other credentials is not a copy. Failing tests: after Verify status."/>
           </WrapPanel>
 
           <DockPanel Grid.Row="1" Margin="0,0,0,8">
@@ -4432,6 +4728,8 @@ $script:MainXaml = @'
               <Button Name="BtnCnExclude" Content="Exclude selected rows"/>
               <Button Name="BtnCnUnexclude" Content="Show excluded"/>
               <Button Name="BtnCnExport" Content="Export CSV"/>
+              <Button Name="BtnCnCleanupReport" Content="Cleanup report..."
+                      ToolTip="What can go before a gateway cluster reaches 1,000 data sources, and whom to ask - a page to forward, and a table for Excel. For the listed connections."/>
               <Button Name="BtnCnAccessReport" Content="Access report..."
                       ToolTip="Who can use what - one row per connection or gateway and person, read fresh from Fabric. For an audit; with the User filter set, everything that one person can access."/>
             </WrapPanel>
@@ -4696,6 +4994,62 @@ $script:StartXaml = @'
     </DockPanel>
   </StackPanel>
 </Window>
+'@
+
+# The cleanup report's look: the report reads it from here, so the page needs nothing
+# from the network. Colours are a validated palette - light, and dark for a dark system.
+$script:CleanupReportCss = @'
+:root { color-scheme: light; --plane: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11, 11, 11, 0.10);
+  --stays: #2a78d6; --go: #eb6834; --r1: #86b6ef; --r2: #5598e7; --r3: #2a78d6; --r4: #1c5cab; --r5: #104281; --nodata: #898781;
+  --warn: #fab219; --crit: #d03b3b; }
+@media screen and (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) { color-scheme: dark; --plane: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255, 255, 255, 0.10);
+    --stays: #3987e5; --go: #d95926; --r1: #184f95; --r2: #256abf; --r3: #3987e5; --r4: #6da7ec; --r5: #9ec5f4; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--plane); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1160px; margin: 0 auto; padding: 32px 16px 56px; }
+h1 { font-size: 28px; font-weight: 600; margin: 0 0 4px; }
+h2 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+.sub, .note { color: var(--ink2); margin: 0 0 16px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 0 0 16px; }
+.kpi, .card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; }
+.kpi { padding: 14px 16px; }
+.kpi .label { color: var(--ink2); font-size: 13px; }
+.kpi .value { font-size: 32px; font-weight: 600; line-height: 1.2; margin: 2px 0; }
+.kpi .hint { color: var(--muted); font-size: 12px; }
+.card { padding: 20px 22px; margin: 0 0 16px; overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-weight: 600; font-size: 12px; color: var(--ink2); padding: 6px 8px; border-bottom: 1px solid var(--axis); white-space: nowrap; }
+td { padding: 7px 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.barcol { width: 36%; min-width: 180px; }
+.track { background: var(--grid); height: 14px; border-radius: 0 4px 4px 0; }
+.fill { display: flex; gap: 2px; height: 14px; }
+.seg { display: block; height: 14px; min-width: 2px; }
+.seg:hover { filter: brightness(1.15); }
+.seg.end { border-radius: 0 4px 4px 0; }
+.stays { background: var(--stays); }
+.go { background: var(--go); }
+.r1 { background: var(--r1); } .r2 { background: var(--r2); } .r3 { background: var(--r3); }
+.r4 { background: var(--r4); } .r5 { background: var(--r5); } .nodata { background: var(--nodata); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--ink2); font-size: 12px; margin: 0 0 10px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 12px; }
+.status i { font-style: normal; }
+.status.warn i { color: var(--warn); }
+.status.crit i { color: var(--crit); }
+details { border-top: 1px solid var(--grid); padding: 10px 0; }
+details:first-of-type { border-top: 0; }
+summary { cursor: pointer; padding: 2px 0 8px; }
+.muted { color: var(--muted); }
+.why { color: var(--ink2); }
+footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+footer p { margin: 4px 0; }
 '@
 
 $script:AlertsXaml = @'
@@ -5567,7 +5921,7 @@ function Open-GLFolder([string]$Path) {
 # ---- appearance ------------------------------------------------------------------
 $script:HistoryFields = @('TxtGwFilter', 'TxtCnSearch', 'TxtCnUser', 'TxtCnAccount', 'TxtBulkPrincipals', 'TxtCredUser', 'TxtLogFind', 'TxtMoveFrom', 'TxtMoveTo')
 # the Show views on the Connections tab - Select-GLConnections knows each by its words
-$script:ShowViews = @('All connections', 'Last used over 30 days ago', 'Last used over 90 days ago', 'Last used over 180 days ago',
+$script:ShowViews = @('All connections', 'Cleanup candidates', 'Last used over 30 days ago', 'Last used over 90 days ago', 'Last used over 180 days ago',
                       'Last used over 365 days ago', 'No use recorded', 'Duplicates', 'Failing tests', 'Skip test connection on',
                       'Access by accounts not in Entra ID')
 
@@ -6303,7 +6657,7 @@ function Update-GLActions {
     $cn = -not ($changing -or $loadingCn)
     $gw = -not ($changing -or $loadingGw)
     foreach ($b in 'BtnCnRefresh', 'BtnBulkStatus', 'BtnBulkUsers', 'BtnBulkGrant', 'BtnBulkRevoke', 'BtnBulkCredentials', 'BtnBulkDelete',
-                   'BtnCopyAccess', 'BtnMoveAccess', 'BtnCnAccessAdd', 'BtnCnAccessRemove', 'BtnCnTest', 'BtnCnAccessReport') {
+                   'BtnCopyAccess', 'BtnMoveAccess', 'BtnCnAccessAdd', 'BtnCnAccessRemove', 'BtnCnTest', 'BtnCnAccessReport', 'BtnCnCleanupReport') {
         if ($script:UI[$b]) { $script:UI[$b].IsEnabled = $cn }
     }
     foreach ($b in 'BtnGwRefresh', 'BtnMemberEnable', 'BtnMemberDisable', 'BtnGwAccessAdd', 'BtnGwAccessRemove') {
@@ -6652,12 +7006,33 @@ function Add-GLGridCopy {
     })
 }
 
+function Add-GLConnectionMenu {
+    # Right-click on connections: test, or read the users of, just the selected ones.
+    # Both only read - so the selection is enough. A change still acts on the whole list.
+    $menu = $script:UI.GridConnections.ContextMenu
+    if (-not $menu) { return }
+    $null = $menu.Items.Add([System.Windows.Controls.Separator]::new())
+    foreach ($m in @(@('Verify status of the selected', 'Status'), @('Verify users of the selected', 'Users'))) {
+        $item = [System.Windows.Controls.MenuItem]::new()
+        $item.Header = $m[0]
+        $item.Tag = $m[1]
+        $item.Add_Click({
+            param($s, $e)
+            if (Test-GLJobRunning 'Loading connections') { Write-GLLog 'The connections are loading - try again when they are in.' 'Warn'; return }
+            $sel = @($script:UI.GridConnections.SelectedItems | Where-Object { $_ })
+            if ($sel.Count -eq 0) { Write-GLLog 'Select the connections first - Ctrl or Shift for several.' 'Warn'; return }
+            if ([string]$s.Tag -eq 'Status') { Invoke-GLBulkStatusUi -Only $sel } else { Start-GLUsersRead -Items $sel }
+        })
+        $null = $menu.Items.Add($item)
+    }
+}
+
 function Add-GLTileCopy {
     # The gateway tiles: a right-click selects the tile under the mouse and offers to
     # copy it, all of them, or its id. Ctrl+C copies the selected gateway.
     $list = $script:UI.LstGwTiles
     $menu = [System.Windows.Controls.ContextMenu]::new()
-    foreach ($m in @(@('Copy this gateway', 'Ctrl+C', 'One'), @('Copy all gateways', '', 'All'), @('Copy id', '', 'Id'))) {
+    foreach ($m in @(@('Copy this gateway', 'Ctrl+C', 'One'), @('Copy all gateways', '', 'All'), @('Copy id', '', 'Id'), @('List the unused connections', '', 'Cleanup'))) {
         $item = [System.Windows.Controls.MenuItem]::new()
         $item.Header = $m[0]
         $item.InputGestureText = $m[1]
@@ -6668,6 +7043,7 @@ function Add-GLTileCopy {
                 'One' { Copy-GLGateways -SelectedOnly }
                 'All' { Copy-GLGateways }
                 'Id'  { Copy-GLId -Grid $script:UI.LstGwTiles }
+                'Cleanup' { Show-GLCleanupFor $script:UI.LstGwTiles.SelectedItem }
             }
         })
         $null = $menu.Items.Add($item)
@@ -6745,7 +7121,7 @@ function Show-GLGateways {
     param([switch]$Say)
     $selId = if ($script:UI.LstGwTiles.SelectedItem) { $script:UI.LstGwTiles.SelectedItem.Id } else { $null }
     $counts = if (@($script:State.ConnRows).Count) { Get-GLConnectionCounts -Rows $script:State.ConnRows -Directory $script:State.Directory } else { $null }
-    $tiles = ConvertTo-GLGatewayTiles -Rows $script:State.GatewayRows -Members $script:State.Members -DownSince $script:State.DownSince -VnetSkipped:([bool]$script:State.VnetSkipped) -Live $script:State.Live -Releases $script:State.Releases -ConnectionCounts $counts
+    $tiles = ConvertTo-GLGatewayTiles -Rows $script:State.GatewayRows -Members $script:State.Members -DownSince $script:State.DownSince -VnetSkipped:([bool]$script:State.VnetSkipped) -Live $script:State.Live -Releases $script:State.Releases -ConnectionCounts $counts -CleanupCounts (Get-GLCleanupCounts -Rows $script:State.ConnRows)
     $shown = Select-GLByText -Rows $tiles -Text $script:UI.TxtGwFilter.Text
     $script:State.Tiles = $tiles
     $script:UI.LstGwTiles.ItemsSource = $shown
@@ -7215,6 +7591,7 @@ function Invoke-GLConnectionRefresh {
         Set-GLReport $Report 'making the rows' -Total @($data.Connections).Count
         $rows = ConvertTo-GLConnectionRows -Connections $data.Connections -GatewayNames (Get-GLGatewayNameMap -Gateways $data.Gateways)
         Add-GLDirectoryInfo -Rows $rows -Directory $directory -Names $names
+        Set-GLCleanupReasons -Rows $rows
         @{ Gateways = $data.Gateways; Connections = $data.Connections; Directory = $directory; Rows = $rows; Warn = $warn; Names = $names; NamesWarn = $namesWarn }
     } -OnDone {
         param($r, $err, $ctx)
@@ -7520,6 +7897,78 @@ function Invoke-GLAccessReportUi {
         $bad = @($rows | Where-Object Role -eq '(could not be read)').Count
         $miss = if ($bad) { " - $bad item(s) could not be read" } else { '' }
         Write-GLLog "Access report${for}: $($rows.Count) row(s) saved to $($ctx.Path)$miss."
+    }
+}
+
+function Show-GLCleanupFor {
+    # From a gateway tile to the connections on it that can go - the fast way to make room.
+    param($Tile)
+    if (-not $Tile) { Write-GLLog 'Right-click a gateway tile first.' 'Warn'; return }
+    if (@($script:State.ConnRows).Count -eq 0) { Write-GLLog 'The connections are not loaded yet - press Refresh on the Connections tab.' 'Warn'; return }
+    if (@($script:UI.CmbCnGateway.ItemsSource) -notcontains [string]$Tile.Name) { Write-GLLog "No connections of '$($Tile.Name)' are listed." 'Warn'; return }
+    $script:State.Populating = $true
+    try {
+        $script:UI.CmbCnGateway.SelectedItem = [string]$Tile.Name
+        $script:UI.CmbCnShow.SelectedItem    = 'Cleanup candidates'
+    }
+    finally { $script:State.Populating = $false }
+    $script:UI.Tabs.SelectedItem = $script:UI.TabConnections
+    Show-GLConnections -Say
+}
+
+function Invoke-GLCleanupReportUi {
+    # What can go before a cluster reaches 1,000, and whom to ask - for the listed
+    # gateway connections, as a page to forward and a table for Excel.
+    $listed = Get-GLListed
+    $rows = @($listed | Where-Object { $_.Connectivity -ne 'ShareableCloud' -and $_.GatewayId })
+    if ($rows.Count -eq 0) { Write-GLLog 'No gateway connections in the list - nothing to report.' 'Warn'; return }
+    $dlg = [Microsoft.Win32.SaveFileDialog]::new()
+    $dlg.FileName = 'gatewaylens-cleanup-{0:yyyyMMdd-HHmm}.html' -f (Get-Date)
+    $dlg.Filter   = 'Web page (*.html)|*.html'
+    if (-not $dlg.ShowDialog($script:Window)) { return }
+    Start-GLCleanupReport -Rows $rows -Path $dlg.FileName
+}
+
+function Start-GLCleanupReport {
+    # The owners of what could go are read fresh from Fabric, then the page is written.
+    param($Rows, [Parameter(Mandatory)][string]$Path, [switch]$NoOpen)
+    $cands  = @($Rows | Where-Object { $_.Cleanup })
+    $counts = Get-GLConnectionCounts -Rows $script:State.ConnRows -Directory $script:State.Directory
+    $meta   = @{ Version = $script:AppVersion; Who = $script:SignedInAs; Tenant = $script:TenantShown; When = (Get-Date) }
+    if ($cands.Count -eq 0) {
+        $res = Save-GLCleanupReport -Path $Path -Rows $Rows -Owners @{} -Counts $counts -Meta $meta -NoOpen:$NoOpen
+        Write-GLLog "Cleanup report: nothing can go on the $($res.Clusters) cluster(s) listed - saved to $($res.Html)." 'Ok'
+        return
+    }
+    $fab = Get-GLTokenSafe Fabric
+    if (-not $fab) { return }
+    $gr  = Get-GLTokenSafe Graph
+    $ids = @($cands | ForEach-Object { [string]$_.Id })
+    Start-GLJob -Bulk -Name "Reading the owners of $($ids.Count) connection(s)" -Arguments @{ F = $fab; G = $gr; Ids = $ids; Known = $script:State.Names } `
+        -Context @{ Path = $Path; Rows = $Rows; Counts = $counts; Meta = $meta; NoOpen = [bool]$NoOpen } -Work {
+        param($F, $G, $Ids, $Known, $Progress)
+        $Progress.Total = $Ids.Count
+        $all = @{}
+        for ($i = 0; $i -lt $Ids.Count; $i += 25) {
+            if ($Progress.Cancel) { break }
+            $chunk = @($Ids[$i..([Math]::Min($i + 25, $Ids.Count) - 1)])
+            $res = Get-GLRoleAssignmentsBulk -Ids $chunk -FabricToken $F
+            foreach ($k in $res.Keys) { $all[$k] = $res[$k] }
+            $Progress.Done = [Math]::Min($i + 25, $Ids.Count)
+        }
+        $names = @{}; $warn = ''
+        $them = @($all.Values | Where-Object { $_ } | ForEach-Object { $_ } | ForEach-Object { [string]$_.principal.id })
+        try { $names = Get-GLPrincipalNames -Ids $them -GraphToken $G -Known $Known } catch { $warn = $_.Exception.Message }
+        @{ Assignments = $all; Names = $names; Warn = $warn }
+    } -OnDone {
+        param($r, $err, $ctx)
+        if ($err -or -not $r -or $script:Progress.Cancel) { return }
+        Add-GLNames $r.Names $r.Warn
+        $owners = Get-GLOwnerLabels -Assignments $r.Assignments -Names $script:State.Names
+        try { $res = Save-GLCleanupReport -Path $ctx.Path -Rows $ctx.Rows -Owners $owners -Counts $ctx.Counts -Meta $ctx.Meta -NoOpen:$ctx.NoOpen }
+        catch { Write-GLLog "The cleanup report could not be saved: $($_.Exception.Message)" 'Error'; return }
+        $tail = if ($res.Csv) { ", and the table to $($res.Csv)" } else { '' }
+        Write-GLLog "Cleanup report: $($res.CanGo) connection(s) can go and $($res.Merge) to merge first, on $($res.Clusters) cluster(s) - saved to $($res.Html)$tail." 'Ok'
     }
 }
 
@@ -8024,6 +8473,13 @@ function Get-GLSmokePlan {
     $plan.Add(@{ Kind = 'AlertsCheck' })
     $plan.Add(@{ Kind = 'MeterCheck' })
     $plan.Add(@{ Kind = 'Tab'; Value = 1 })
+    $plan.Add(@{ Kind = 'MenuVerify' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'MenuCheck' })
+    $plan.Add(@{ Kind = 'CleanupStart' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'CleanupCheck' })
+    $plan.Add(@{ Kind = 'Tab'; Value = 1 })
     $plan.Add(@{ Kind = 'HistoryPick' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'HistoryBack' })
@@ -8097,6 +8553,34 @@ function Step-GLSmokeTest {
             $shown = @($script:UI.GridGwAccess.ItemsSource).Count -eq $all
             Set-GLShowGone $false
             $sm.GoneOk = $hidden -and $shown
+        }
+        'MenuVerify' {
+            # two connections selected, Verify status from the right-click menu
+            $g = $script:UI.GridConnections
+            $on = @($g.ItemsSource | Where-Object { $_.Connectivity -eq 'OnPremisesGateway' -and $_.GatewayId })
+            foreach ($r in $on) { $r.Status = '' }
+            $g.SelectedItems.Clear()
+            foreach ($r in $on[0..1]) { $null = $g.SelectedItems.Add($r) }
+            $sm.MenuRows = @($on[0..2])
+            $item = @($g.ContextMenu.Items | Where-Object { $_ -is [System.Windows.Controls.MenuItem] -and [string]$_.Tag -eq 'Status' })[0]
+            if ($item) { $item.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent)) }
+        }
+        'MenuCheck' {
+            $mr = @($sm.MenuRows)
+            $sm.MenuOk = $mr.Count -eq 3 -and [bool]$mr[0].Status -and [bool]$mr[1].Status -and -not $mr[2].Status
+            $script:UI.GridConnections.SelectedItems.Clear()
+        }
+        'CleanupStart' {
+            $sm.CleanupFile = Join-Path ([System.IO.Path]::GetTempPath()) ('gatewaylens-smoke-cleanup-{0}.html' -f [guid]::NewGuid().ToString('N'))
+            $rowsC = @($script:State.ConnRows | Where-Object { $_.Connectivity -ne 'ShareableCloud' -and $_.GatewayId })
+            Start-GLCleanupReport -Rows $rowsC -Path $sm.CleanupFile -NoOpen
+        }
+        'CleanupCheck' {
+            $page = if (Test-Path -LiteralPath $sm.CleanupFile) { Get-Content -Raw -LiteralPath $sm.CleanupFile } else { '' }
+            $unusedTile = @($script:State.Tiles | Where-Object { [string]$_.ConnectionsText -match 'unused' }).Count
+            $sm.CleanupOk = ($page -match 'Room on each cluster') -and ($page -match 'Who to ask') -and $unusedTile -gt 0 -and
+                            @($script:State.ConnRows | Where-Object { $_.CanGo }).Count -gt 0
+            foreach ($f in $sm.CleanupFile, [System.IO.Path]::ChangeExtension($sm.CleanupFile, '.csv')) { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
         }
         'MeterCheck' { Update-GLMeter; $sm.MeterOk = [string]$script:UI.TxtMeter.Text -match '^CPU \d+%.*API calls \d' }
         'AlertsCheck' {
@@ -8181,6 +8665,8 @@ function Get-GLSmokeVerdict {
     if (-not ($script:State.Releases -and $script:State.Releases.Newest)) { $problems.Add('the newest gateway version was not read from the demo''s copy of Microsoft''s pages') }
     $st = @($script:State.Tiles | ForEach-Object Status | Sort-Object -Unique)
     if (@($script:State.Tiles).Count -ne 5 -or ($st -notcontains 'Offline') -or ($st -notcontains 'VNet')) { $problems.Add("gateway tiles: $(@($script:State.Tiles).Count) with $($st -join ', '), expected 5 including Offline and VNet") }
+    if ($script:Smoke -and -not $script:Smoke.MenuOk) { $problems.Add('Verify status on the right-click menu did not test exactly the selected connections') }
+    if ($script:Smoke -and -not $script:Smoke.CleanupOk) { $problems.Add('the cleanup report, or the unused count on the tiles, did not come out') }
     if ($script:Smoke -and -not $script:Smoke.MeterOk) { $problems.Add('the meter at the bottom right showed no numbers') }
     if ($script:Smoke -and -not $script:Smoke.AlertsOk) { $problems.Add('the Alerts window did not load') }
     if ($script:Smoke -and -not $script:Smoke.TaskbarOk) { $problems.Add('with a gateway offline, the taskbar button and the title did not say so') }
@@ -8217,7 +8703,7 @@ function Export-GLGrid {
     if (-not $dlg.ShowDialog($script:Window)) { return }
     $hasUsers = $rows[0].PSObject.Properties.Name -contains 'UserList'
     $rows | ForEach-Object {
-        $o = $_ | Select-Object -Property * -ExcludeProperty UserList, Source, People, UnknownUsers, NotInEntra
+        $o = $_ | Select-Object -Property * -ExcludeProperty UserList, Source, People, UnknownUsers, NotInEntra, CanGo
         if ($hasUsers -and -not $_.PSObject.Properties['UserNames']) { $o | Add-Member -NotePropertyName UserNames -NotePropertyValue (@($_.UserList) -join '; ') -Force }
         $o
     } | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding utf8BOM
@@ -8277,7 +8763,7 @@ function Show-GLWindow {
     foreach ($g in $script:Grids) {
         $script:UI[$g].Add_AutoGeneratingColumn({
             param($s, $e)
-            if ($e.PropertyName -in 'GatewayId', 'PrincipalId', 'UserList', 'Source', 'People', 'UnknownUsers', 'NotInEntra') { $e.Cancel = $true; return }
+            if ($e.PropertyName -in 'GatewayId', 'PrincipalId', 'UserList', 'Source', 'People', 'UnknownUsers', 'NotInEntra', 'CanGo') { $e.Cancel = $true; return }
             # read-only text that can be selected and copied, sorted as the user left it
             $col = New-GLGridColumn -Property $e.PropertyName -Header $e.Column.Header
             $sorted = @($script:GridSort[[string]$s.Name]) | Where-Object { $_.PropertyName -eq $e.PropertyName } | Select-Object -First 1
@@ -8295,6 +8781,7 @@ function Show-GLWindow {
         })
         Add-GLGridCopy $script:UI[$g]
     }
+    Add-GLConnectionMenu
     Add-GLTileCopy
 
     # colour on what needs attention - by brush name, so it follows the theme
@@ -8387,6 +8874,7 @@ function Show-GLWindow {
     $script:UI.CmbCnShow.Add_SelectionChanged({ Show-GLConnections -Say })
     $script:UI.ChkCnCloud.Add_Click({ Update-GLConnectionCombos; Show-GLConnections -Say })
     $script:UI.BtnCnAccessReport.Add_Click({ Invoke-GLAccessReportUi })
+    $script:UI.BtnCnCleanupReport.Add_Click({ Invoke-GLCleanupReportUi })
     $script:UI.BtnCopyAccess.Add_Click({ Invoke-GLHandoverUi })
     $script:UI.BtnMoveAccess.Add_Click({ Invoke-GLHandoverUi -Move })
     $script:UI.GridConnections.Add_SelectionChanged({ Update-GLConnectionDetail })

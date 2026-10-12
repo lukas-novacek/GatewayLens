@@ -66,6 +66,12 @@ it publicly.
       *Failing tests* (after step 3).
 - [ ] *UserNames* shows emails, not ids, and the *User* filter finds a colleague by
       their display name.
+- [ ] **Cleanup**: the tiles say how many are unused. Right-click a full cluster >
+      *List the unused connections* - each one says why in *Cleanup*. Check two of
+      them in the portal. *Cleanup report...* opens a page with every cluster, and
+      the owners of what can go; the table next to it opens in Excel.
+- [ ] Select two connections, right-click > *Verify status of the selected* - only
+      those two are tested.
 - [ ] Pick an entry from a search box's history, delete the text, pick it again.
 - [ ] Drag the grips to resize the panels; close and start again - they keep the size.
 - [ ] The log is in colour and follows Ctrl + mouse wheel. **?** opens the help menu.

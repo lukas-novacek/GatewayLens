@@ -46,6 +46,7 @@ ones the Fabric API uses.
 | Delete a connection | Owner of the connection |
 | Hand over access (copy or move roles) | Owner of each connection; Admin on each gateway (with *Gateway clusters too*) |
 | Access report | Owner of each connection and Admin on each gateway - for any other, its row says it could not be read |
+| Cleanup report | Nothing extra for the counts and the recency; the owners need what the access report needs - a connection whose owners cannot be read says so |
 | Connection recency | Comes with the connections list - Microsoft decides which connections carry it for your account (preview) |
 | Connections per cluster | Nothing extra - the count is what your account can see, so a cluster can hold more |
 | Usernames and access in one call | Admin on the gateways concerned |

@@ -4,17 +4,20 @@ GatewayLens signs in as **you**, in your browser, on Microsoft's own sign-in pag
 It can do exactly what your account can do in the Power BI and Fabric portals -
 [permissions.md](permissions.md) has the details.
 
-## Two ways in
+## The ways in
 
 GatewayLens uses whichever works with nothing more to do:
 
 | | You need | Your organisation approves GatewayLens |
 |---|---|---|
 | **Az.Accounts** - used when it is installed | `Install-Module Az.Accounts -Scope CurrentUser`, once. No admin rights. | No - Microsoft's Azure PowerShell is already approved in practically every tenant |
-| **Built-in** - used when it is not | Nothing | Once, the first time anyone in the organisation uses it |
+| **Your organisation's app registration** | `-ClientId <application id>` - see [below](#your-own-app-registration) | Once, by IT |
+| **Built-in** - not published yet | Nothing | Once, the first time anyone in the organisation uses it |
 
-So: if your organisation has approved GatewayLens, you need nothing at all. If it
-has not, and you would rather not wait for IT, install Az.Accounts.
+> [!NOTE]
+> GatewayLens's own app registration is not published yet, so the built-in way has
+> nothing to sign in with. Until it is: install Az.Accounts - the quickest way - or
+> start GatewayLens with your organisation's own app registration and `-ClientId`.
 
 `-SignIn AzAccounts` or `-SignIn Browser` chooses one way. A `-ClientId` given on
 the command line always means the built-in way.

@@ -37,7 +37,8 @@ into days of clicking. GatewayLens does the same work in bulk, safely:
   on gateways and connections, and the portal does not list them. GatewayLens counts
   them, names them when Microsoft still can, and lets you remove them.
 - **A cluster filling up?** Microsoft allows 1,000 data sources per gateway cluster.
-  Find the connections nobody has used for months, and the duplicates.
+  Every tile says how many are unused; one click lists them with the reason, and a
+  cleanup report tells their owners before you delete.
 - **Is anything down?** A live wall of every gateway cluster, a kiosk view for a TV on
   the wall, and a message in Teams when a member drops.
 
@@ -57,7 +58,7 @@ in as you - so it can do exactly what you can do in the portal, and nothing more
 | **Someone leaves the company** | Find each connection and gateway they can use, share it again, remove them | **Move access**: their successor gets exactly the same roles everywhere, then theirs are removed |
 | **Who can use what?** | Open each connection's list of users | Filter by person, by credential account, by server or database - and export an access report for the auditor |
 | **Who still has access after leaving?** | Not shown - deleted accounts are left out of the lists | *Show N not in Entra ID*, and *Access by accounts not in Entra ID* across every connection |
-| **Make room on a cluster** | Check connections one by one | Connections counted against the 1,000 limit; *not used for 90 days*, *no use recorded*, *duplicates*, *failing* - then delete, with a backup written first |
+| **Make room on a cluster** | Check connections one by one | Every tile: "940 of 1,000 - 312 unused". *Cleanup candidates* with the reason, a cleanup report for the owners - then delete, with a backup written first |
 | **Is every gateway up, current and supported?** | Open each gateway | One coloured tile per cluster, versions checked against Microsoft's supported releases, a kiosk view and alerts |
 | **What changed, and who did it?** | - | Every change is recorded the moment it happens: who, when, what, and the result |
 
@@ -83,6 +84,12 @@ Entra ID, by name when it is recent.
 
 ![Access by accounts not in Entra ID](assets/screenshot-deleted-accounts.png)
 
+**Make room before the 1,000 limit** - a cleanup report to forward: how full each
+cluster is, how recently its connections were used, what can go and why, and whom
+to ask.
+
+![The cleanup report: room on each cluster, recency, and what can go](assets/screenshot-cleanup-report.png)
+
 **A wall screen** - the kiosk view: full screen, nothing that changes anything,
 counting down to the next refresh.
 
@@ -99,7 +106,8 @@ counting down to the next refresh.
 
 </details>
 
-Every picture is the built-in demo - Contoso is fictional.
+Every picture shows Contoso, a fictional company: the built-in demo - and for the cleanup
+report, a larger made-up Contoso, the size of tenant the report is for.
 
 ## What it does
 
@@ -158,6 +166,7 @@ leave alone, then press one button:
   in the log as it is tested. A connection with *Skip test connection* on is marked
   **Unverified**: its test passes whatever the data source says.
 - **Verify users** - who has access to each one, by name, in the list and the log.
+  Right-click a few rows to verify the status or the users of just those.
 - **Delete** - only after typing the count, and only after a backup is written.
 
 ### Hand over access
@@ -171,15 +180,29 @@ the object id the access lists show.
 
 ### Clean up before you hit the limit
 Microsoft allows
-[1,000 data sources per gateway cluster](https://learn.microsoft.com/en-us/data-integration/gateway/service-gateway-onprem).
-Every tile counts the connections on its cluster, and the **Show** filter finds the
-ones to remove:
-- **Last used over 30, 90, 180 or 365 days ago**, and **no use recorded**, from
-  Microsoft's connection recency *(preview in Fabric)*
-- **Duplicates** - the same gateway, type, path and account, side by side
-- **Failing tests** - after Verify status
-- **Skip test connection on** - connections whose test always passes
-- **Access by accounts not in Entra ID** - roles still held by deleted accounts
+[1,000 data sources per gateway cluster](https://learn.microsoft.com/en-us/data-integration/gateway/service-gateway-onprem),
+and a full cluster takes no new connection. GatewayLens says what could make room,
+from Microsoft's connection recency *(preview in Fabric)*:
+- **Every tile** counts its cluster against the limit, and how many could go:
+  "940 of 1,000 connections - 312 unused". Right-click it > **List the unused
+  connections**.
+- **The Cleanup column** says why, for each connection: *not used for 212 days*, *no
+  use recorded since it was made*, *a copy of 'Sales DW'*.
+- **Show > Cleanup candidates** lists what can go now: not used for more than four
+  months - so a quarterly refresh is never taken for unused - or never used. Nothing
+  made or linked to an item in the last 30 days, and nothing without recency data. A
+  copy still in use is *merge first*: point its items at the copy that stays. A copy
+  means the same server, account and sign-in settings - the same path with other
+  credentials is often on purpose, and is never called a copy.
+- **Cleanup report...** - a page to forward and print: how full each cluster is now
+  and after cleanup, how recently its connections were used, what can go and why,
+  and **who to ask** - each owner with theirs, read fresh from Fabric. With a table
+  for Excel or a mail merge.
+- Then **Delete all listed connections** - with a backup written first.
+
+More views in **Show**: *last used over 30, 90, 180 or 365 days ago*, *no use
+recorded*, *duplicates* side by side, *failing tests*, *Skip test connection on*,
+and *access by accounts not in Entra ID*.
 
 ### Find access the portal hides
 Fabric keeps the roles of accounts that were deleted from Microsoft Entra ID, and the
@@ -220,6 +243,7 @@ takes you to the start page. Things to try:
 4. **Show > Access by accounts not in Entra ID** - Tom Wright left, and still owns a
    connection.
 5. **Show > Duplicates** - a stale copy of Sales DW is taking a slot on the Prod cluster.
+6. **Cleanup report...** - what can go on every cluster, and whom to ask.
 
 ## Use it on your tenant
 
@@ -243,14 +267,17 @@ permission shows up as one clear line instead of an empty grid.
 ### Requirements and sign-in
 
 - Windows with **PowerShell 7.2 or later** - `winget install Microsoft.PowerShell`
-- Nothing else. GatewayLens signs in **as you**, in the browser, and acts with your
-  permissions - exactly what you can see and change in the portal, no more. On a
-  company PC the browser usually signs you in without a password.
+- **Az.Accounts**, once: `Install-Module Az.Accounts -Scope CurrentUser` - no admin
+  rights, and no approval: Microsoft's Azure PowerShell is already approved in
+  practically every tenant.
+- GatewayLens signs in **as you**, in the browser, and acts with your permissions -
+  exactly what you can see and change in the portal, no more.
 
 | | You need | Approval by your organisation |
 |---|---|---|
-| **Az.Accounts** - used when installed | `Install-Module Az.Accounts -Scope CurrentUser`, once, no admin rights | None |
-| **Built-in** - used when it is not | Nothing | Once, the first time anyone uses GatewayLens |
+| **Az.Accounts** - the way in today | `Install-Module Az.Accounts -Scope CurrentUser`, once, no admin rights | None |
+| **Your organisation's app registration** | `-ClientId <application id>` - [docs/sign-in.md](docs/sign-in.md) | Once, by IT |
+| **Built-in** - coming: nothing to install | Nothing | Once, the first time anyone uses GatewayLens |
 
 [docs/sign-in.md](docs/sign-in.md) has the details, and a section to forward to IT.
 [docs/permissions.md](docs/permissions.md) says which role each action needs.
@@ -389,9 +416,10 @@ a Teams channel or a Power Automate flow. They come while GatewayLens is open wi
 auto-refresh on - on a wall screen in kiosk view, for example.
 
 ### How close am I to the 1,000 data source limit?
-Every tile counts its cluster's connections against it, with a badge when it gets
-near. **Show > Last used over 90 days ago**, *No use recorded* and *Duplicates* find
-what to remove.
+Every tile counts its cluster's connections against it - with a badge when it gets
+near, and how many are unused. **Show > Cleanup candidates** lists what can go, with
+the reason, and **Cleanup report...** makes a page for the owners: how full each
+cluster is now, and after cleanup.
 
 ### Does it work with Microsoft Fabric and VNet data gateways?
 Yes. It uses the Fabric REST API for gateways and connections, and shows on-premises
@@ -440,6 +468,8 @@ answer: it reached the gateway, and the gateway could not reach the data source.
 
 ## Roadmap
 
+- The built-in sign-in: GatewayLens's own app registration, so nothing has to be
+  installed - not even Az.Accounts
 - A gateway health report - one page to send to your manager: versions, the 1,000
   limit, deleted accounts with access, unused connections
 - Alerts without the window open, for a server or a scheduled task
