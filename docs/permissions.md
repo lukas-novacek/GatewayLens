@@ -42,7 +42,7 @@ ones the Fabric API uses.
 | Test a connection | A role on the connection |
 | Live member status | Admin on the gateway |
 | Enable or disable a member | Admin on the gateway |
-| Update a connection's credentials | Owner of the connection, or Admin on its gateway |
+| Update a connection's credentials | Owner of the connection, or Admin on its gateway - the same both ways, like the portal or documented |
 | Delete a connection | Owner of the connection |
 | Hand over access (copy or move roles) | Owner of each connection; Admin on each gateway (with *Gateway clusters too*) |
 | Access report | Owner of each connection and Admin on each gateway - for any other, its row says it could not be read |

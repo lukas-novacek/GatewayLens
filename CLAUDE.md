@@ -91,7 +91,11 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
     `$script:Auth`, in memory only. Tests check this.
 12. **Unofficial endpoints** (Power BI v2) and **web pages** (`Get-GLGatewayReleases`)
     stay isolated in their own function, are optional, and degrade to empty columns -
-    never to an error. Never send a token to a web page.
+    never to an error. Never send a token to a web page. The one unofficial change,
+    credentials like the portal (`Set-GLConnectionCredentialPortal`), has its own
+    checkbox and falls back to the documented call only when the endpoint refused
+    the request (`Test-GLPortalWayRefused`) - never after the gateway's answer or no
+    answer, which could send the same change twice.
 13. **Every change to a tenant** starts with `Get-GLRunAudit` (no record, no change)
     and records each item with `Write-GLChange` as it happens.
 14. **Bulk runs act on every listed row**, never on the selection, one item at a

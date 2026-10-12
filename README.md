@@ -282,6 +282,7 @@ role on it - [docs/permissions.md](docs/permissions.md).
 | Sign-in | Microsoft Entra ID (OAuth 2.0) | Documented |
 | Gateways, members, connections, access, recency, delete | Fabric REST API | Documented (recency is in preview) |
 | Connection test, update credentials | Power BI REST API | Documented |
+| **Update credentials like the portal** - keeps the username readable | Power BI v2 `credentialsV2` | **Unofficial** - the documented call is used if it is refused |
 | Names of who has access, name lookup when granting access | Microsoft Graph | Documented |
 | **Live member status** | Power BI v2 `gatewayClusters` | **Unofficial** |
 | **Usernames and access in one call** | Power BI v2 `gatewayClusterDatasources` | **Unofficial** |

@@ -4,6 +4,26 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-10-12
+
+### Fixed
+- **Update credentials keeps the username visible.** The documented API stores the
+  credentials encrypted only, so the readable copy of the username - the Account
+  column, and the username the portal shows - was lost. GatewayLens now updates
+  them the way the portal does: it reads each gateway member's key from the
+  data source, encrypts the credentials once per member, and sends them to the
+  portal's own endpoint (`credentialsV2`, unofficial). Privacy level, encryption and
+  *Skip test connection* stay as they were.
+  - *Like the portal - keeps the username visible* is on by default, in the
+    Credentials box.
+  - If that endpoint refuses the request, nothing was changed, and the documented
+    way is used instead - the log says so for each connection. The gateway's own
+    answer, such as a wrong password, is not sent a second way, and neither is a
+    request that got no answer.
+  - The change record says which way each update went.
+- The demo answers like a real tenant here too: the documented call loses the
+  username, the portal's way keeps it.
+
 ## [0.8.0] - 2026-10-12
 
 From the second run on a real tenant.

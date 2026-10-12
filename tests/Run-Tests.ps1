@@ -1454,6 +1454,28 @@ $finKey = $keys[([string]($cd.Gateways | Where-Object displayName -eq 'Contoso F
 $err = $null; try { Set-GLConnectionCredential -GatewayId $hr.GatewayId -ConnectionId $hr.Id -PublicKey $finKey -CredentialType Basic -Username 'u' -Password 'p' -PbiToken $T } catch { $err = $_.Exception.Message }
 Assert ($err -match 'could not decrypt') 'credentials encrypted for a different gateway are refused - the demo really decrypts'
 
+# The portal's way: one encrypted copy per gateway member, and the username stays
+# readable. The documented way keeps only the encrypted copy - the Account goes.
+$accountOf = { param($Id) $dd = Get-GLDatasourceDirectory -PbiToken $T; $dd[([string]$Id).ToLowerInvariant()].Account }
+$pds = Invoke-GLRequest -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources/$($hr.Id)" -Token $T
+$mk  = @($pds.memberGatewayPublicKeys.PSObject.Properties)
+$pk  = ConvertFrom-GLRsaXmlKey -Base64Xml ([string]$mk[0].Value)
+Assert ($mk.Count -eq 3 -and $pk.modulus.Length -gt 300 -and $pk.exponent -eq 'AQAB') "a member key from the portal's API reads as a modulus and exponent ($($mk.Count) members)"
+$beforeDoc = [int]$s.DocumentedCredentialCalls
+$rp = Invoke-GLBulkCredentials -Items @($hr) -CredentialType Windows -Username 'CONTOSO\svc_hr2' -Password 'Correct horse 9' -PublicKeys $keys -PbiToken $T -Progress @{ Cancel = $false } -Audit $au -PortalWay
+Assert ($rp[0].Ok -and $rp[0].Way -eq 'portal' -and (& $accountOf $hr.Id) -eq 'CONTOSO\svc_hr2' -and [int]$s.DocumentedCredentialCalls -eq $beforeDoc) "like the portal: every member gets the credentials, and the Account stays readable ($(& $accountOf $hr.Id))"
+$rd = Invoke-GLBulkCredentials -Items @($hr) -CredentialType Windows -Username 'CONTOSO\svc_hr' -Password 'Correct horse 9' -PublicKeys $keys -PbiToken $T -Progress @{ Cancel = $false } -Audit $au
+Assert ($rd[0].Ok -and $rd[0].Way -eq 'documented' -and -not (& $accountOf $hr.Id)) 'the documented way works too, but the readable username is gone - as on a real tenant'
+$rf = Invoke-GLBulkCredentials -Items @($hr) -CredentialType Windows -Username 'CONTOSO\svc_hr' -Password 'Correct horse 9' -PublicKeys $keys -PbiToken $T -Progress @{ Cancel = $false } -Audit $au -PortalWay -PortalMethod 'POST'
+Assert ($rf[0].Ok -and $rf[0].Way -eq 'documented' -and $rf[0].Message -match "portal's way was refused \(HTTP 405\)") "a portal endpoint that refuses the request changes nothing, so the documented way is used - and says so ($($rf[0].Message))"
+$beforeDoc = [int]$s.DocumentedCredentialCalls
+$rw = Invoke-GLBulkCredentials -Items @($hr) -CredentialType Windows -Username 'CONTOSO\svc_hr' -Password 'wrong' -PublicKeys $keys -PbiToken $T -Progress @{ Cancel = $false } -Audit $au -PortalWay
+Assert (-not $rw[0].Ok -and $rw[0].Message -match 'Login failed' -and [int]$s.DocumentedCredentialCalls -eq $beforeDoc) 'a wrong password is the gateway''s answer, not a refusal: it fails, and is not sent the other way as well'
+$recCsv = Get-ChildItem -LiteralPath $dl -Recurse -Filter 'changes-*.csv' | Select-Object -First 1
+$recTxt = if ($recCsv) { Get-Content -LiteralPath $recCsv.FullName -Raw } else { '' }
+Assert ($recTxt -match 'Way=like the portal \(unofficial\)' -and $recTxt -match 'Way=documented API' -and $recTxt -match "portal's way was refused" -and $recTxt -notmatch 'Correct horse') 'the change record says which way each update went, and never the password'
+Assert ((Test-GLPortalWayRefused 'PUT https://x -> HTTP 405 : MethodNotAllowed') -and (Test-GLPortalWayRefused 'PORTAL-NOT-USABLE: no keys') -and -not (Test-GLPortalWayRefused 'PUT https://x -> HTTP 400 : DM_GWPipeline_Gateway_DataSourceAccessError: Login failed') -and -not (Test-GLPortalWayRefused 'PUT https://x -> no response : timed out')) 'only a refusal of the request itself lets the documented way be tried - not a gateway answer, not silence'
+
 $jane = Resolve-GLPrincipal -Value 'jane.doe@contoso.com' -Type User -GraphToken $T
 $grp  = Resolve-GLPrincipal -Value 'Finance Analysts' -Type Group -GraphToken $T
 Assert ($jane.DisplayName -eq 'Jane Doe <jane.doe@contoso.com>' -and $grp.DisplayName -eq 'Finance Analysts <finance-analysts@contoso.com>') 'people and groups are found by email and by name'

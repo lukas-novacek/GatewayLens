@@ -137,12 +137,13 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.8.0'
+$script:AppVersion = '0.8.1'
 # What is new, in a few lines for the window - shown once after an update. The full
 # list is CHANGELOG.md. The tests check that it is about the current version.
 $script:WhatsNew = @{
-    Version = '0.8.0'
+    Version = '0.8.1'
     Lines   = @(
+        'Update credentials the way the portal does: the username stays visible in the Account column and in the portal.'
         'A start page: sign in when you are ready, or try the demo first.'
         'Names everywhere: the Users column and the User filter show people, not object ids.'
         'Access left behind by deleted accounts - the portal hides it, GatewayLens shows it: Show > Access by accounts not in Entra ID.'
@@ -1527,6 +1528,91 @@ function Set-GLConnectionCredential {
         -Token $PbiToken -Body @{ credentialDetails = $details } -MaxRetry 2
 }
 
+function Get-GLPortalCredentialMethod {
+    # The HTTP method of the portal's credentialsV2 call. One place, so the demo
+    # answers exactly what the real service accepts.
+    return 'PUT'
+}
+
+function ConvertFrom-GLRsaXmlKey {
+    # A gateway member's public key as the portal's API gives it - base64 of an XML
+    # <RSAParameters> - as the modulus and exponent the encryption takes.
+    param([Parameter(Mandatory)][string]$Base64Xml)
+    $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Base64Xml)).TrimStart([char]0xFEFF)
+    $x = [xml]$text
+    $mod = [string]$x.RSAParameters.Modulus
+    $exp = [string]$x.RSAParameters.Exponent
+    if (-not $mod -or -not $exp) { throw 'The gateway member key has no modulus or exponent.' }
+    return [pscustomobject]@{ modulus = $mod.Trim(); exponent = $exp.Trim() }
+}
+
+function Set-GLConnectionCredentialPortal {
+    <#
+        UNOFFICIAL - the way the portal updates a gateway connection's credentials.
+
+        The documented Update Datasource call stores only the encrypted credentials,
+        and the readable copy of the username (publicCredentialProperties - the
+        Account column, and the username the portal shows) is lost. The portal
+        reads each gateway member's key from
+            GET /v2.0/myorg/me/gatewayClusterDatasources/{id}
+        encrypts the credentials once per member, and sends them all to
+            /v2.0/myorg/me/gatewayClusters/{cluster}/datasources/{id}/credentialsV2
+        Privacy level, encryption and Skip test connection stay as they are, unless
+        -Encryption says otherwise. Throws like any request; Invoke-GLBulkCredentials
+        decides whether the documented way may be tried after a refusal.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$GatewayId,
+        [Parameter(Mandatory)][string]$ConnectionId,
+        [Parameter(Mandatory)][string]$CredentialType,
+        [string]$Username,
+        [string]$Password,
+        [string]$Encryption = 'Keep',
+        [Parameter(Mandatory)][string]$PbiToken,
+        [string]$Method = (Get-GLPortalCredentialMethod)
+    )
+    $ds = Invoke-GLRequest -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources/$ConnectionId" -Token $PbiToken -MaxRetry 2
+    $keys = $ds.memberGatewayPublicKeys
+    $members = @(if ($keys) { $keys.PSObject.Properties | Where-Object { $_.Value } })
+    if ($members.Count -eq 0) { throw 'PORTAL-NOT-USABLE: the data source lists no gateway member keys.' }
+    $cur = $ds.credentialDetails
+    $enc = if ($Encryption -in 'Encrypted', 'NotEncrypted') { $Encryption } elseif ($cur.encryptedConnection) { [string]$cur.encryptedConnection } else { 'Encrypted' }
+    $priv = if ($cur.privacyLevel) { [string]$cur.privacyLevel } else { 'Organizational' }
+    $json = ConvertTo-GLCredentialJson -CredentialType $CredentialType -Username $Username -Password $Password
+    $perMember = [ordered]@{}
+    foreach ($m in $members) {
+        $k = ConvertFrom-GLRsaXmlKey -Base64Xml ([string]$m.Value)
+        $perMember[[string]$m.Name] = [ordered]@{
+            credentialType      = $CredentialType
+            credentials         = (ConvertTo-GLEncryptedCredential -CredentialJson $json -Modulus $k.modulus -Exponent $k.exponent)
+            encryptedConnection = $enc
+            privacyLevel        = $priv
+            skipTestConnection  = [bool]$cur.skipTestConnection
+            encryptionAlgorithm = 'RSA-OAEP'
+            credentialSources   = @()
+        }
+    }
+    $null = Invoke-GLRequest -Method $Method -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusters/$GatewayId/datasources/$ConnectionId/credentialsV2" `
+        -Token $PbiToken -Body @{ credentialDetails = $perMember } -MaxRetry 0
+    return $members.Count
+}
+
+function Test-GLPortalWayRefused {
+    <#
+        Did the portal's endpoint refuse the request itself - so nothing was changed,
+        and the documented way may be tried instead? The gateway's own answer to the
+        new credentials (its DM_ codes - a wrong password, an unreachable server) is
+        no refusal: they would fail the other way too. No answer at all may still
+        have arrived, so it is never sent a second way.
+    #>
+    param([string]$Message)
+    if ($Message -match 'PORTAL-NOT-USABLE') { return $true }
+    if ($Message -match 'DM_GWPipeline|DMTS_') { return $false }
+    if ($Message -match '-> HTTP (\d{3}) :') { return ([int]$Matches[1] -in 400, 403, 404, 405, 415, 501) }
+    return $false
+}
+
 function Remove-GLConnection {
     # Documented Fabric endpoint: Connections - Delete Connection.
     [CmdletBinding()]
@@ -2099,7 +2185,9 @@ function Invoke-GLBulkCredentials {
         [Parameter(Mandatory)][hashtable]$PublicKeys,   # gateway id (lower case) -> publicKey
         [Parameter(Mandatory)][string]$PbiToken,
         [Parameter(Mandatory)][hashtable]$Progress,
-        $Audit
+        $Audit,
+        [switch]$PortalWay,                                # the portal's way first - keeps the username readable
+        [string]$PortalMethod = (Get-GLPortalCredentialMethod)
     )
     $Progress.Total = @($Items).Count
     $Progress.Done  = 0
@@ -2114,14 +2202,35 @@ function Invoke-GLBulkCredentials {
             $out.Add((New-GLResult $it.Name $it.Id $false "skipped - $($it.Connectivity) connections are not updated here"))
         }
         else {
+            $way = 'documented'; $refused = ''
             try {
-                $key = $PublicKeys[([string]$it.GatewayId).ToLowerInvariant()]
-                $enc = ConvertTo-GLEncryptionSetting -Current $it.Encryption -Choice $EncryptionChoice
-                Set-GLConnectionCredential -GatewayId $it.GatewayId -ConnectionId $it.Id -PublicKey $key `
-                    -CredentialType $CredentialType -Username $Username -Password $Password `
-                    -Privacy $it.Privacy -Encryption $enc -PbiToken $PbiToken
-                Write-GLChange @rec -Result Done
-                $out.Add((New-GLResult $it.Name $it.Id $true "credentials updated ($CredentialType)"))
+                if ($PortalWay) {
+                    # the portal's way first: the username stays readable afterwards
+                    try {
+                        $null = Set-GLConnectionCredentialPortal -GatewayId $it.GatewayId -ConnectionId $it.Id -CredentialType $CredentialType `
+                            -Username $Username -Password $Password -Encryption $EncryptionChoice -PbiToken $PbiToken -Method $PortalMethod
+                        $way = 'portal'
+                    }
+                    catch {
+                        if (-not (Test-GLPortalWayRefused $_.Exception.Message)) { throw }
+                        $refused = ($_.Exception.Message -replace '^PORTAL-NOT-USABLE: ', '')
+                    }
+                }
+                if ($way -eq 'documented') {
+                    $key = $PublicKeys[([string]$it.GatewayId).ToLowerInvariant()]
+                    $enc = ConvertTo-GLEncryptionSetting -Current $it.Encryption -Choice $EncryptionChoice
+                    Set-GLConnectionCredential -GatewayId $it.GatewayId -ConnectionId $it.Id -PublicKey $key `
+                        -CredentialType $CredentialType -Username $Username -Password $Password `
+                        -Privacy $it.Privacy -Encryption $enc -PbiToken $PbiToken
+                }
+                $rec.Details += "; Way=$(if ($way -eq 'portal') { 'like the portal (unofficial)' } else { 'documented API' })"
+                Write-GLChange @rec -Result Done -Message $(if ($refused) { "the portal's way was refused: $refused" } else { '' })
+                $msg = if ($way -eq 'portal') { "credentials updated ($CredentialType)" }
+                       elseif ($refused) { "credentials updated ($CredentialType) the documented way - the portal's way was refused ($(if ($refused -match 'HTTP \d{3}') { $Matches[0] } else { $refused })), so the Account can be empty after a refresh" }
+                       else { "credentials updated ($CredentialType)" }
+                $res = New-GLResult $it.Name $it.Id $true $msg
+                $res | Add-Member -NotePropertyName Way -NotePropertyValue $way
+                $out.Add($res)
             }
             catch {
                 Write-GLChange @rec -Result Failed -Message $_.Exception.Message
@@ -2907,6 +3016,49 @@ function Invoke-GLDemoHttp {
                     }
                     return New-GLDemoReply 200 ([pscustomobject]@{ value = @($v) })
                 }
+                if ($M -eq 'GET' -and $path -match '^/v2\.0/myorg/me/gatewayClusterDatasources/([^/]+)$') {
+                    $c = $s.Connections | Where-Object { $_.id -eq $Matches[1] -and $_.connectivityType -eq 'OnPremisesGateway' } | Select-Object -First 1
+                    if (-not $c) { return New-GLDemoReply 404 (New-GLDemoPbiError 'DMTS_DatasourceNotFoundError' 'The data source was not found.') }
+                    $acc = $s.Accounts[$c.id]
+                    $pub = $s.Rsa[$c.gatewayId].ExportParameters($false)
+                    $xml = '<?xml version="1.0"?><RSAParameters xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' +
+                           "<Exponent>$([Convert]::ToBase64String($pub.Exponent))</Exponent><Modulus>$([Convert]::ToBase64String($pub.Modulus))</Modulus></RSAParameters>"
+                    $keys = [ordered]@{}
+                    foreach ($mb in @($s.Members[$c.gatewayId])) { $keys[[string]$mb.id] = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($xml)) }
+                    return New-GLDemoReply 200 ([pscustomobject]@{
+                        id = $c.id; clusterId = $c.gatewayId; datasourceName = $c.displayName
+                        credentialDetails = [pscustomobject]@{ credentialType = $c.credentialDetails.credentialType; privacyLevel = $c.privacyLevel
+                            encryptedConnection = $(if ($c.credentialDetails.connectionEncryption -eq 'Encrypted') { 'Encrypted' } else { 'NotEncrypted' })
+                            skipTestConnection = [bool]$c.credentialDetails.skipTestConnection; encryptionAlgorithm = 'AES'
+                            publicCredentialProperties = $(if ($acc) { (@(@{ name = 'username'; value = $acc }) | ConvertTo-Json -Compress -AsArray) } else { $null }) }
+                        memberGatewayPublicKeys = [pscustomobject]$keys })
+                }
+                if ($path -match '^/v2\.0/myorg/me/gatewayClusters/([^/]+)/datasources/([^/]+)/credentialsV2$') {
+                    $gid = $Matches[1]; $cid = $Matches[2]
+                    if ($M -ne (Get-GLPortalCredentialMethod)) { return New-GLDemoReply 405 ([pscustomobject]@{ error = [pscustomobject]@{ code = 'MethodNotAllowed'; message = "The requested resource does not support http method '$M'." } }) }
+                    $c = $s.Connections | Where-Object { $_.id -eq $cid -and $_.gatewayId -eq $gid } | Select-Object -First 1
+                    if (-not $c) { return New-GLDemoReply 404 (New-GLDemoPbiError 'DMTS_DatasourceNotFoundError' 'The data source was not found.') }
+                    # like the service: credentials for every member, each one opened by the gateway
+                    $given = $Body.credentialDetails
+                    $user = $null; $pass = $null; $first = $null
+                    foreach ($mb in @($s.Members[$gid])) {
+                        $cd = $given[[string]$mb.id]
+                        if (-not $cd) { return New-GLDemoReply 400 (New-GLDemoPbiError 'InvalidRequest' "No credentials for gateway member $($mb.id).") }
+                        try { $plain = Unprotect-GLDemoCredential $s $gid ([string]$cd.credentials) | ConvertFrom-Json }
+                        catch { return New-GLDemoReply 400 (New-GLDemoPbiError 'DM_GWPipeline_Gateway_InvalidConnectionCredentials' "The gateway could not decrypt the credentials: $($_.Exception.Message)") }
+                        $user = ($plain.credentialData | Where-Object name -eq 'username').value
+                        $pass = ($plain.credentialData | Where-Object { $_.name -in 'password', 'key' }).value
+                        $first = $cd
+                    }
+                    if ($pass -eq 'wrong') { return New-GLDemoReply 400 (New-GLDemoPbiError 'DM_GWPipeline_Gateway_DataSourceAccessError' "Login failed for user '$user'.") }
+                    $c.credentialDetails.credentialType = [string]$first.credentialType
+                    # the portal's way: the username stays readable
+                    if ($user) { $s.Accounts[$c.id] = $user } else { $s.Accounts.Remove($c.id) }
+                    if ($first.privacyLevel) { $c.privacyLevel = [string]$first.privacyLevel }
+                    $s.StatusFail.Remove($c.id)
+                    $s.PortalCredentialCalls = 1 + [int]$s.PortalCredentialCalls
+                    return New-GLDemoReply 200 $null
+                }
                 if ($M -eq 'GET' -and $path -match '^/v1\.0/myorg/gateways$') {
                     return New-GLDemoReply 200 ([pscustomobject]@{ value = @($s.Gateways | Where-Object type -eq 'OnPremises' | ForEach-Object {
                         [pscustomobject]@{ id = $_.id; name = $_.displayName; type = 'Resource'; publicKey = $_.publicKey } }) })
@@ -2937,7 +3089,10 @@ function Invoke-GLDemoHttp {
                         $pass = ($plain.credentialData | Where-Object { $_.name -in 'password', 'key' }).value
                         if ($pass -eq 'wrong') { return New-GLDemoReply 400 (New-GLDemoPbiError 'DM_GWPipeline_Gateway_DataSourceAccessError' "Login failed for user '$user'.") }
                         $c.credentialDetails.credentialType = [string]$cd.credentialType
-                        if ($user) { $s.Accounts[$c.id] = $user } else { $s.Accounts.Remove($c.id) }
+                        # like the real service: the documented call keeps only the encrypted
+                        # credentials - the readable username, the Account column, is gone
+                        $s.Accounts.Remove($c.id)
+                        $s.DocumentedCredentialCalls = 1 + [int]$s.DocumentedCredentialCalls
                         if ($cd.privacyLevel) { $c.privacyLevel = [string]$cd.privacyLevel }
                         $s.StatusFail.Remove($c.id)       # good credentials fix a login failure
                         return New-GLDemoReply 200 $null
@@ -3016,7 +3171,8 @@ $script:WorkerFunctions = @(
     'ConvertTo-GLAccessReportRows', 'Get-GLAccessReport',
     'Resolve-GLPrincipal', 'Test-GLConnection',
     'ConvertTo-GLCredentialJson', 'ConvertTo-GLEncryptedCredential', 'New-GLCredentialDetails',
-    'Set-GLConnectionCredential', 'Invoke-GLBulkMembers',
+    'Set-GLConnectionCredential', 'Invoke-GLBulkMembers', 'Set-GLConnectionCredentialPortal', 'Get-GLPortalCredentialMethod',
+    'ConvertFrom-GLRsaXmlKey', 'Test-GLPortalWayRefused',
     'Remove-GLConnection', 'Set-GLMemberEnabled', 'Test-GLConnectionsBulk', 'Get-GLRoleAssignmentsBulk',
     'Get-GLDatasourceDirectory', 'Resolve-GLHostAddress', 'ConvertTo-GLConnectionRows', 'ConvertTo-GLLocalTime',
     'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'Get-GLDirectoryPrincipalIds', 'ConvertTo-GLPeopleLabels', 'Set-GLRowPeople',
@@ -3591,6 +3747,13 @@ function Invoke-GLSelfTest {
             # an authorisation or not-found error means the call itself is unusable
             $usable = $t.Ok -or ($t.Message -notmatch 'HTTP (401|403|404)')
             Add-Result 'Power BI: test connection' $usable "'$($gc.displayName)': $($t.Message)"
+            # read-only: what updating credentials like the portal needs - a key per member
+            try {
+                $pds  = Invoke-GLRequest -Uri "https://api.powerbi.com/v2.0/myorg/me/gatewayClusterDatasources/$($gc.id)" -Token $pbi -MaxRetry 1
+                $mkey = @(if ($pds.memberGatewayPublicKeys) { $pds.memberGatewayPublicKeys.PSObject.Properties | Where-Object { $_.Value } })
+                if ($mkey.Count) { $null = ConvertFrom-GLRsaXmlKey -Base64Xml ([string]$mkey[0].Value) }
+                Add-Result 'Power BI v2: credentials like the portal (unofficial)' ($mkey.Count -gt 0) $(if ($mkey.Count) { "$($mkey.Count) member key(s) on '$($gc.displayName)' - the username stays visible after an update" } else { 'no member keys - updates use the documented way, and the Account can be empty afterwards' })
+            } catch { Add-Result 'Power BI v2: credentials like the portal (unofficial)' $false "$($_.Exception.Message) - updates use the documented way" }
         }
     }
 
@@ -4029,6 +4192,7 @@ $script:MainXaml = @'
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
                       </Grid.RowDefinitions>
                       <TextBlock Grid.Row="0" Grid.Column="0" Text="Type" Style="{DynamicResource LabelText}" Margin="0,0,6,0"/>
                       <ComboBox Name="CmbCredType" Grid.Row="0" Grid.Column="1" MinHeight="26"/>
@@ -4042,6 +4206,11 @@ $script:MainXaml = @'
                         <Button Name="BtnBulkCredentials" Content="Update credentials"/>
                         <CheckBox Name="ChkCredRetest" Content="Test them afterwards" IsChecked="True" VerticalAlignment="Center" Margin="4,0,0,0"
                                   ToolTip="After the update, test exactly the connections that were updated, and list the ones that still fail."/>
+                      </StackPanel>
+                      <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="4" Orientation="Horizontal" Margin="0,6,0,0">
+                        <CheckBox Name="ChkCredPortal" Content="Like the portal - keeps the username visible" IsChecked="True" VerticalAlignment="Center"
+                                  ToolTip="Updates the credentials the way the portal does, so the Account column and the portal still show the username. Not documented by Microsoft - if it is refused, the documented way is used, and the Account can then be empty."/>
+                        <TextBlock Text="(unofficial)" Foreground="{DynamicResource InkFaint}" VerticalAlignment="Center" Margin="4,0,0,0"/>
                       </StackPanel>
                     </Grid>
                   </GroupBox>
@@ -6666,10 +6835,10 @@ function Invoke-GLBulkCredentialsUi {
     if (-not $pbi) { return }
     $keys = @{} + $script:State.PublicKeys
     Start-GLJob -Bulk -Name "Updating credentials on $($gwItems.Count) connection(s)" `
-        -Arguments @{ P = $pbi; I = $items; T = $type; U = $user; S = $secret; E = $encChoice; K = $keys; A = $audit } `
+        -Arguments @{ P = $pbi; I = $items; T = $type; U = $user; S = $secret; E = $encChoice; K = $keys; A = $audit; W = [bool]$script:UI.ChkCredPortal.IsChecked } `
         -Context @{ Items = $gwItems; Retest = [bool]$script:UI.ChkCredRetest.IsChecked; User = $user } -Work {
-        param($P, $I, $T, $U, $S, $E, $K, $A, $Progress)
-        Invoke-GLBulkCredentials -Items $I -CredentialType $T -Username $U -Password $S -EncryptionChoice $E -PublicKeys $K -PbiToken $P -Progress $Progress -Audit $A
+        param($P, $I, $T, $U, $S, $E, $K, $A, $W, $Progress)
+        Invoke-GLBulkCredentials -Items $I -CredentialType $T -Username $U -Password $S -EncryptionChoice $E -PublicKeys $K -PbiToken $P -Progress $Progress -Audit $A -PortalWay:$W
     } -OnDone {
         param($r, $err, $ctx)
         if ($err) { return }
@@ -6681,7 +6850,10 @@ function Invoke-GLBulkCredentialsUi {
             # to it - so a later refresh can show the Account empty.
             foreach ($row in $ctx.Items) { if ($done -contains [string]$row.Id) { $row.Account = $ctx.User } }
             try { $script:UI.GridConnections.Items.Refresh() } catch { }
-            Write-GLLog "The Account column shows $($ctx.User) for the $($done.Count) updated connection(s). After the next refresh it can be empty: Microsoft's API stores the username encrypted only. The connections use it all the same - Verify status shows it." 'Warn'
+            $plainWay = @($r | Where-Object { $_.Ok -and $_.Way -eq 'documented' }).Count
+            if ($plainWay) {
+                Write-GLLog "$plainWay connection(s) were updated the documented way, which stores the username encrypted only - after the next refresh their Account can be empty. They use $($ctx.User) all the same: Verify status shows it." 'Warn'
+            }
         }
         if ($ctx.Retest -and -not $script:Progress.Cancel) {
             # exactly the ones that took the new credentials - a test shows whether they work

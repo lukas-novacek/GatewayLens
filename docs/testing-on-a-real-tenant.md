@@ -83,7 +83,9 @@ Search for `GatewayLens TEST`, so the list holds that one connection and nothing
 - [ ] Then From = the colleague, To = you, **Move access**. The colleague is gone and
       you keep your role.
 - [ ] **Update credentials** with the right test credentials and *Test them afterwards*
-      ticked - the log says 1 of 1 works.
+      ticked - the log says 1 of 1 works. With *Like the portal* ticked, Refresh: the
+      Account column still shows the username, and so does the portal. If the log
+      says the portal's way was refused, send the HTTP code it names.
 - [ ] Again with a wrong password - the log says it still fails, and *Show > Failing
       tests* lists it. Then put the right credentials back.
 - [ ] Only on the test cluster, with two or more members: **Disable** a member, then
