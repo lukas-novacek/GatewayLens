@@ -185,9 +185,7 @@ $xaml = @'
     <ColumnDefinition Width="600"/>
     <ColumnDefinition Width="*"/>
   </Grid.ColumnDefinitions>
-  <Border Grid.Column="1" Margin="0,74,-330,-160" CornerRadius="14" BorderBrush="{DynamicResource BorderStrong}" BorderThickness="2" ClipToBounds="True" Background="{DynamicResource Surface}">
-    <Image Name="Shot" Stretch="UniformToFill" HorizontalAlignment="Left" VerticalAlignment="Top"/>
-  </Border>
+  <Canvas Name="Cards" Grid.Column="0" Grid.ColumnSpan="2"/>
   <StackPanel Grid.Column="0" Margin="64,66,30,40">
     <StackPanel Orientation="Horizontal">
       <Image Name="Logo" Width="88" Height="88"/>
@@ -205,10 +203,29 @@ $card = [Windows.Markup.XamlReader]::Parse($xaml)
 $null = Set-GLTheme -Target $card -Name 'Dark'
 $logo = Get-GLIconImage
 if ($logo) { $card.FindName('Logo').Source = $logo }
-$shotFile = Join-Path $assets 'screenshot-gateways.png'
-$shot = [System.Windows.Media.Imaging.BitmapImage]::new()
-$shot.BeginInit(); $shot.UriSource = [Uri]::new($shotFile); $shot.CacheOption = 'OnLoad'; $shot.EndInit()
-$card.FindName('Shot').Source = $shot
+# three screens as cards, back to front - each one whole, nothing cut off
+$cards = $card.FindName('Cards')
+foreach ($c in @(
+        @{ File = 'screenshot-kiosk.png';       X = 628; Y = 34;  W = 470 }
+        @{ File = 'screenshot-connections.png'; X = 690; Y = 150; W = 500 }
+        @{ File = 'screenshot-gateways.png';    X = 752; Y = 276; W = 500 })) {
+    $img = [System.Windows.Media.Imaging.BitmapImage]::new()
+    $img.BeginInit(); $img.UriSource = [Uri]::new((Join-Path $assets $c.File)); $img.CacheOption = 'OnLoad'; $img.EndInit()
+    $b = [System.Windows.Controls.Border]::new()
+    $b.Width  = $c.W
+    $b.Height = [Math]::Round($c.W * $img.PixelHeight / $img.PixelWidth)
+    $b.CornerRadius = [System.Windows.CornerRadius]::new(10)
+    $b.BorderThickness = [System.Windows.Thickness]::new(1.5)
+    $b.SetResourceReference([System.Windows.Controls.Border]::BorderBrushProperty, 'BorderStrong')
+    $b.Background = [System.Windows.Media.ImageBrush]::new($img)
+    [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($b, [System.Windows.Media.BitmapScalingMode]::HighQuality)
+    $sh = [System.Windows.Media.Effects.DropShadowEffect]::new()
+    $sh.BlurRadius = 34; $sh.ShadowDepth = 6; $sh.Opacity = 0.7; $sh.Direction = 270
+    $b.Effect = $sh
+    [System.Windows.Controls.Canvas]::SetLeft($b, $c.X)
+    [System.Windows.Controls.Canvas]::SetTop($b, $c.Y)
+    $null = $cards.Children.Add($b)
+}
 foreach ($chip in 'Bulk credentials', 'Hand over access', 'Deleted-account access', 'Live gateway wall', 'Teams alerts') {
     $b = [System.Windows.Controls.Border]::new()
     $b.CornerRadius = [System.Windows.CornerRadius]::new(19)
