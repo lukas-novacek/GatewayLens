@@ -137,11 +137,11 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.10.0'
+$script:AppVersion = '0.10.1'
 # What is new, in a few lines for the window - shown once after an update. The full
 # list is CHANGELOG.md. The tests check that it is about the current version.
 $script:WhatsNew = @{
-    Version = '0.10.0'
+    Version = '0.10.1'
     Lines   = @(
         'Make room before a gateway cluster reaches 1,000: every tile says how many connections are unused, Show > Cleanup candidates lists them with the reason, and Cleanup report... makes a page for the owners.'
         'Right-click connections to verify the status or the users of just the selected ones.'
@@ -6693,7 +6693,7 @@ function Reset-GLSession {
 function Get-GLWorkStatus {
     <#
         The status bar for the jobs running now, from what each one reports: its
-        stage, and how far - "1,500 of 3,200", "about 3,235" from the last time, or
+        stage, and how far - "1,500 of 2,600", "about 2,600" from the last time, or
         "so far". Returns Text, and Max / Value for the bar (Max 0: no total known).
     #>
     param($Jobs)

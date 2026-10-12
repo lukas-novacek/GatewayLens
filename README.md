@@ -373,7 +373,7 @@ format byte for byte.
   and copies or saves what it shows. Everything in it also goes to a daily log file,
   kept for 30 days. The change record is kept for good.
 - The **status bar** says what is running and how far it is - "reading the
-  connections - 1,500 of about 3,200" - and shows what GatewayLens uses: CPU, memory,
+  connections - 1,500 of about 2,600" - and shows what GatewayLens uses: CPU, memory,
   its workers, and the calls it made to Microsoft, with how many were throttled.
 - Both records live in `%LOCALAPPDATA%\GatewayLens\logs` - **Open folder** takes you
   there. With `-LogFolder \\server\share\gatewaylens` a whole team's records sit in

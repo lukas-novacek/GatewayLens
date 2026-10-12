@@ -1190,12 +1190,12 @@ $script:Rules = @{ 'pages/one' = [pscustomobject]@{ value = @(1, 2, 3); continua
 $pg = Get-GLPaged -Uri 'https://x/pages/one' -Token 't' -Report $repTest
 Assert ($pg.Count -eq 5 -and $repTest.Done -eq 5) 'paging reports how many it has so far'
 $jobsNow = @(
-    [pscustomobject]@{ Name = 'Loading connections'; Report = @{ Stage = 'reading the connections'; Done = 1500; Total = 0; Expect = 3235 } }
-    [pscustomobject]@{ Name = 'Loading gateways'; Report = @{ Stage = 'reading the members of each gateway'; Done = 4; Total = 11; Expect = 0 } }
+    [pscustomobject]@{ Name = 'Loading connections'; Report = @{ Stage = 'reading the connections'; Done = 1500; Total = 0; Expect = 2600 } }
+    [pscustomobject]@{ Name = 'Loading gateways'; Report = @{ Stage = 'reading the members of each gateway'; Done = 4; Total = 6; Expect = 0 } }
     [pscustomobject]@{ Name = 'Access for x'; Report = $null })
 $ws = Get-GLWorkStatus -Jobs $jobsNow
-Assert ($ws.Text -match 'Loading connections: reading the connections - 1\D?500 of about 3\D?235' -and $ws.Text -match 'reading the members of each gateway - 4 of 11' -and $ws.Text -match 'Access for x' -and $ws.Max -eq 3235 -and $ws.Value -eq 1500) "the status bar says what each job is doing, and how far ($($ws.Text))"
-$ws2 = Get-GLWorkStatus -Jobs @([pscustomobject]@{ Name = 'Loading connections'; Report = @{ Stage = 'reading the connections'; Done = 4000; Total = 0; Expect = 3235 } })
+Assert ($ws.Text -match 'Loading connections: reading the connections - 1\D?500 of about 2\D?600' -and $ws.Text -match 'reading the members of each gateway - 4 of 6' -and $ws.Text -match 'Access for x' -and $ws.Max -eq 2600 -and $ws.Value -eq 1500) "the status bar says what each job is doing, and how far ($($ws.Text))"
+$ws2 = Get-GLWorkStatus -Jobs @([pscustomobject]@{ Name = 'Loading connections'; Report = @{ Stage = 'reading the connections'; Done = 4000; Total = 0; Expect = 2600 } })
 Assert ($ws2.Value -lt $ws2.Max) 'more than expected: the bar never claims to be finished before it is'
 $mt = Get-GLMeterText -Cpu 3.4 -MemoryBytes 420MB -Busy 6 -Workers 4 -Threads 41 -Calls 1284 -Throttled 3
 Assert ($mt -match '^CPU 3%' -and $mt -match 'Memory 420 MB' -and $mt -match 'Workers 4 of 4 busy, 2 waiting' -and $mt -match 'Threads 41' -and $mt -match 'API calls 1\D?284' -and $mt -match 'throttled 3') "the meter: CPU, memory, workers, threads, calls and throttling ($mt)"

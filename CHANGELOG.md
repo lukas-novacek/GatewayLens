@@ -4,6 +4,11 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.10.1] - 2026-10-13
+
+### Changed
+- The examples in the changelog, the docs and the tests use made-up numbers only.
+
 ## [0.10.0] - 2026-10-13
 
 ### Added
@@ -56,7 +61,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - **The taskbar button says it without a sound**: yellow while a gateway is degraded,
   red while one is offline. The window title says the same, for Alt+Tab.
 - **Progress for loading**: the status bar says what each load is doing and how far it
-  is - "reading the connections - 1,500 of about 3,235", from the last load's count -
+  is - "reading the connections - 1,500 of about 2,600", from the last load's count -
   with a bar that fills. The connection count above the list says the same.
 - **A meter** at the bottom right: GatewayLens's CPU and memory, its busy workers and
   threads, and the calls it made to Microsoft this session - with how many Microsoft
@@ -79,7 +84,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ### Changed
 - **Access lists match the portal.** Accounts that Microsoft Entra ID no longer
   knows are left out of the access panels and the Users count, as in the portal.
-  When there are any, a checkbox says how many - *Show 8 not in Entra ID* - and
+  When there are any, a checkbox says how many - *Show 3 not in Entra ID* - and
   ticked, they are listed too, to be removed. The choice is kept.
 - **What is known about such an account comes from Graph, and only that.** An
   account deleted in the last 30 days is still in the recycle bin: it is shown by
