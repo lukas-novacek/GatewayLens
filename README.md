@@ -25,7 +25,8 @@ Hundreds of gateway connections? Do in minutes what takes days in the portal.</p
 - **Someone leaving?** Move all their access - every connection, every gateway, the
   same roles - to their successor.
 - **Access nobody can see?** Find the roles still held by accounts that were deleted
-  from Microsoft Entra ID. The portal hides them; GatewayLens lists them.
+  from Microsoft Entra ID. The portal hides them; GatewayLens counts them, and shows
+  them when you ask.
 - **A cluster filling up?** Find the connections nobody has used for months, and the
   duplicates, before you hit Microsoft's limit of 1,000.
 - **What is down right now?** A live wall of every gateway cluster, on any screen.
@@ -335,10 +336,11 @@ same as the portal. See [What you will see](#what-you-will-see).
 
 **Will it wake up my VNet gateways?** Not unless you untick *Skip VNet status*.
 
-**Why does GatewayLens list more people than the portal?** The portal leaves out
-accounts that were deleted from Microsoft Entra ID - but they still hold their role
-on the gateway or connection. GatewayLens shows them, marked *Not in Microsoft Entra
-ID*, so you can remove them.
+**What does "Show 8 not in Entra ID" mean?** The portal leaves out accounts that
+were deleted from Microsoft Entra ID - but they still hold their role on the gateway
+or connection. GatewayLens lists the same people as the portal, and counts those
+apart. Tick the box to see them - an account deleted in the last 30 days by name,
+with the day it went - and remove them.
 
 **Does it send my data anywhere?** Only to Microsoft's APIs, which it needs to do its
 job, and it reads two public Microsoft pages for the newest gateway version. There is

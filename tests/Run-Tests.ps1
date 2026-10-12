@@ -1431,7 +1431,27 @@ Assert ((@($orphans | ForEach-Object Name | Sort-Object) -join ',') -eq 'AP Arch
 $apaRoles = Get-GLRoleAssignments -Kind connections -Id $apa.Id -FabricToken $T
 $apaRows  = ConvertTo-GLRoleRows -Assignments $apaRoles -Names $dnames
 $goneRow  = @($apaRows | Where-Object NotInEntra)
-Assert ($goneRow.Count -eq 1 -and $goneRow[0].Principal -eq 'Not in Microsoft Entra ID' -and $goneRow[0].Detail -match 'portal' -and (Format-GLAccessList $apaRows) -match 'not in Entra ID \(Owner\)') 'the access panel and the log say who is not in Entra ID, and that the portal leaves them out'
+Assert ($goneRow.Count -eq 1 -and $goneRow[0].Principal -eq 'Tom Wright (deleted)' -and $goneRow[0].Detail -match 'tom\.wright@contoso\.com - deleted from Microsoft Entra ID on \d{4}-\d\d-\d\d' -and $goneRow[0].Detail -match 'portal' -and (Format-GLAccessList $apaRows) -match 'not in Entra ID\] \(Owner\)') "the access panel and the log say who is not in Entra ID, and that the portal leaves them out ($($goneRow[0].Principal): $($goneRow[0].Detail))"
+# what Graph can say: deleted lately - still in the recycle bin, with a name; long gone; or nothing
+$oldId = ([string]$s.Deleted[1].id).ToLowerInvariant()
+$why   = Get-GLMissingPrincipals -Ids @($tomKey, $oldId) -GraphToken $T
+Assert ($why[$tomKey].State -eq 'Deleted' -and $why[$tomKey].Name -eq 'Tom Wright' -and $why[$tomKey].DeletedOn -is [datetime] -and $why[$oldId].State -eq 'Gone') "an account deleted lately is named from the recycle bin; one gone for good is called deleted, without a name ($($why[$tomKey].State), $($why[$oldId].State))"
+$oldLabel = Get-GLPrincipalLabel -Principal ([pscustomobject]@{ id = $oldId; type = 'User' }) -Names $why
+$unkLabel = Get-GLPrincipalLabel -Principal ([pscustomobject]@{ id = 'x1'; type = 'User' }) -Names @{ x1 = [pscustomobject]@{ Name = ''; Email = ''; Missing = $true; State = 'Unknown' } }
+Assert ($oldLabel.Name -eq 'Deleted account' -and $oldLabel.Key -eq $oldId -and $unkLabel.Name -eq 'Not found in Microsoft Entra ID' -and (Get-GLMissingText $unkLabel) -match 'would not say') 'an account Graph would not tell about is never called deleted - and each is known by its id only'
+Assert ($apa.Users -eq '2' -and $apa.UserNames -match '\+1 not in Entra ID') "the Users column counts whom the portal shows; the account not in Entra ID is added apart ($($apa.Users): $($apa.UserNames))"
+$prodGwId    = [string](@($s.Gateways | Where-Object { $_.displayName -like '*Prod*' })[0].id)
+$prodGwRoles = Get-GLRoleAssignments -Kind gateways -Id $prodGwId -FabricToken $T
+$prodNames   = Get-GLPrincipalNames -Ids @($prodGwRoles | ForEach-Object { [string]$_.principal.id }) -GraphToken $T
+$prodRows    = ConvertTo-GLRoleRows -Assignments $prodGwRoles -Names $prodNames
+Assert (@($prodRows | Where-Object NotInEntra).Count -eq 1 -and @($prodRows | Where-Object { -not $_.NotInEntra }).Count -eq 3) 'the Prod gateway: three people the portal shows, and an admin who left years ago'
+# the countdown on the Gateways tab
+$at = Get-Date '2026-10-12 10:00:00'
+Assert ((Get-GLCountdownText -LastRefresh $at -NextAt $at.AddSeconds(102) -Now $at) -eq 'Updated 10:00:00   |   next in 1:42' -and
+        (Get-GLCountdownText -LastRefresh $at -NextAt $null -Now $at) -eq 'Updated 10:00:00' -and
+        (Get-GLCountdownText -LastRefresh $at -NextAt $at.AddSeconds(-5) -Now $at) -match 'next in 0:00' -and
+        (Get-GLCountdownText -LastRefresh $at -NextAt $at.AddSeconds(30) -Busy $true -Now $at) -match 'refreshing now') 'the Gateways tab says when it was updated and counts down to the next refresh'
+
 $idle  = @($crow | Where-Object { $_.UnusedDays -gt 30 })
 $never = @($crow | Where-Object { -not $_.LastUsed })
 Assert (@($crow | Where-Object Created).Count -eq 27 -and $idle.Count -ge 2 -and $never.Count -ge 2) "the demo has connection recency: all created, $($idle.Count) idle for over a month, $($never.Count) never used"
@@ -1716,11 +1736,22 @@ Assert ($paramNames.Count -ge 10 -and -not $aliasWrites) "no parameter is overwr
 $newObj = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'New-Object' }, $true))
 Assert ($newObj.Count -eq 0) "no New-Object in the script - it wraps objects, and WPF stored a wrapped brush as text $(if ($newObj.Count) { '- line ' + (($newObj | ForEach-Object { $_.Extent.StartLineNumber }) -join ', ') })"
 
+# back to the start page: the next window starts with nothing from the last one
+$keepReset = @{ State = $script:State; UI = $script:UI; Auth = $script:Auth; Who = $script:SignedInAs; Mode = $script:AuthMode; Tenant = $script:TenantShown; Ready = $script:LogReady; Jobs = $script:Jobs }
+$script:State.ConnRows = @(1, 2, 3); $script:State.Names['x'] = 'y'; $script:UI = @{ X = 1 }
+$script:SignedInAs = 'someone@contoso.com'; $script:AuthMode = 'Demo'
+$script:LogEntries.Add([pscustomobject]@{ Level = 'Error'; Line = 'old error' })
+Reset-GLSession
+Assert (@($script:State.ConnRows).Count -eq 0 -and $script:State.Names.Count -eq 0 -and $script:UI.Count -eq 0 -and -not $script:SignedInAs -and -not $script:AuthMode -and $script:LogEntries.Count -eq 0 -and @($script:EarlierErrors | Where-Object Line -eq 'old error').Count -eq 1) 'back to the start page: no rows, names, window or account remain - and earlier errors are kept for the smoke test'
+$script:EarlierErrors.Clear()
+$script:State = $keepReset.State; $script:UI = $keepReset.UI; $script:Auth = $keepReset.Auth; $script:SignedInAs = $keepReset.Who
+$script:AuthMode = $keepReset.Mode; $script:TenantShown = $keepReset.Tenant; $script:LogReady = $keepReset.Ready; $script:Jobs = $keepReset.Jobs
+
 # what the window checks after the smoke run, tested on any OS by setting the state it reads
 $keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
 $keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
 $script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
-$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true }
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true; GoneOk = $true; CountdownOk = $true; AgainOk = $true }
 $keepStart = $script:StartPageResult; $script:StartPageResult = 'Demo'
 $keepTiles = $script:State.Tiles
 $script:State.GatewayRows = @(1..5); $script:State.ConnRows = @(1..27)
@@ -1740,6 +1771,11 @@ Assert (((Get-GLSmokeVerdict) -join ' ') -match 'kiosk view') 'smoke verdict: a 
 $script:Smoke.KioskOk = $true; $script:Smoke.GridChecks = 'a cell wrote its text back into the row'
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'grids: a cell wrote') 'smoke verdict: a grid that sorts, opens or copies wrongly fails'
 $script:Smoke.GridChecks = ''
+foreach ($k in 'GoneOk', 'CountdownOk', 'AgainOk') {
+    $script:Smoke[$k] = $false
+    Assert ((Get-GLSmokeVerdict).Count -ge 1) "smoke verdict: $k false fails"
+    $script:Smoke[$k] = $true
+}
 $script:StartPageResult = 'Fallback'
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'start page') 'smoke verdict: a start page that did not open, or whose demo button did nothing, fails'
 $script:StartPageResult = 'Demo'

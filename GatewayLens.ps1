@@ -137,16 +137,18 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.8.1'
+$script:AppVersion = '0.8.2'
 # What is new, in a few lines for the window - shown once after an update. The full
 # list is CHANGELOG.md. The tests check that it is about the current version.
 $script:WhatsNew = @{
-    Version = '0.8.1'
+    Version = '0.8.2'
     Lines   = @(
+        'Access lists match the portal. Accounts that are no longer in Microsoft Entra ID are counted apart - tick Show to see or remove them.'
+        'A countdown to the next automatic refresh on the Gateways tab.'
+        'From the demo straight to the start page: Sign in to your tenant.'
         'Update credentials the way the portal does: the username stays visible in the Account column and in the portal.'
         'A start page: sign in when you are ready, or try the demo first.'
         'Names everywhere: the Users column and the User filter show people, not object ids.'
-        'Access left behind by deleted accounts - the portal hides it, GatewayLens shows it: Show > Access by accounts not in Entra ID.'
         'A coloured activity log that follows the text size - green done, amber warnings, red failures.'
         'Panels you can resize by dragging, remembered for next time.'
         'Kiosk view and help moved to the top bar. Press F1 for help.'
@@ -912,26 +914,26 @@ function ConvertTo-GLAccessReportRows {
     $ic = [System.StringComparison]::OrdinalIgnoreCase
     $rows = [System.Collections.Generic.List[object]]::new()
     $row = {
-        param($T, $Principal, $Email, $PType, $Role, $PrincipalId)
+        param($T, $Principal, $Email, $PType, $Role, $PrincipalId, $InEntra)
         [pscustomobject][ordered]@{
             Kind = $(if ($T.Kind -eq 'gateways') { 'Gateway' } else { 'Connection' })
             Target = [string]$T.Name; Gateway = [string]$T.Gateway; Type = [string]$T.Type; Path = [string]$T.Path
             Account = [string]$T.Account; LastUsed = [string]$T.LastUsed
             Principal = [string]$Principal; Email = [string]$Email; PrincipalType = [string]$PType; Role = [string]$Role
-            PrincipalId = [string]$PrincipalId; TargetId = [string]$T.Id
+            InEntraId = [string]$InEntra; PrincipalId = [string]$PrincipalId; TargetId = [string]$T.Id
         }
     }
     foreach ($t in $Targets) {
         $ras = $Assignments["$($t.Kind)/$($t.Id)"]
         if ($null -eq $ras) {
-            if (-not $w) { $rows.Add((& $row $t '' '' '' '(could not be read)' '')) }
+            if (-not $w) { $rows.Add((& $row $t '' '' '' '(could not be read)' '' '')) }
             continue
         }
         foreach ($as in $ras) {
             $p = $as.principal
             $label = Get-GLPrincipalLabel -Principal $p -Names $Names
             if ($w -and ("$($label.Name)|$($label.Email)|$($p.id)").IndexOf($w, $ic) -lt 0) { continue }
-            $rows.Add((& $row $t $label.Name $label.Email $p.type $as.role $p.id))
+            $rows.Add((& $row $t $label.Name $label.Email $p.type $as.role $p.id $(if ($label.Missing) { 'No' } else { 'Yes' })))
         }
     }
     return , $rows.ToArray()
@@ -1085,6 +1087,7 @@ function Get-GLPrincipalNames {
     $want = @($Ids | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Sort-Object -Unique |
               Where-Object { -not $Known.ContainsKey($_) })
     if (-not $GraphToken -or $want.Count -eq 0) { return $out }
+    $missing = [System.Collections.Generic.List[string]]::new()
     for ($i = 0; $i -lt $want.Count; $i += 1000) {
         $chunk = @($want[$i..([Math]::Min($i + 1000, $want.Count) - 1)])
         $r = Invoke-GLRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/directoryObjects/getByIds' -Token $GraphToken `
@@ -1095,8 +1098,74 @@ function Get-GLPrincipalNames {
             if (-not $mail -and $o.appId) { $mail = "app $($o.appId)" }
             $out[([string]$o.id).ToLowerInvariant()] = [pscustomobject]@{ Name = [string]$o.displayName; Email = [string]$mail; Missing = $false }
         }
-        foreach ($id in $chunk) {
-            if (-not $out.ContainsKey($id)) { $out[$id] = [pscustomobject]@{ Name = ''; Email = ''; Missing = $true } }
+        foreach ($id in $chunk) { if (-not $out.ContainsKey($id)) { $missing.Add($id) } }
+    }
+    if ($missing.Count) {
+        $why = Get-GLMissingPrincipals -Ids $missing.ToArray() -GraphToken $GraphToken
+        foreach ($id in $missing) { $out[$id] = $why[$id] }
+    }
+    return $out
+}
+
+function Get-GLGraphBatch {
+    # Graph's $batch: up to 20 GET requests in one call. -Urls are relative to v1.0,
+    # like /directoryObjects/{id}. Returns url -> Status, Body.
+    param([string[]]$Urls, [string]$GraphToken)
+    $out = @{}
+    $all = @($Urls | Where-Object { $_ })
+    for ($i = 0; $i -lt $all.Count; $i += 20) {
+        $chunk = @($all[$i..([Math]::Min($i + 20, $all.Count) - 1)])
+        $reqs = for ($j = 0; $j -lt $chunk.Count; $j++) { [ordered]@{ id = [string]$j; method = 'GET'; url = $chunk[$j] } }
+        $r = Invoke-GLRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/$batch' -Token $GraphToken -Body @{ requests = @($reqs) } -MaxRetry 2
+        foreach ($resp in @($r.responses)) {
+            if ($null -eq $resp) { continue }
+            $out[$chunk[[int]$resp.id]] = [pscustomobject]@{ Status = [int]$resp.status; Body = $resp.body }
+        }
+    }
+    return $out
+}
+
+function Get-GLMissingPrincipals {
+    <#
+        What Graph can tell about ids that getByIds did not return. Its recycle bin
+        first: an account deleted in the last 30 days is still there, with its name
+        and the day it went (State Deleted). Then the directory: "no such object"
+        means it is gone for good (Gone). When Graph refuses to say, the id stays
+        Unknown - and is never called deleted.
+        Returns id -> Name, Email, Missing, State, DeletedOn.
+    #>
+    param([string[]]$Ids, [string]$GraphToken)
+    $out = @{}
+    $list = @($Ids | Where-Object { $_ })
+    foreach ($id in $list) { $out[$id] = [pscustomobject]@{ Name = ''; Email = ''; Missing = $true; State = 'Unknown'; DeletedOn = $null } }
+    if ($list.Count -eq 0 -or -not $GraphToken) { return $out }
+    $bin = @{}
+    try { $bin = Get-GLGraphBatch -Urls @($list | ForEach-Object { "/directory/deletedItems/$_" }) -GraphToken $GraphToken } catch { return $out }
+    $ask = [System.Collections.Generic.List[string]]::new()
+    foreach ($id in $list) {
+        $r = $bin["/directory/deletedItems/$id"]
+        if ($r -and $r.Status -eq 200 -and $r.Body) {
+            $b = $r.Body
+            # a deleted user's UPN gets its object id in front - the mail stays as it was
+            $mail = @($b.mail, ([string]$b.userPrincipalName -replace '^[0-9a-fA-F]{32}', '')) | Where-Object { $_ } | Select-Object -First 1
+            $out[$id] = [pscustomobject]@{ Name = [string]$b.displayName; Email = [string]$mail; Missing = $true; State = 'Deleted'
+                                           DeletedOn = (ConvertTo-GLLocalTime $b.deletedDateTime) }
+        }
+        elseif ($r -and $r.Status -eq 404) { $out[$id].State = 'Gone' }
+        else { $ask.Add($id) }
+    }
+    if ($ask.Count) {
+        $dir = @{}
+        try { $dir = Get-GLGraphBatch -Urls @($ask | ForEach-Object { "/directoryObjects/$_" }) -GraphToken $GraphToken } catch { }
+        foreach ($id in $ask) {
+            $r = $dir["/directoryObjects/$id"]
+            if ($r -and $r.Status -eq 404) { $out[$id].State = 'Gone' }
+            elseif ($r -and $r.Status -eq 200 -and $r.Body) {
+                $b = $r.Body
+                $mail = @($b.userPrincipalName, $b.mail) | Where-Object { $_ } | Select-Object -First 1
+                if (-not $mail -and $b.appId) { $mail = "app $($b.appId)" }
+                $out[$id] = [pscustomobject]@{ Name = [string]$b.displayName; Email = [string]$mail; Missing = $false; State = 'Found'; DeletedOn = $null }
+            }
         }
     }
     return $out
@@ -1132,14 +1201,22 @@ function Get-GLPrincipalLabel {
     $id = ([string]$Principal.id).ToLowerInvariant()
     $n  = if ($Names -and $id -and $Names.ContainsKey($id)) { $Names[$id] } else { $null }
     $missing = [bool]($n -and $n.Missing)
+    $state = if ($missing) { [string]$n.State } else { '' }
     $app = if ($Principal.servicePrincipalDetails.aadAppId) { "app $($Principal.servicePrincipalDetails.aadAppId)" } else { '' }
     $name  = @($n.Name, $Principal.displayName) | Where-Object { $_ } | Select-Object -First 1
     $email = @($n.Email, $Principal.userDetails.userPrincipalName, $Principal.groupDetails.email, $app) | Where-Object { $_ } | Select-Object -First 1
+    $shown = if ($missing) {
+        # only what Graph confirmed: a deleted account by name, gone for good, or not known
+        if ($state -eq 'Deleted' -and $name) { "$name (deleted)" } elseif ($state -in 'Deleted', 'Gone') { 'Deleted account' } else { 'Not found in Microsoft Entra ID' }
+    } elseif ($name) { [string]$name } else { [string]$Principal.id }
     return [pscustomobject]@{
-        Name    = $(if ($name) { [string]$name } elseif ($missing) { 'Not in Microsoft Entra ID' } else { [string]$Principal.id })
-        Email   = [string]$email
-        Key     = $(if ($email) { [string]$email } elseif ($name) { [string]$name } else { [string]$Principal.id })
-        Missing = $missing
+        Name      = $shown
+        Email     = [string]$email
+        # an account that is not in Entra ID can only be named by its id - for a handover, a removal
+        Key       = $(if ($missing) { [string]$Principal.id } elseif ($email) { [string]$email } elseif ($name) { [string]$name } else { [string]$Principal.id })
+        Missing   = $missing
+        State     = $state
+        DeletedOn = $(if ($missing) { $n.DeletedOn } else { $null })
     }
 }
 
@@ -1169,13 +1246,31 @@ function Set-GLRowPeople {
     #>
     param($Row, $Labels)
     $l = @($Labels | Where-Object { $_ })
+    $live = @($l | Where-Object { -not $_.Missing })
+    $gone = @($l | Where-Object { $_.Missing })
     $Row.UserList = @($l | ForEach-Object { [string]$_.Key } | Where-Object { $_ })
-    $Row.Users    = [string]$l.Count
-    $shown = @($l | ForEach-Object { if ($_.Missing -and -not $_.Email) { "$($_.Key) (not in Entra ID)" } elseif ($_.Email) { $_.Email } else { $_.Name } })
+    $Row.Users    = [string]$live.Count             # as many as the portal lists
+    $shown = @($live | ForEach-Object { if ($_.Email) { $_.Email } else { $_.Name } })
+    if ($gone.Count) { $shown += "+$($gone.Count) not in Entra ID" }
     # rows made elsewhere - in the tests, by older code - may not have these yet
     $Row | Add-Member -NotePropertyName UserNames -NotePropertyValue ($shown -join '; ') -Force
     $Row | Add-Member -NotePropertyName People -NotePropertyValue $l -Force
     $Row | Add-Member -NotePropertyName UnknownUsers -NotePropertyValue @($l | Where-Object { $_.Missing }).Count -Force
+}
+
+function Get-GLMissingText {
+    # Why a principal is not named, in the words of what Graph said.
+    param($Label)
+    $tail = 'the portal leaves it out, but it still has this role'
+    switch ([string]$Label.State) {
+        'Deleted' {
+            $on = if ($Label.DeletedOn) { ' on ' + ([datetime]$Label.DeletedOn).ToString('yyyy-MM-dd') } else { '' }
+            $who = if ($Label.Email) { "$($Label.Email) - " } else { '' }
+            return "${who}deleted from Microsoft Entra ID$on - $tail"
+        }
+        'Gone'  { return "Microsoft Entra ID has no account with this id any more - $tail" }
+        default { return "Graph would not say who this is - you may not be allowed to see it. $($tail.Substring(0,1).ToUpper())$($tail.Substring(1))" }
+    }
 }
 
 function Format-GLAccessList {
@@ -1184,7 +1279,7 @@ function Format-GLAccessList {
     $all = @($Rows | Where-Object { $_ })
     if ($all.Count -eq 0) { return 'nobody' }
     return (@($all | ForEach-Object {
-        $who = if ($_.NotInEntra) { "$($_.PrincipalId) - not in Entra ID" } elseif ($_.Detail) { $_.Detail } else { $_.Principal }
+        $who = if ($_.NotInEntra) { "$($_.Principal) [$($_.PrincipalId) - not in Entra ID]" } elseif ($_.Detail) { $_.Detail } else { $_.Principal }
         "$who ($($_.Role))"
     }) -join ', ')
 }
@@ -1195,10 +1290,10 @@ function ConvertTo-GLRoleRows {
     foreach ($a in $Assignments) {
         $p = $a.principal
         $label = Get-GLPrincipalLabel -Principal $p -Names $Names
-        $gone  = $label.Missing -and -not $label.Email
+        $gone  = [bool]$label.Missing
         $rows.Add([pscustomobject]@{
             Principal   = $label.Name
-            Detail      = $(if ($gone) { 'Deleted? Entra ID does not know this id - the portal leaves it out' } else { $label.Email })
+            Detail      = $(if ($gone) { Get-GLMissingText $label } else { $label.Email })
             Type        = [string]$p.type
             Role        = [string]$a.role
             Id          = [string]$a.id
@@ -1529,9 +1624,9 @@ function Set-GLConnectionCredential {
 }
 
 function Get-GLPortalCredentialMethod {
-    # The HTTP method of the portal's credentialsV2 call. One place, so the demo
-    # answers exactly what the real service accepts.
-    return 'PUT'
+    # The HTTP method of the portal's credentialsV2 call, as the portal sends it. One
+    # place, so the demo answers exactly what the real service accepts.
+    return 'PATCH'
 }
 
 function ConvertFrom-GLRsaXmlKey {
@@ -2372,7 +2467,8 @@ function Get-GLRowHeight {
 function New-GLDefaultSettings {
     # Layout: the panel sizes the user dragged to. SeenVersion: the last version whose
     # news was shown. LastAccount: who signed in last, offered on the start page.
-    return [ordered]@{ Theme = 'Light'; FontSize = 12; History = [ordered]@{}; Layout = [ordered]@{}; SeenVersion = ''; LastAccount = '' }
+    # ShowGone: list accounts that are not in Entra ID in the access panels too.
+    return [ordered]@{ Theme = 'Light'; FontSize = 12; History = [ordered]@{}; Layout = [ordered]@{}; SeenVersion = ''; LastAccount = ''; ShowGone = $false }
 }
 
 function Read-GLSettings {
@@ -2385,6 +2481,7 @@ function Read-GLSettings {
         if ($j.Theme)    { $s.Theme = [string]$j.Theme }
         if ($j.FontSize) { $s.FontSize = [Math]::Max(9, [Math]::Min(20, [int]$j.FontSize)) }
         if ($j.SeenVersion) { $s.SeenVersion = [string]$j.SeenVersion }
+        if ($j.ShowGone -is [bool]) { $s.ShowGone = $j.ShowGone }
         if ($j.LastAccount -and [string]$j.LastAccount -match '^[^\s@]+@[^\s@]+$') { $s.LastAccount = [string]$j.LastAccount }
         if ($j.Layout) {
             foreach ($p in $j.Layout.PSObject.Properties) {
@@ -2712,7 +2809,10 @@ function New-GLDemoStore {
     )
     # someone who left: their account is deleted, Graph no longer knows the id,
     # and the portal leaves them out - but they still have access
-    $s.Deleted = @([pscustomobject]@{ id = New-GLDemoId 'user|tom.wright' })
+    $s.Deleted = @(
+        [pscustomobject]@{ id = New-GLDemoId 'user|tom.wright'; displayName = 'Tom Wright'; mail = 'tom.wright@contoso.com'; DeletedOn = (Get-Date).Date.AddDays(-12) }
+        [pscustomobject]@{ id = New-GLDemoId 'user|old.admin'; displayName = ''; mail = ''; DeletedOn = $null }    # long gone - not even in the recycle bin
+    )
 
     # ---- gateways: one of every state ----
     $s.Gateways = [System.Collections.Generic.List[object]]::new()
@@ -2845,6 +2945,9 @@ function New-GLDemoStore {
     $tom = $s.Deleted[0]
     $null = Add-GLDemoRole $s "connections/$($cn['AP Archive'])" $tom 'Owner'
     $null = Add-GLDemoRole $s "connections/$($cn['Treasury Oracle'])" $tom 'User'
+    # and an admin who left years ago is still an admin of the Prod gateway
+    $prodGw = $s.Gateways | Where-Object { $_.displayName -like '*Prod*' } | Select-Object -First 1
+    $null = Add-GLDemoRole $s "gateways/$($prodGw.id)" $s.Deleted[1] 'Admin'
     return $s
 }
 
@@ -3132,6 +3235,24 @@ function Invoke-GLDemoHttp {
                     }
                     return New-GLDemoReply 200 ([pscustomobject]@{ value = @($found) })
                 }
+                if ($M -eq 'POST' -and $path -eq '/v1.0/$batch') {
+                    $answers = foreach ($q in @($Body.requests)) {
+                        $sub = Invoke-GLDemoHttp -Method ([string]$q.method) -Uri ('https://graph.microsoft.com/v1.0' + [string]$q.url) -Body $null
+                        [pscustomobject]@{ id = [string]$q.id; status = [int]$sub.Status; body = $sub.Body }
+                    }
+                    return New-GLDemoReply 200 ([pscustomobject]@{ responses = @($answers) })
+                }
+                if ($M -eq 'GET' -and $path -match '^/v1\.0/directory/deletedItems/([^/]+)$') {
+                    $d = @($s.Deleted) | Where-Object { $_ -and $_.id -eq $Matches[1] -and $_.DeletedOn } | Select-Object -First 1
+                    if (-not $d) { return $notFound }
+                    return New-GLDemoReply 200 ([pscustomobject]@{ id = $d.id; displayName = $d.displayName; mail = $d.mail
+                        userPrincipalName = ($d.id -replace '-', '') + $d.mail; deletedDateTime = $d.DeletedOn.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') })
+                }
+                if ($M -eq 'GET' -and $path -match '^/v1\.0/directoryObjects/([^/]+)$') {
+                    $p = Get-GLDemoPrincipal $s $Matches[1]
+                    if (-not $p -or (@($s.Deleted) | Where-Object { $_ -and $_.id -eq $Matches[1] })) { return $notFound }
+                    return New-GLDemoReply 200 ([pscustomobject]@{ id = $p.id; displayName = $p.displayName; userPrincipalName = $p.userDetails.userPrincipalName })
+                }
                 if ($M -eq 'GET' -and $path -eq '/v1.0/me') {
                     $me = $s.Users | Where-Object userPrincipalName -eq $s.Me | Select-Object -First 1
                     return New-GLDemoReply 200 ([pscustomobject]@{ id = $me.id; userPrincipalName = $me.userPrincipalName })
@@ -3172,7 +3293,7 @@ $script:WorkerFunctions = @(
     'Resolve-GLPrincipal', 'Test-GLConnection',
     'ConvertTo-GLCredentialJson', 'ConvertTo-GLEncryptedCredential', 'New-GLCredentialDetails',
     'Set-GLConnectionCredential', 'Invoke-GLBulkMembers', 'Set-GLConnectionCredentialPortal', 'Get-GLPortalCredentialMethod',
-    'ConvertFrom-GLRsaXmlKey', 'Test-GLPortalWayRefused',
+    'ConvertFrom-GLRsaXmlKey', 'Test-GLPortalWayRefused', 'Get-GLGraphBatch', 'Get-GLMissingPrincipals', 'Get-GLMissingText',
     'Remove-GLConnection', 'Set-GLMemberEnabled', 'Test-GLConnectionsBulk', 'Get-GLRoleAssignmentsBulk',
     'Get-GLDatasourceDirectory', 'Resolve-GLHostAddress', 'ConvertTo-GLConnectionRows', 'ConvertTo-GLLocalTime',
     'Get-GLGatewayNameMap', 'Add-GLDirectoryInfo', 'Get-GLDirectoryPrincipalIds', 'ConvertTo-GLPeopleLabels', 'Set-GLRowPeople',
@@ -3768,9 +3889,11 @@ function Invoke-GLSelfTest {
             try {
                 $n = Get-GLPrincipalNames -Ids $ids -GraphToken $gr
                 $named = @($n.Values | Where-Object { -not $_.Missing }).Count
-                $gone  = $ids.Count - $named
-                $tail  = if ($named -eq 0) { ' - access lists will show object ids' }
-                         elseif ($gone) { "; $gone not in Microsoft Entra ID - deleted accounts, which the portal does not show" } else { '' }
+                $del   = @($n.Values | Where-Object { $_.Missing -and $_.State -in 'Deleted', 'Gone' }).Count
+                $unk   = @($n.Values | Where-Object { $_.Missing -and $_.State -notin 'Deleted', 'Gone' }).Count
+                $tail  = if ($named -eq 0) { ' - access lists will show object ids' } else { '' }
+                if ($del) { $tail += "; $del deleted from Microsoft Entra ID - the portal does not show them, but they still have their roles" }
+                if ($unk) { $tail += "; $unk Graph would not say who they are" }
                 Add-Result 'Graph: names in access lists' ($named -gt 0) "$named of $($ids.Count) id(s) named$tail"
             } catch { Add-Result 'Graph: names in access lists' $false "$($_.Exception.Message) - access lists will show object ids" }
         }
@@ -3875,6 +3998,8 @@ $script:MainXaml = @'
       <DockPanel>
         <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
           <TextBlock Name="TxtIdentity" VerticalAlignment="Center" Foreground="{DynamicResource InkMuted}" Margin="0,0,14,0"/>
+          <Button Name="BtnSignInReal" Content="Sign in to your tenant" Style="{DynamicResource PrimaryButton}" Visibility="Collapsed" Margin="0,0,14,0"
+                  ToolTip="Leave the demo and go back to the start page, to sign in with your own account."/>
           <Button Name="BtnKiosk" Style="{DynamicResource KioskButton}" Margin="0,0,14,0"
                   ToolTip="Kiosk view: full screen, gateway tiles only, nothing that changes anything - for a wall screen. F11 goes in and out, Esc leaves it.">
             <StackPanel Orientation="Horizontal">
@@ -4032,6 +4157,8 @@ $script:MainXaml = @'
             <DockPanel Grid.Column="2">
               <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                  <CheckBox Name="ChkGwShowGone" Visibility="Collapsed" VerticalAlignment="Center" Margin="0,0,12,0"
+                            ToolTip="Accounts Microsoft Entra ID does not know any more - deleted ones. The portal leaves them out, but they still hold their roles. Show them to see or remove them."/>
                   <Button Name="BtnGwAccessAdd" Content="Add..."/>
                   <Button Name="BtnGwAccessRemove" Content="Remove" Style="{DynamicResource DangerButton}" Margin="0"/>
                 </StackPanel>
@@ -4113,6 +4240,8 @@ $script:MainXaml = @'
             <DockPanel Grid.Column="0">
               <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                  <CheckBox Name="ChkCnShowGone" Visibility="Collapsed" VerticalAlignment="Center" Margin="0,0,12,0"
+                            ToolTip="Accounts Microsoft Entra ID does not know any more - deleted ones. The portal leaves them out, but they still hold their roles. Show them to see or remove them."/>
                   <Button Name="BtnCnTest" Content="Test"/>
                   <Button Name="BtnCnCopyId" Content="Copy id"/>
                   <Button Name="BtnCnAccessAdd" Content="Add..."/>
@@ -5057,31 +5186,38 @@ $script:IconPng = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAQW0lEQVR42t2be
 
 
 $script:UI    = @{}
-$script:State = @{
-    Gateways     = @()
-    GatewayList  = @()
-    Members      = @{}
-    Live         = $null
-    GatewayRows  = @()
-    Tiles        = @()
-    DownSince    = @{}
-    VnetSkipped  = $true
-    Releases     = $null
-    Directory    = $null
-    Names        = @{}         # principal id -> Name, Email - from Graph, kept for the session
-    NamesWarned  = $false
-    CnAccessFor  = ''
-    GatewayState = @{}
-    PublicKeys   = @{}
-    ConnRows     = @()
-    Excluded     = [System.Collections.Generic.HashSet[string]]::new()
-    Populating   = $false
-    LastRefresh  = $null
+function New-GLState {
+    # Everything one window knows about the tenant - new for every window, so going
+    # back to the start page leaves nothing of the last session behind.
+    return @{
+        Gateways     = @()
+        GatewayList  = @()
+        Members      = @{}
+        Live         = $null
+        GatewayRows  = @()
+        Tiles        = @()
+        DownSince    = @{}
+        VnetSkipped  = $true
+        Releases     = $null
+        Directory    = $null
+        Names        = @{}         # principal id -> Name, Email - from Graph, kept for the session
+        NamesWarned  = $false
+        CnAccessFor  = ''
+        GatewayState = @{}
+        PublicKeys   = @{}
+        ConnRows     = @()
+        Excluded     = [System.Collections.Generic.HashSet[string]]::new()
+        Populating   = $false
+        LastRefresh  = $null
+        AccessRows   = @{ gateways = @(); connections = @() }   # what the access panels hold, before the Entra filter
+    }
 }
+$script:State = New-GLState
 # Shared with the bulk worker: it writes Total and Done, the window sets Cancel.
 $script:Progress = [hashtable]::Synchronized(@{ Active = $false; Name = ''; Total = 0; Done = 0; Cancel = $false })
 
 $script:LogEntries = [System.Collections.Generic.List[object]]::new()
+$script:EarlierErrors = [System.Collections.Generic.List[object]]::new()   # from windows closed to go back to the start page
 
 function Test-GLLogVisible($Entry) {
     $lvl = [string]$script:UI.CmbLogLevel.SelectedItem
@@ -5726,6 +5862,29 @@ function Update-GLActions {
     }
 }
 
+function Reset-GLSession {
+    <#
+        Back to the start page: the window has closed, and the next one - in the demo
+        or signed in, maybe as someone else - starts with nothing from this one.
+    #>
+    foreach ($tm in $script:AutoTimer, $script:ClockTimer, $script:Timer) { try { if ($tm) { $tm.Stop() } } catch { } }
+    foreach ($tm in @($script:Debounce.Values)) { try { if ($tm) { $tm.Stop() } } catch { } }
+    # a smoke test still judges what went wrong before
+    foreach ($e in @($script:LogEntries | Where-Object { $_.Level -eq 'Error' })) { $script:EarlierErrors.Add($e) }
+    $script:State = New-GLState
+    $script:UI = @{}
+    $script:Window = $null
+    $script:LogEntries.Clear()
+    $script:LogView = $null; $script:LogScroller = $null
+    $script:Debounce = $null; $script:AutoTimer = $null; $script:ClockTimer = $null; $script:NextAutoRefresh = $null
+    $script:TileItemStyle = $null; $script:KioskSaved = $null
+    foreach ($k in 'Active', 'Cancel') { $script:Progress[$k] = $false }
+    $script:Progress.Total = 0; $script:Progress.Done = 0; $script:Progress.Name = ''
+    $script:Jobs = [System.Collections.Generic.List[object]]::new()
+    $script:Auth = $null; $script:SignedInAs = ''; $script:AuthMode = ''; $script:TenantShown = ''
+    $script:LogReady = $false
+}
+
 function Update-GLBusy {
     Update-GLActions
     $p = $script:Progress
@@ -6101,7 +6260,27 @@ function Update-GLGatewaySummary {
     if ($n.NearLimit) { $parts += "$($n.NearLimit) near the 1,000 connection limit" }
     if (@($script:UI.LstGwTiles.ItemsSource).Count -ne $n.Total) { $parts += "$(@($script:UI.LstGwTiles.ItemsSource).Count) shown" }
     $script:UI.TxtGwSummary.Text = $parts -join '   |   '
-    $script:UI.TxtGwUpdated.Text = if ($script:State.LastRefresh) { 'Updated {0:HH:mm:ss}' -f $script:State.LastRefresh } else { '' }
+    Update-GLRefreshCountdown
+}
+
+function Get-GLCountdownText {
+    # "Updated 22:13:58 | next in 0:42" - with auto-refresh on; "refreshing now" while it loads.
+    param($LastRefresh, $NextAt, [bool]$Busy, [datetime]$Now = (Get-Date))
+    if (-not $LastRefresh) { return $(if ($Busy) { 'Loading...' } else { '' }) }
+    $text = 'Updated {0:HH:mm:ss}' -f $LastRefresh
+    if ($Busy) { return "$text   |   refreshing now" }
+    if ($NextAt) {
+        $left = [Math]::Max(0, [int][Math]::Ceiling(([datetime]$NextAt - $Now).TotalSeconds))
+        $text += '   |   next in {0}:{1:00}' -f [int][Math]::Floor($left / 60), ($left % 60)
+    }
+    return $text
+}
+
+function Update-GLRefreshCountdown {
+    if (-not $script:UI.TxtGwUpdated) { return }
+    $next = if ($script:AutoTimer -and $script:AutoTimer.IsEnabled) { $script:NextAutoRefresh } else { $null }
+    $text = Get-GLCountdownText -LastRefresh $script:State.LastRefresh -NextAt $next -Busy (Test-GLJobRunning 'Loading gateways')
+    if ([string]$script:UI.TxtGwUpdated.Text -ne $text) { $script:UI.TxtGwUpdated.Text = $text }
 }
 
 function Invoke-GLReleaseCheck {
@@ -6229,7 +6408,7 @@ function Update-GLGatewayDetail {
     $row = $script:UI.LstGwTiles.SelectedItem
     if (-not $row) {
         Set-GLGridItems -Grid $script:UI.GridMembers -Items $null
-        Set-GLGridItems -Grid $script:UI.GridGwAccess -Items $null
+        Show-GLAccessRows -Kind gateways -Rows @()
         $script:UI.TxtMembersTitle.Text     = 'Members'
         $script:State.AccessFor             = $null
         return
@@ -6240,7 +6419,7 @@ function Update-GLGatewayDetail {
     $script:UI.TxtMembersTitle.Text    = "Members of $($row.Name)"
     if ($script:State.AccessFor -ne $row.Id) {
         $script:State.AccessFor = $row.Id
-        Set-GLGridItems -Grid $script:UI.GridGwAccess -Items $null
+        Show-GLAccessRows -Kind gateways -Rows @()
         Update-GLAccess -Kind gateways -Id $row.Id -Name $row.Name
     }
 }
@@ -6249,20 +6428,31 @@ function Set-GLAutoRefresh {
     if (-not $script:AutoTimer) {
         $script:AutoTimer = [System.Windows.Threading.DispatcherTimer]::new()
         $script:AutoTimer.Add_Tick({
+            $script:NextAutoRefresh = (Get-Date).Add($script:AutoTimer.Interval)
             if ($script:Progress.Active) { Write-GLLog 'Auto-refresh skipped - a run is still going.'; return }
             Write-GLLog 'Auto-refresh: loading the gateways again.'
             Invoke-GLGatewayRefresh
         })
     }
+    if (-not $script:ClockTimer) {
+        # the countdown on the Gateways tab, once a second
+        $script:ClockTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $script:ClockTimer.Interval = [TimeSpan]::FromSeconds(1)
+        $script:ClockTimer.Add_Tick({ Update-GLRefreshCountdown })
+        $script:ClockTimer.Start()
+    }
     $was = $script:AutoTimer.IsEnabled
     $script:AutoTimer.Stop()
+    $script:NextAutoRefresh = $null
     $choice = [string]$script:UI.CmbAutoRefresh.SelectedItem
     if ($choice -match '^(\d+) min') {
         $script:AutoTimer.Interval = [TimeSpan]::FromMinutes([int]$Matches[1])
         $script:AutoTimer.Start()
+        $script:NextAutoRefresh = (Get-Date).Add($script:AutoTimer.Interval)
         Write-GLLog "Gateways refresh automatically every $($Matches[1]) minute(s)."
     }
     elseif ($was) { Write-GLLog 'Auto-refresh is off.' }
+    Update-GLRefreshCountdown
 }
 
 function Get-GLGatewayExport {
@@ -6534,7 +6724,7 @@ function Update-GLConnectionDetail {
     $id  = if ($row) { [string]$row.Id } else { '' }
     if ($id -and $id -eq $script:State.CnAccessFor) { return }      # another cell of the same row
     $script:State.CnAccessFor = $id
-    Set-GLGridItems -Grid $script:UI.GridCnAccess -Items $null
+    Show-GLAccessRows -Kind connections -Rows @()
     if (-not $row) { $script:UI.TxtCnSelected.Text = 'Select a connection to see who has access.'; return }
     $where = if ($row.Gateway) { " on $($row.Gateway)" } else { '' }
     $script:UI.TxtCnSelected.Text = "$($row.Name)  -  $($row.Type)$where"
@@ -6669,7 +6859,7 @@ function Start-GLUsersRead {
         $sel = Get-GLSelectedId connections
         if ($sel -and $as.ContainsKey($sel) -and $null -ne $as[$sel]) {
             $script:State.CnAccessFor = $sel
-            Set-GLGridItems -Grid $script:UI.GridCnAccess -Items (ConvertTo-GLRoleRows -Assignments $as[$sel] -Names $script:State.Names)
+            Show-GLAccessRows -Kind connections -Rows (ConvertTo-GLRoleRows -Assignments $as[$sel] -Names $script:State.Names)
         }
     }
 }
@@ -6910,6 +7100,34 @@ function Invoke-GLBulkDeleteUi {
 }
 
 # ---- single-item access -----------------------------------------------------------
+function Show-GLAccessRows {
+    <#
+        Who has access, in an access panel. By default like the portal: accounts that
+        are not in Microsoft Entra ID are left out, and the checkbox above says how
+        many there are. Ticked, they are listed too - to be seen, or removed.
+    #>
+    param([string]$Kind, $Rows)
+    $all  = @($Rows | Where-Object { $_ })
+    $gone = @($all | Where-Object { $_.NotInEntra })
+    $script:State.AccessRows[$Kind] = $all
+    $show = [bool]$script:Settings.ShowGone
+    $chk  = if ($Kind -eq 'gateways') { $script:UI.ChkGwShowGone } else { $script:UI.ChkCnShowGone }
+    if ($chk) {
+        $chk.Visibility = $(if ($gone.Count) { 'Visible' } else { 'Collapsed' })
+        $chk.Content    = "Show $($gone.Count) not in Entra ID"
+        $chk.IsChecked  = $show
+    }
+    $items = if ($show) { $all } else { @($all | Where-Object { -not $_.NotInEntra }) }
+    Set-GLGridItems -Grid (Get-GLAccessGrid $Kind) -Items $items
+}
+
+function Set-GLShowGone([bool]$Show) {
+    # One choice for both panels, kept in the settings.
+    $script:Settings.ShowGone = $Show
+    foreach ($k in 'gateways', 'connections') { Show-GLAccessRows -Kind $k -Rows $script:State.AccessRows[$k] }
+    Write-GLLog $(if ($Show) { 'Access lists now include accounts that are not in Microsoft Entra ID.' } else { 'Access lists leave out accounts that are not in Microsoft Entra ID, like the portal.' })
+}
+
 function Get-GLAccessGrid([string]$Kind) {
     if ($Kind -eq 'gateways') { return $script:UI.GridGwAccess }
     return $script:UI.GridCnAccess
@@ -6952,7 +7170,7 @@ function Update-GLAccess {
         $rows = ConvertTo-GLRoleRows -Assignments $r.Assignments -Names $script:State.Names
         Write-GLLog "Access for '$($ctx.Name)': $(Format-GLAccessList $rows)"
         if ((Get-GLSelectedId $ctx.Kind) -ne $ctx.Id) { return }
-        Set-GLGridItems -Grid (Get-GLAccessGrid $ctx.Kind) -Items $rows
+        Show-GLAccessRows -Kind $ctx.Kind -Rows $rows
     }
 }
 
@@ -7136,8 +7354,12 @@ function Save-GLLog {
 function Start-GLSmokeTest {
     param([switch]$Screenshots)
     if ($Screenshots) { $plan = Get-GLScreenshotPlan }
+    elseif ([int]$script:SmokeRound -ge 2) { $plan = Get-GLSmokePlanAgain }
     else { $plan = Get-GLSmokePlan }
+    $before = $script:Smoke
     $script:Smoke = @{ Plan = $plan; Next = 0; Deadline = (Get-Date).AddSeconds(180) }
+    # what the first window found is still judged after the second
+    if ($before -and [int]$script:SmokeRound -ge 2) { foreach ($k in @($before.Keys)) { if (-not $script:Smoke.ContainsKey($k)) { $script:Smoke[$k] = $before[$k] } } }
     $script:SmokeTimer = [System.Windows.Threading.DispatcherTimer]::new()
     $script:SmokeTimer.Interval = [TimeSpan]::FromMilliseconds(400)
     $script:SmokeTimer.Add_Tick({ Step-GLSmokeTest })
@@ -7160,10 +7382,12 @@ function Get-GLScreenshotPlan {
     $plan.Add(@{ Kind = 'Run'; Value = 'Status' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-verify-status' })
+    $plan.Add(@{ Kind = 'ShowGone'; Value = $true })
     $plan.Add(@{ Kind = 'ShowView'; Value = 'Access by accounts not in Entra ID' })
     $plan.Add(@{ Kind = 'Row'; Value = 'AP Archive' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'Shot'; Value = 'screenshot-deleted-accounts' })
+    $plan.Add(@{ Kind = 'ShowGone'; Value = $false })
     $plan.Add(@{ Kind = 'ShowView'; Value = 'All connections' })
     $plan.Add(@{ Kind = 'Tab'; Value = 0 })
     $plan.Add(@{ Kind = 'Font'; Value = 20 })          # a wall screen is read from across the room
@@ -7209,6 +7433,11 @@ function Get-GLSmokePlan {
     $plan.Add(@{ Kind = 'FilterCheck' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'FilterBack' })
+    $plan.Add(@{ Kind = 'Tab'; Value = 0 })
+    $plan.Add(@{ Kind = 'Tile'; Value = 'Contoso Prod Cluster' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'GoneCheck' })
+    $plan.Add(@{ Kind = 'Tab'; Value = 1 })
     $plan.Add(@{ Kind = 'HistoryPick' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'HistoryBack' })
@@ -7219,6 +7448,15 @@ function Get-GLSmokePlan {
     $plan.Add(@{ Kind = 'Font'; Value = 16 })
     $plan.Add(@{ Kind = 'Font'; Value = 12 })
     $plan.Add(@{ Kind = 'Theme'; Value = 'Light' })
+    $plan.Add(@{ Kind = 'Restart' })       # back to the start page, and into the demo again
+    return , $plan
+}
+
+function Get-GLSmokePlanAgain {
+    # The second window, after the start page: it loads, and works like the first.
+    $plan = [System.Collections.Generic.List[object]]::new()
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'Again' })
     $plan.Add(@{ Kind = 'Close' })
     return , $plan
 }
@@ -7263,6 +7501,23 @@ function Step-GLSmokeTest {
             $sm.HistoryOk = ([string]$b.Text -eq 'svc_sales')
             $b.IsDropDownOpen = $false
         }
+        'GoneCheck' {
+            # like the portal: the admin who left is not listed - until asked for
+            $all = @($script:State.AccessRows.gateways).Count
+            $vis = @($script:UI.GridGwAccess.ItemsSource).Count
+            $chk = $script:UI.ChkGwShowGone
+            $hidden = $all -eq $vis + 1 -and $chk.Visibility -eq 'Visible' -and [string]$chk.Content -match '1 not in Entra ID'
+            Set-GLShowGone $true
+            $shown = @($script:UI.GridGwAccess.ItemsSource).Count -eq $all
+            Set-GLShowGone $false
+            $sm.GoneOk = $hidden -and $shown
+        }
+        'Again' {
+            $sm.AgainOk = (@($script:State.ConnRows).Count -eq 27) -and (@($script:State.GatewayRows).Count -eq 5) -and
+                          (@($script:LogView).Count -gt 0) -and ($script:UI.BtnSignInReal.Visibility -eq 'Visible')
+        }
+        'Restart' { $script:SmokeTimer.Stop(); $script:BackToStart = $true; $script:Window.Close() }
+        'ShowGone' { Set-GLShowGone ([bool]$p.Value) }
         'HistoryBack' { $b = $script:UI.TxtCnAccount; $b.Text = ''; $b.ItemsSource = $sm.HistoryKeep }
         'ShowView' {
             $script:UI.CmbCnShow.SelectedItem = $p.Value
@@ -7274,6 +7529,7 @@ function Step-GLSmokeTest {
             $sm.KioskIn = ($script:UI.HeaderBar.Visibility -eq 'Collapsed' -and $script:UI.GwDetail.Visibility -eq 'Collapsed')
         }
         'KioskOff' {
+            $sm.CountdownOk = [string]$script:UI.TxtGwUpdated.Text -match 'next in \d+:\d\d'
             Exit-GLKiosk
             $sm.KioskOk = $sm.KioskIn -and $script:UI.HeaderBar.Visibility -eq 'Visible' -and $script:UI.GwDetail.Visibility -eq 'Visible' -and -not $script:KioskSaved -and
                           [string]$script:UI.CmbAutoRefresh.SelectedItem -eq $sm.AutoBefore
@@ -7300,7 +7556,7 @@ function Get-GLSmokeVerdict {
     # Called after the window has closed. Returns the problems found - none means pass.
     $problems = [System.Collections.Generic.List[string]]::new()
     if ($script:StyleMode -ne 'Modern') { $problems.Add("the modern look did not load: $($script:StyleError)") }
-    $entries = @($script:LogEntries)
+    $entries = @($script:EarlierErrors) + @($script:LogEntries)
     foreach ($e in ($entries | Where-Object Level -eq 'Error')) { $problems.Add("logged: $($e.Line)") }
     if (-not $script:Smoke) { $problems.Add('the window never finished loading') }
     elseif ($script:Smoke.Next -lt $script:Smoke.Plan.Count) { $problems.Add("stopped at step $($script:Smoke.Next) of $($script:Smoke.Plan.Count)") }
@@ -7308,6 +7564,9 @@ function Get-GLSmokeVerdict {
     if (-not ($script:State.Releases -and $script:State.Releases.Newest)) { $problems.Add('the newest gateway version was not read from the demo''s copy of Microsoft''s pages') }
     $st = @($script:State.Tiles | ForEach-Object Status | Sort-Object -Unique)
     if (@($script:State.Tiles).Count -ne 5 -or ($st -notcontains 'Offline') -or ($st -notcontains 'VNet')) { $problems.Add("gateway tiles: $(@($script:State.Tiles).Count) with $($st -join ', '), expected 5 including Offline and VNet") }
+    if ($script:Smoke -and -not $script:Smoke.GoneOk) { $problems.Add('the gateway access list did not leave out the account that is not in Entra ID, or did not show it when asked') }
+    if ($script:Smoke -and -not $script:Smoke.CountdownOk) { $problems.Add('with auto-refresh on, the Gateways tab did not count down to the next refresh') }
+    if ($script:Smoke -and -not $script:Smoke.AgainOk) { $problems.Add('back to the start page and into the demo again did not give a working window') }
     if ($script:Smoke -and $script:StartPageResult -ne 'Demo') { $problems.Add("the start page did not open, or Try the demo did not work (it gave '$($script:StartPageResult)')") }
     if ($script:Smoke -and -not $script:Smoke.HistoryOk) { $problems.Add('a remembered entry could not be picked again after its text was deleted') }
     if ($script:Smoke -and -not $script:Smoke.FilterOk) { $problems.Add('the search box did not filter the connections once typing stopped, or did not give them all back when cleared') }
@@ -7387,6 +7646,7 @@ function Show-GLWindow {
     $script:Window.Title        = "$($script:AppName) $($script:AppVersion)"
     if ($script:AuthMode -eq 'Demo') {
         $script:Window.Title += '  -  DEMO (fictional data)'
+        $script:UI.BtnSignInReal.Visibility = 'Visible'
     }
     $script:UI.TxtApp.Text      = $script:AppName
     $script:UI.TxtVersion.Text  = "v$($script:AppVersion)"
@@ -7484,6 +7744,8 @@ function Show-GLWindow {
     $script:UI.BtnGwCopyId.Add_Click({ Copy-GLId -Grid $script:UI.LstGwTiles })
     $script:UI.BtnKiosk.Add_Click({ Enter-GLKiosk })
     $script:UI.BtnKioskExit.Add_Click({ Exit-GLKiosk })
+    $script:UI.BtnSignInReal.Add_Click({ $script:BackToStart = $true; $script:Window.Close() })
+    foreach ($c in 'ChkGwShowGone', 'ChkCnShowGone') { $script:UI[$c].Add_Click({ param($s, $e) Set-GLShowGone ([bool]$s.IsChecked) }) }
     Add-GLHelpMenu
     $script:UI.BtnGwCopyAll.Add_Click({ Copy-GLGateways })
     $script:UI.BtnGwCopyCluster.Add_Click({ Copy-GLGateways -SelectedOnly })
@@ -7601,6 +7863,7 @@ function Show-GLWindow {
         param($s, $e)
         if ($script:Progress.Active -and -not (Confirm-GL "'$($script:Progress.Name)' is still running. Close anyway? It stops after the current item." 'Close')) {
             $e.Cancel = $true
+            $script:BackToStart = $false
             return
         }
         $script:Progress.Cancel = $true
@@ -7612,6 +7875,7 @@ function Show-GLWindow {
         $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath
         try { $script:Timer.Stop() } catch { }
         try { if ($script:AutoTimer) { $script:AutoTimer.Stop() } } catch { }
+        try { if ($script:ClockTimer) { $script:ClockTimer.Stop() } } catch { }
         try { $script:Pool.Close(); $script:Pool.Dispose() } catch { }
     })
 
@@ -7670,12 +7934,21 @@ if (-not ($SelfTest -or $Inspect) -and [System.Threading.Thread]::CurrentThread.
     exit $LASTEXITCODE
 }
 
+# Round and round: the window can send the user back to the start page - out of
+# the demo, to sign in - and everything starts again from there.
+$realLogFolder = $LogFolder; $realBackupFolder = $BackupFolder
+$round = 0
+while ($true) {
+$round++
+$script:SmokeRound = $round
+
 # The start page: sign in when ready, or try the demo. Not for -Demo (straight in),
-# a wall screen (-Kiosk), the console modes or -DeviceCode, which prints its code there.
+# a wall screen (-Kiosk), the console modes or -DeviceCode, which prints its code there
+# - unless the window sent the user back to it.
 $startResult = ''
-if ($IsWindows -and -not ($SelfTest -or $Inspect -or $DeviceCode -or $Kiosk) -and (-not $Demo -or $SmokeTest -or $Screenshots)) {
+if ($IsWindows -and -not ($SelfTest -or $Inspect -or $DeviceCode) -and ($round -gt 1 -or (-not $Kiosk -and (-not $Demo -or $SmokeTest -or $Screenshots)))) {
     $auto = if ($SmokeTest -or $Screenshots) { 'Demo' } else { '' }
-    $shot = if ($Screenshots) { Join-Path $script:ShotFolder 'screenshot-start.png' } else { '' }
+    $shot = if ($Screenshots -and $round -eq 1) { Join-Path $script:ShotFolder 'screenshot-start.png' } else { '' }
     $startResult = Invoke-GLStartPage -TenantId $TenantId -ClientId $ClientId -Account $Account -SignIn $SignIn -NoWindow:$Launched -Auto $auto -Shot $shot
     $script:StartPageResult = $startResult
     if ($startResult -eq 'Closed') { exit 0 }
@@ -7717,6 +7990,17 @@ if ($Inspect) {
 
 try { Show-GLWindow }
 catch { Stop-GL "$($script:AppName) stopped: $($_.Exception.Message)" }
+
+if (-not $script:BackToStart) { break }
+# back to the start page: the demo - or the session - ends here
+$script:BackToStart = $false
+Reset-GLSession
+if ($Demo) {
+    Disable-GLDemo
+    $Demo = $false
+    $LogFolder = $realLogFolder; $BackupFolder = $realBackupFolder; $script:DemoRoot = $null
+}
+}
 
 if ($Screenshots) {
     Remove-Item -LiteralPath $script:SettingsPath -ErrorAction SilentlyContinue

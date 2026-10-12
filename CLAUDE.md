@@ -140,9 +140,13 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
 26. **The start page runs on a thread of its own**, so the sign-in on the main thread
     does not freeze it. They share one synchronized hashtable. A function the page
     calls goes into `$script:StartPageFunctions` - guard.
-27. **An object id Graph does not know is a deleted account** - the portal hides it.
-    `Get-GLPrincipalNames` marks it `Missing`; show it as not in Entra ID, never as
-    a name, and never guess who it was.
+27. **An object id getByIds does not return is checked, never guessed.**
+    `Get-GLMissingPrincipals` asks Graph's recycle bin (deleted lately: name and day)
+    and the directory (no such object: deleted). Anything else is Unknown, never
+    "deleted". The access panels hide them by default, like the portal, and count them.
+28. **Everything a window learns goes into `New-GLState`, or is cleared in
+    `Reset-GLSession`.** The start page can come back - out of the demo, or to sign
+    in again - and the next window must not see the last one's rows, names or timers.
 
 ## Versions and changes
 

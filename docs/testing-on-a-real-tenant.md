@@ -27,6 +27,9 @@ it publicly.
 
 ## 2. Read-only: the window
 
+- [ ] *Try the demo* on the start page, then *Sign in to your tenant* in its top bar -
+      the start page comes back, and signing in opens your tenant with nothing of
+      the demo in it.
 - [ ] `.\GatewayLens.ps1` (or the exe) - the start page opens. *Sign in* opens the
       browser, the page waits, and the gateways and connections load. Close the
       browser tab half way once: the page says so, and *Sign in* works again.
@@ -38,9 +41,11 @@ it publicly.
 - [ ] VNet tiles say *Not checked, so it is not woken up* - and a sleeping VNet
       gateway stays asleep.
 - [ ] Each tile counts its connections. Compare one cluster with the portal.
-- [ ] **Gateway access:** select a tile - the access list shows names and emails. An id
-      marked *Not in Microsoft Entra ID* should be a deleted account: look it up in
-      the Entra admin center (Users, search by object id) to be sure.
+- [ ] **Gateway access:** select a tile - the list shows the same people as the portal.
+      If there is a *Show N not in Entra ID* box, tick it: deleted accounts appear,
+      the recent ones by name with the day. Look one up in the Entra admin center
+      (Users > Deleted users) to be sure.
+- [ ] Auto-refresh 1 min: the Gateways tab counts down to the next refresh.
 - [ ] **Text size** (Ctrl + mouse wheel): the tiles grow and shrink with the text.
 - [ ] **Kiosk view** (F11) on a second screen; Esc leaves it. Auto-refresh is back to
       what it was afterwards.

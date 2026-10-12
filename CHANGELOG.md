@@ -4,6 +4,29 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-10-12
+
+### Changed
+- **Access lists match the portal.** Accounts that Microsoft Entra ID no longer
+  knows are left out of the access panels and the Users count, as in the portal.
+  When there are any, a checkbox says how many - *Show 8 not in Entra ID* - and
+  ticked, they are listed too, to be removed. The choice is kept.
+- **What is known about such an account comes from Graph, and only that.** An
+  account deleted in the last 30 days is still in the recycle bin: it is shown by
+  name, with the day it was deleted. One that Entra ID has no object for is a
+  *Deleted account*. When Graph will not say - you may not be allowed to see it -
+  it is *Not found in Microsoft Entra ID*, never called deleted. The access report
+  has an *InEntraId* column, and the self-test counts them that way.
+
+### Added
+- **A countdown on the Gateways tab**: "Updated 22:13:58 | next in 0:42" while
+  auto-refresh is on, "refreshing now" while it loads - in the kiosk view too.
+- **From the demo to the start page**: *Sign in to your tenant* in the top bar of
+  the demo closes it and opens the start page. Nothing of the demo is kept.
+
+### Fixed
+- Update credentials like the portal uses PATCH, as the portal does.
+
 ## [0.8.1] - 2026-10-12
 
 ### Fixed
