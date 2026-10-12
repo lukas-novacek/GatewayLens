@@ -1064,6 +1064,7 @@ Assert (-not [System.AppDomain]::CurrentDomain.GetData('GatewayLens.Demo')) 'swi
 $pw  = (Get-Process -Id $PID).Path
 $out = & $pw -NoProfile -Command "Set-StrictMode -Version Latest; & '$script' -Demo -SelfTest" 2>&1
 Assert ($LASTEXITCODE -eq 0 -and ($out -join "`n") -match 'Everything works') "the tool works for a caller with strict mode on (exit $LASTEXITCODE)"
+Assert (($out -join "`n") -match 'PASS\s+Demo: kept apart from real records') 'demo mode writes only to its own folders, never the real log, changes or backups'
 $script:AuthMode = $keepMode; $script:SignedInAs = $keepUser; $script:TenantShown = $keepTenant
 Remove-Item -Recurse -Force $dl
 
@@ -1076,7 +1077,7 @@ Section 'Look and feel'
 $xamlBy = @{}
 foreach ($h in $hereStrings) { $xamlBy[$h.Groups[1].Value] = $h.Groups[2].Value }
 $allXaml = ($xamlBy.Values -join "`n")
-$styleKeys   = @('Primary', 'Danger', 'DangerFilled', 'Label', 'Section')
+$styleKeys   = @([regex]::Matches($allXaml, 'x:Key="(\w+)"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 $brushesUsed = @([regex]::Matches($allXaml, '\{DynamicResource (\w+)\}') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique | Where-Object { $styleKeys -notcontains $_ })
 foreach ($name in $script:Themes.Keys) {
     $miss = @($brushesUsed | Where-Object { -not $script:Themes[$name].Contains($_) })
@@ -1089,6 +1090,10 @@ foreach ($set in 'ModernStylesXaml', 'ClassicStylesXaml') {
     $miss = @($asked | Where-Object { $have -notcontains $_ })
     Assert (-not $miss) "$set has every style the windows ask for ($($asked -join ', ')) $(if ($miss) { '- missing: ' + ($miss -join ', ') })"
 }
+# A style and a brush with the same name: the window's brushes are found first, so
+# the style gets a brush - "'#FFDC2626' is not a valid value for property 'Style'".
+$clash = @($styleKeys | Where-Object { $script:Themes[0].Contains($_) })
+Assert ($styleKeys.Count -ge 5 -and -not $clash) "no style shares a name with a brush ($($styleKeys.Count) styles) $(if ($clash) { '- both: ' + ($clash -join ', ') })"
 $hard = @([regex]::Matches($windowsXaml, '"#[0-9A-Fa-f]{6,8}"'))
 Assert ($hard.Count -eq 0) 'the windows use no fixed colours - everything follows the theme'
 
@@ -1132,6 +1137,62 @@ Assert ($named.Count -ge 6 -and -not $gone) "every file CLAUDE.md names exists (
 $fnNamed = @([regex]::Matches($cm, '`((?:Get|Write|Invoke|Set|New)-GL[A-Za-z]+)`') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 $fnGone  = @($fnNamed | Where-Object { -not (Get-Command $_ -CommandType Function -ErrorAction SilentlyContinue) })
 Assert ($fnNamed.Count -ge 3 -and -not $fnGone) "every function CLAUDE.md names exists ($($fnNamed -join ', ')) $(if ($fnGone) { '- missing: ' + ($fnGone -join ', ') })"
+
+# ============================================================================
+Section 'The real window'
+# ============================================================================
+# A script's parameters ARE its script variables. Writing $script:LogFolder silently
+# overwrote the -LogFolder parameter, and the demo then wrote into the real log folder.
+$paramNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+$aliasWrites = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+    Where-Object { $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                   $_.Left.VariablePath.UserPath -like 'script:*' -and
+                   $paramNames -contains $_.Left.VariablePath.UserPath.Substring(7) } |
+    ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Left.Extent.Text)" })
+Assert ($paramNames.Count -ge 10 -and -not $aliasWrites) "no parameter is overwritten through `$script: ($($paramNames.Count) parameters) $(if ($aliasWrites) { '- ' + ($aliasWrites -join '; ') })"
+
+$newObj = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'New-Object' }, $true))
+Assert ($newObj.Count -eq 0) "no New-Object in the script - it wraps objects, and WPF stored a wrapped brush as text $(if ($newObj.Count) { '- line ' + (($newObj | ForEach-Object { $_.Extent.StartLineNumber }) -join ', ') })"
+
+# what the window checks after the smoke run, tested on any OS by setting the state it reads
+$keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
+$keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
+$script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3 }
+$script:State.GatewayRows = @(1..6); $script:State.ConnRows = @(1..26); $script:State.Changes = @(1..8)
+Assert ((Get-GLSmokeVerdict).Count -eq 0) 'smoke verdict: a clean run passes'
+$script:StyleMode = 'Classic'; $script:StyleError = 'bad template'
+$script:LogEntries.Add([pscustomobject]@{ Level = 'Error'; Line = '12:00:00  ERROR  boom' })
+$script:Smoke.Next = 2
+$v = Get-GLSmokeVerdict
+Assert ($v.Count -eq 3 -and ($v -join ' ') -match 'bad template' -and ($v -join ' ') -match 'boom' -and ($v -join ' ') -match 'step 2 of 3') 'smoke verdict: falling back to the classic look, an error, or an unfinished run all fail'
+$script:State.ConnRows = @(1..3)
+Assert (((Get-GLSmokeVerdict) -join ' ') -match 'connections shown: 3, expected 26') 'smoke verdict: missing demo data fails'
+$script:StyleMode = $keepStyle; $script:StyleError = $keepErr; $script:Smoke = $keepSmoke; $script:LogEntries.Clear()
+$script:State.GatewayRows = $keepRows.G; $script:State.ConnRows = $keepRows.C; $script:State.Changes = $keepRows.A
+
+if ($IsWindows -and -not $env:GATEWAYLENS_NO_WINDOW_TEST) {
+    # The window itself. This is also what catches a theme brush that reaches WPF as
+    # text: PowerShell hides its wrappers too well for a smaller test to see one.: a fresh PowerShell opens it on demo data and drives it
+    $pw  = (Get-Process -Id $PID).Path
+    $so  = [System.IO.Path]::GetTempFileName()
+    $se  = [System.IO.Path]::GetTempFileName()
+    $argList = @('-NoProfile', '-STA', '-File', "`"$script`"", '-SmokeTest')
+    $proc = Start-Process -FilePath $pw -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $so -RedirectStandardError $se
+    $null = $proc.Handle            # without this, Start-Process often reports no exit code
+    $done = $proc.WaitForExit(180000)
+    if ($done) { $proc.WaitForExit() } else { try { $proc.Kill() } catch { } }
+    $said = ((Get-Content $so -Raw) + (Get-Content $se -Raw)) -replace '\s+', ' '
+    Remove-Item $so, $se -ErrorAction SilentlyContinue
+    $ok = $done -and $proc.ExitCode -eq 0
+    Assert $ok "the real window opens on demo data, goes through every theme and tab, and closes cleanly $(if (-not $done) { '- no answer within 3 minutes' } elseif (-not $ok) { '- ' + $said.Trim() })"
+}
+elseif ($IsWindows) {
+    Write-Host '  SKIP  the real window - GATEWAYLENS_NO_WINDOW_TEST is set' -ForegroundColor DarkYellow
+}
+else {
+    Write-Host '  SKIP  the real window - needs Windows' -ForegroundColor DarkYellow
+}
 
 # ============================================================================
 Section 'API inspection output'
@@ -1270,6 +1331,45 @@ Assert ($r -is [array] -and $r.Count -eq 3) 'an array result arrives as one arra
 
 $r = Invoke-Worker 'function Get-None { return , @() }; Get-None'
 Assert ($r -is [array] -and $r.Count -eq 0) 'an empty array result arrives as an empty array'
+
+# A list of OBJECTS - what most jobs return. A list of numbers has no properties to
+# lose, which is how a bug that emptied every object in a list went unnoticed.
+$r = Invoke-Worker 'function Get-Rows { return , @([pscustomobject]@{ Name = "a"; Ok = $true }, [pscustomobject]@{ Name = "b"; Ok = $false }) }; Get-Rows'
+Assert ($r.Count -eq 2 -and $r[0].Name -eq 'a' -and $r[0].Ok -eq $true -and $r[1].Name -eq 'b') 'a list of objects arrives with every property on every object'
+$r = Invoke-Worker 'function Get-One { return , @([pscustomobject]@{ Name = "only" }) }; Get-One'
+Assert ($r.Count -eq 1 -and $r[0].Name -eq 'only') 'a list of one object stays a list, its object intact'
+
+# the real jobs that return lists of objects
+$wf = Join-Path ([IO.Path]::GetTempPath()) ("gl-wk-" + [guid]::NewGuid().ToString('N'))
+Enable-GLDemo; (Get-GLDemoStore).Fast = $true
+Initialize-GLDemoHistory -Folder $wf
+$r = Invoke-Worker "Read-GLChanges -Folder '$wf'"
+Assert ($r.Count -eq 8 -and $r[0].Action -and $r[0].User -and $r[0].When -is [datetime]) 'the change record arrives from a worker whole - every change, every field'
+$cid = (Get-GLDemoStore).Connections[0].id
+$r = Invoke-Worker "Get-GLRoleAssignments -Kind connections -Id '$cid' -FabricToken 'demo-token'"
+Assert ($r.Count -ge 2 -and $r[0].role -and $r[0].principal.displayName) 'who has access arrives from a worker whole'
+$r = Invoke-Worker ('$s = Get-GLDemoStore; $c = $s.Connections[2]; $u = $s.Users[3]; ' +
+    'Invoke-GLBulkGrant -Items @([pscustomobject]@{ Id = $c.id; Name = $c.displayName }) ' +
+    '-Principals @([pscustomobject]@{ Id = $u.id; DisplayName = $u.displayName; Type = "User" }) -Role User -FabricToken demo-token -Progress @{ Cancel = $false }')
+Assert ($r.Count -eq 1 -and $r[0].Name -eq 'Customer 360' -and $r[0].Ok -eq $true -and $r[0].Message -like 'granted User to Ana Novak') "bulk results arrive from a worker whole - name, outcome and reason ($($r[0].Name): $($r[0].Message))"
+
+# the window's own Activity refresh, with stand-in controls: the path that came back empty
+$keepUI = $script:UI; $keepFolder = $script:LogFolder
+$script:UI = @{}
+foreach ($n in 'CmbActAction', 'CmbActUser', 'CmbActPeriod', 'CmbActResult', 'TxtActFind', 'GridActivity', 'TxtActCount', 'Busy', 'BtnCancel', 'TxtStatus') {
+    $script:UI[$n] = [pscustomobject]@{ ItemsSource = $null; SelectedItem = '(all)'; SelectedIndex = 0; Text = ''; Visibility = ''; IsIndeterminate = $false; Maximum = 0; Value = 0 }
+}
+$script:UI.CmbActPeriod.SelectedItem = '30 days'
+$script:LogFolder = $wf
+$script:Pool = $pool    # careful: names ignore case - in this file $pool and $script:Pool are ONE variable
+$script:Jobs = [System.Collections.Generic.List[object]]::new()
+$script:State.Changes = @()
+Invoke-GLActivityRefresh 6>$null
+for ($i = 0; $i -lt 100 -and $script:Jobs.Count; $i++) { Start-Sleep -Milliseconds 50; Receive-GLJobs 6>$null }
+Assert (@($script:State.Changes).Count -eq 8 -and @($script:UI.GridActivity.ItemsSource).Count -eq 8 -and @($script:UI.GridActivity.ItemsSource)[0].Action) "the Activity tab's own refresh shows every change ($(@($script:State.Changes).Count) loaded, $(@($script:UI.GridActivity.ItemsSource).Count) shown)"
+$script:UI = $keepUI; $script:LogFolder = $keepFolder; $script:State.Changes = @()   # $script:Pool stays: it is $pool
+Disable-GLDemo
+Remove-Item -Recurse -Force $wf
 
 $r = Invoke-Worker 'Test-GLGuid "abcdef01-d9cb-469f-a165-70867728950e"'
 Assert ($r -eq $true) 'worker runspaces can call the shared functions'

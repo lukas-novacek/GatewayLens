@@ -4,6 +4,57 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.5] - 2026-10-11
+
+### Fixed
+- **Every list of objects from a background job arrived empty.** Unpacking a job's
+  result read `$r.BaseObject`, which on a list is member enumeration: PowerShell took
+  `BaseObject` of every item, and for a `[pscustomobject]` that is an empty
+  placeholder. The Activity tab showed no changes; in real use every bulk operation
+  would have reported every item as not done, with no name or reason, and the access
+  panels would have shown empty rows. It now reads `$r.PSObject.BaseObject`.
+- **Resolve IPs** showed only the last gateway: a job's result is the last thing it
+  writes, and it wrote one result per gateway. It now returns them as one list.
+- The tests now send lists of real objects through the real worker pool - the old
+  test used a list of numbers, which has no properties to lose - and drive the
+  Activity tab's own refresh with stand-in controls.
+
+## [0.5.4] - 2026-10-11
+
+### Fixed
+- **Demo mode wrote into the real folders** - its log, its made-up change history and
+  any backups went where the real ones live. A script's parameters are its script
+  variables, so filling in the default `-LogFolder` made the demo think a folder had
+  been given. The demo now checks which parameters were really passed, the
+  self-test checks in demo mode that it stays in its own folder, and a guard stops
+  any parameter being overwritten through `$script:`.
+- The window smoke test says where it looked when the Activity tab comes up short.
+
+## [0.5.3] - 2026-10-11
+
+### Fixed
+- **The window did not open** - "'#FFDC2626' is not a valid value for property
+  'Style'". The red button style and the red theme brush were both called Danger,
+  and the brush was found first. Every style now has a name ending in what it styles
+  (`DangerButton`, `LabelText`), and a test checks that no style and brush share one.
+
+## [0.5.2] - 2026-10-11
+
+### Fixed
+- **The window did not open** - "'#FFF4F6FA' is not a valid value for property
+  'Background'". Theme brushes were made with `New-Object`, which wraps them in a
+  PowerShell object; a WPF resource dictionary stores that wrapper as it is, and WPF
+  could only read it as text. Every `New-Object` in the script is now `::new()`, and
+  a guard test keeps it that way.
+- An unexpected error inside the window is now logged, and the window stays open.
+
+### Added
+- **A test of the real window.** `-SmokeTest` opens it on demo data, waits for every
+  load, goes through every theme and tab and two text sizes, and closes it. It fails
+  on any logged error, on falling back to the classic look, or on missing data. It
+  runs with the test suite on Windows - on your PC and on GitHub with every push.
+  Set `GATEWAYLENS_NO_WINDOW_TEST=1` to skip it.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed

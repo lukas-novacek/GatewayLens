@@ -48,6 +48,11 @@
     leaves the computer. The demo keeps its own log and change record, apart from
     the real ones. Good for trying things out and for screenshots.
 
+.PARAMETER SmokeTest
+    For the test suite: opens the real window on demo data, steps through every
+    theme and tab, closes it, and exits 0 only if nothing went wrong. Your own
+    settings are not touched.
+
 .PARAMETER Inspect
     Signs in and lists the fields Microsoft's APIs return for gateways and
     connections - names and dates only, no data. Safe to share.
@@ -85,6 +90,7 @@ param(
     [switch]$SelfTest,
     [switch]$Inspect,
     [switch]$Demo,
+    [switch]$SmokeTest,
     [switch]$Launched,
     [switch]$LoadOnly
 )
@@ -95,17 +101,17 @@ $script:AppName    = 'GatewayLens'
 $docs = [Environment]::GetFolderPath('MyDocuments')
 if (-not $docs) { $docs = $HOME }
 if (-not $docs) { $docs = [System.IO.Path]::GetTempPath() }
-$script:BackupFolder = if ($BackupFolder) { $BackupFolder } else { Join-Path (Join-Path $docs 'GatewayLens') 'backups' }
+if (-not $BackupFolder) { $BackupFolder = Join-Path (Join-Path $docs 'GatewayLens') 'backups' }   # the parameter is the script variable
 $appData = [Environment]::GetFolderPath('LocalApplicationData')
 if (-not $appData) { $appData = $docs }
-$script:LogFolder = if ($LogFolder) { $LogFolder } else { Join-Path (Join-Path $appData 'GatewayLens') 'logs' }
+if (-not $LogFolder) { $LogFolder = Join-Path (Join-Path $appData 'GatewayLens') 'logs' }   # the parameter is the script variable
 $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 # Strict mode, if the caller's session has it on, would make every optional field in
 # an API answer an error - Microsoft's APIs leave fields out freely, and this script
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.5.1'
+$script:AppVersion = '0.5.5'
 
 $script:GatewayRoles    = @('Admin', 'ConnectionCreator', 'ConnectionCreatorWithResharing')
 $script:ConnectionRoles = @('Owner', 'User', 'UserWithReshare')
@@ -819,10 +825,12 @@ function ConvertFrom-GLJobOutput {
     param($Output)
     if ($null -eq $Output -or $Output.Count -eq 0) { return $null }
     $r = $Output[$Output.Count - 1]
-    if ($r -is [psobject] -and $null -ne $r.BaseObject -and
-        $r.BaseObject -isnot [System.Management.Automation.PSCustomObject]) {
-        $r = $r.BaseObject
-    }
+    # .PSObject.BaseObject - never .BaseObject. On a list, .BaseObject is member
+    # enumeration: PowerShell takes BaseObject of every ITEM, and for a
+    # [pscustomobject] that is an empty placeholder - every list of objects came
+    # back as a list of empty shells.
+    $base = $r.PSObject.BaseObject
+    if ($base -isnot [System.Management.Automation.PSCustomObject]) { $r = $base }
     # keep an array an array on the way out
     if ($r -is [array]) { return , $r }
     return $r
@@ -875,10 +883,10 @@ function ConvertTo-GLEncryptedCredential {
 
         if ($mod.Length -eq 128) {
             # 1024-bit key: RSA-OAEP (SHA-1) on 85-byte segments, 128 bytes each out
-            $out = New-Object System.IO.MemoryStream
+            $out = [System.IO.MemoryStream]::new()
             for ($i = 0; $i -lt $plain.Length; $i += 85) {
                 $len = [Math]::Min(85, $plain.Length - $i)
-                $seg = New-Object byte[] $len
+                $seg = [byte[]]::new($len)
                 [Array]::Copy($plain, $i, $seg, 0, $len)
                 $enc = $rsa.Encrypt($seg, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA1)
                 $out.Write($enc, 0, $enc.Length)
@@ -887,8 +895,8 @@ function ConvertTo-GLEncryptedCredential {
         }
 
         # 2048-bit and larger: AES-256-CBC + HMAC-SHA256, both keys wrapped with RSA-OAEP-SHA256
-        $keyEnc = New-Object byte[] 32
-        $keyMac = New-Object byte[] 64
+        $keyEnc = [byte[]]::new(32)
+        $keyMac = [byte[]]::new(64)
         [System.Security.Cryptography.RandomNumberGenerator]::Fill($keyEnc)
         [System.Security.Cryptography.RandomNumberGenerator]::Fill($keyMac)
 
@@ -1651,7 +1659,7 @@ $script:ChangeColumns = @('TimeUtc', 'Time', 'User', 'Tenant', 'Action', 'Result
 function Get-GLSafeName([string]$Text) {
     if ([string]::IsNullOrWhiteSpace($Text)) { return 'unknown' }
     $bad = [System.IO.Path]::GetInvalidFileNameChars() + [char[]]'\/:*?"<>| '
-    $sb = New-Object System.Text.StringBuilder
+    $sb = [System.Text.StringBuilder]::new()
     foreach ($ch in $Text.Trim().ToCharArray()) { [void]$sb.Append($(if ($bad -contains $ch) { '_' } else { $ch })) }
     return $sb.ToString().ToLowerInvariant()
 }
@@ -2400,6 +2408,13 @@ function Get-GLToken {
 # ============================================================================
 #  SELF-TEST  -  every API once, read-only, and a plain verdict per call.
 # ============================================================================
+function Test-GLDemoApart {
+    # The demo must never write into the real log, change record or backups.
+    if ($script:AuthMode -ne 'Demo' -or -not $script:DemoRoot) { return , @() }   # an empty list: @($null).Count is 1
+    $outside = @(@($script:LogFolder, $script:BackupFolder) | Where-Object { -not ([string]$_).StartsWith($script:DemoRoot) })
+    return , $outside
+}
+
 function Invoke-GLSelfTest {
     $results = [System.Collections.Generic.List[object]]::new()
     function Add-Result([string]$Name, [bool]$Ok, [string]$Detail) {
@@ -2412,6 +2427,12 @@ function Invoke-GLSelfTest {
     Write-Host "$($script:AppName) $($script:AppVersion) self-test" -ForegroundColor Cyan
     Write-Host "  signed in as $($script:SignedInAs) via $($script:AuthMode)" -ForegroundColor DarkGray
     Write-Host ''
+
+    if ($script:AuthMode -eq 'Demo') {
+        $outside = Test-GLDemoApart
+        $apart   = @($outside).Count -eq 0
+        Add-Result 'Demo: kept apart from real records' $apart $(if ($apart) { "log, changes and backups under $($script:DemoRoot)" } else { "writes to $($outside -join ', ')" })
+    }
 
     $fab = $null; $pbi = $null; $gr = $null
     try { $fab = Get-GLToken Fabric;  Add-Result 'Token: Fabric'   $true  'issued' } catch { Add-Result 'Token: Fabric'   $false $_.Exception.Message }
@@ -2589,7 +2610,7 @@ $script:MainXaml = @'
       <DockPanel>
         <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
           <TextBlock Name="TxtIdentity" VerticalAlignment="Center" Foreground="{DynamicResource InkMuted}" Margin="0,0,18,0"/>
-          <TextBlock Text="Theme" Style="{DynamicResource Label}" Margin="0,0,6,0"/>
+          <TextBlock Text="Theme" Style="{DynamicResource LabelText}" Margin="0,0,6,0"/>
           <ComboBox Name="CmbTheme" Width="110" Height="28"/>
           <Button Name="BtnFontDown" Content="A-" MinWidth="34" Padding="6,2" Margin="12,0,2,0" ToolTip="Smaller text"/>
           <TextBlock Name="TxtFontSize" VerticalAlignment="Center" MinWidth="22" TextAlignment="Center" Foreground="{DynamicResource InkMuted}"/>
@@ -2618,16 +2639,16 @@ $script:MainXaml = @'
           </Grid.RowDefinitions>
 
           <DockPanel Grid.Row="0" Margin="0,0,0,8">
-            <TextBlock Name="TxtGwSummary" DockPanel.Dock="Right" Style="{DynamicResource Label}"/>
+            <TextBlock Name="TxtGwSummary" DockPanel.Dock="Right" Style="{DynamicResource LabelText}"/>
             <WrapPanel>
-              <Button Name="BtnGwRefresh" Content="Refresh" Style="{DynamicResource Primary}"/>
+              <Button Name="BtnGwRefresh" Content="Refresh" Style="{DynamicResource PrimaryButton}"/>
               <CheckBox Name="ChkLive" Content="Live member status" IsChecked="True" VerticalAlignment="Center" Margin="8,0,2,0"
                         ToolTip="Online / offline per member, from the endpoint behind the portal's Manage gateways page. Not documented by Microsoft - untick it if it ever stops working."/>
               <TextBlock Text="(unofficial)" Foreground="{DynamicResource InkFaint}" VerticalAlignment="Center" Margin="0,0,10,0"/>
               <CheckBox Name="ChkVnet" Content="Include VNet gateways" VerticalAlignment="Center" Margin="0,0,10,0"/>
-              <TextBlock Text="Auto-refresh" Style="{DynamicResource Label}"/>
+              <TextBlock Text="Auto-refresh" Style="{DynamicResource LabelText}"/>
               <ComboBox Name="CmbAutoRefresh" Width="80" Height="26"/>
-              <TextBlock Text="Filter" Style="{DynamicResource Label}"/>
+              <TextBlock Text="Filter" Style="{DynamicResource LabelText}"/>
               <ComboBox Name="TxtGwFilter" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Width="180" Height="26" VerticalContentAlignment="Center"/>
               <Button Name="BtnGwCopyAll" Content="Copy all" Margin="12,0,6,0"
                       ToolTip="Every gateway and member, tab-separated - pastes straight into Excel or a ticket."/>
@@ -2651,11 +2672,11 @@ $script:MainXaml = @'
               <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                   <Button Name="BtnMemberEnable" Content="Enable"/>
-                  <Button Name="BtnMemberDisable" Content="Disable" Style="{DynamicResource Danger}"/>
+                  <Button Name="BtnMemberDisable" Content="Disable" Style="{DynamicResource DangerButton}"/>
                   <Button Name="BtnGwCopyCluster" Content="Copy gateway"/>
                   <Button Name="BtnGwIpsCluster" Content="Resolve IPs" Margin="0"/>
                 </StackPanel>
-                <TextBlock Name="TxtMembersTitle" Text="Members" Style="{DynamicResource Section}"/>
+                <TextBlock Name="TxtMembersTitle" Text="Members" Style="{DynamicResource SectionText}"/>
               </DockPanel>
               <DataGrid IsReadOnly="True" CanUserAddRows="False" AutoGenerateColumns="True" SelectionMode="Single" Name="GridMembers"/>
             </DockPanel>
@@ -2663,9 +2684,9 @@ $script:MainXaml = @'
               <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                   <Button Name="BtnGwAccessAdd" Content="Add..."/>
-                  <Button Name="BtnGwAccessRemove" Content="Remove" Style="{DynamicResource Danger}" Margin="0"/>
+                  <Button Name="BtnGwAccessRemove" Content="Remove" Style="{DynamicResource DangerButton}" Margin="0"/>
                 </StackPanel>
-                <TextBlock Text="Gateway access" Style="{DynamicResource Section}"/>
+                <TextBlock Text="Gateway access" Style="{DynamicResource SectionText}"/>
               </DockPanel>
               <DataGrid IsReadOnly="True" CanUserAddRows="False" AutoGenerateColumns="True" SelectionMode="Single" Name="GridGwAccess"/>
             </DockPanel>
@@ -2685,31 +2706,31 @@ $script:MainXaml = @'
           </Grid.RowDefinitions>
 
           <WrapPanel Grid.Row="0" Margin="0,0,0,6">
-            <TextBlock Text="Search" Style="{DynamicResource Label}" Margin="0,0,6,0"/>
+            <TextBlock Text="Search" Style="{DynamicResource LabelText}" Margin="0,0,6,0"/>
             <ComboBox Name="TxtCnSearch" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Width="230" Height="26" VerticalContentAlignment="Center"
                      ToolTip="Name, path, type, gateway or id. Several values separated by ; - a connection matching any of them is listed."/>
-            <TextBlock Text="User" Style="{DynamicResource Label}"/>
+            <TextBlock Text="User" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="TxtCnUser" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Width="170" Height="26" VerticalContentAlignment="Center"
                      ToolTip="Someone with access. Needs the users loaded - tick Usernames and access, or press Verify users."/>
-            <TextBlock Text="Account" Style="{DynamicResource Label}"/>
+            <TextBlock Text="Account" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="TxtCnAccount" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Width="150" Height="26" VerticalContentAlignment="Center"
                      ToolTip="The username stored in the connection's credentials. Needs Usernames and access."/>
-            <TextBlock Text="Gateway" Style="{DynamicResource Label}"/>
+            <TextBlock Text="Gateway" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="CmbCnGateway" Width="180" Height="26"/>
-            <TextBlock Text="Connectivity" Style="{DynamicResource Label}"/>
+            <TextBlock Text="Connectivity" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="CmbCnConnectivity" Width="150" Height="26"/>
-            <TextBlock Text="Type" Style="{DynamicResource Label}"/>
+            <TextBlock Text="Type" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="CmbCnType" Width="130" Height="26"/>
           </WrapPanel>
 
           <DockPanel Grid.Row="1" Margin="0,0,0,8">
-            <TextBlock Name="TxtCnCount" DockPanel.Dock="Right" Style="{DynamicResource Label}"/>
+            <TextBlock Name="TxtCnCount" DockPanel.Dock="Right" Style="{DynamicResource LabelText}"/>
             <WrapPanel>
-              <Button Name="BtnCnRefresh" Content="Refresh" Style="{DynamicResource Primary}"/>
+              <Button Name="BtnCnRefresh" Content="Refresh" Style="{DynamicResource PrimaryButton}"/>
               <CheckBox Name="ChkDirectory" Content="Usernames and access" IsChecked="True" VerticalAlignment="Center" Margin="8,0,2,0"
                         ToolTip="Loads every connection's credential username and users in one call, from the endpoint the portal uses. Not documented by Microsoft."/>
               <TextBlock Text="(unofficial)" Foreground="{DynamicResource InkFaint}" VerticalAlignment="Center" Margin="0,0,12,0"/>
-              <TextBlock Text="Gateway state" Style="{DynamicResource Label}"/>
+              <TextBlock Text="Gateway state" Style="{DynamicResource LabelText}"/>
               <CheckBox Name="ChkStOnline"  Content="Online"  IsChecked="True" VerticalAlignment="Center" Margin="0,0,8,0"/>
               <CheckBox Name="ChkStPartial" Content="Partially online" IsChecked="True" VerticalAlignment="Center" Margin="0,0,8,0"/>
               <CheckBox Name="ChkStOffline" Content="Offline" IsChecked="True" VerticalAlignment="Center" Margin="0,0,8,0"/>
@@ -2736,9 +2757,9 @@ $script:MainXaml = @'
                   <Button Name="BtnCnTest" Content="Test"/>
                   <Button Name="BtnCnCopyId" Content="Copy id"/>
                   <Button Name="BtnCnAccessAdd" Content="Add..."/>
-                  <Button Name="BtnCnAccessRemove" Content="Remove" Style="{DynamicResource Danger}" Margin="0"/>
+                  <Button Name="BtnCnAccessRemove" Content="Remove" Style="{DynamicResource DangerButton}" Margin="0"/>
                 </StackPanel>
-                <TextBlock Name="TxtCnSelected" Text="Select a connection to see who has access." Style="{DynamicResource Section}" TextTrimming="CharacterEllipsis"/>
+                <TextBlock Name="TxtCnSelected" Text="Select a connection to see who has access." Style="{DynamicResource SectionText}" TextTrimming="CharacterEllipsis"/>
               </DockPanel>
               <DataGrid IsReadOnly="True" CanUserAddRows="False" AutoGenerateColumns="True" SelectionMode="Single" Name="GridCnAccess"/>
             </DockPanel>
@@ -2746,7 +2767,7 @@ $script:MainXaml = @'
             <Border Grid.Column="2" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Border}" BorderThickness="1" Padding="10,8">
               <ScrollViewer VerticalScrollBarVisibility="Auto">
                 <StackPanel>
-                  <TextBlock Name="TxtBulkTitle" Text="All listed connections" Style="{DynamicResource Section}"/>
+                  <TextBlock Name="TxtBulkTitle" Text="All listed connections" Style="{DynamicResource SectionText}"/>
                   <TextBlock Text="Everything below acts on every connection in the list above, after filters and exclusions."
                              Foreground="{DynamicResource InkMuted}" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,4"/>
                   <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
@@ -2759,12 +2780,12 @@ $script:MainXaml = @'
                       <ComboBox Name="TxtBulkPrincipals" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Height="26" VerticalContentAlignment="Center"
                                ToolTip="Emails, group names or object ids, separated by ; - all of them are applied to every listed connection."/>
                       <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                        <TextBlock Text="Type" Style="{DynamicResource Label}" Margin="0,0,6,0"/>
+                        <TextBlock Text="Type" Style="{DynamicResource LabelText}" Margin="0,0,6,0"/>
                         <ComboBox Name="CmbBulkPrincipalType" Width="120" Height="26"/>
-                        <TextBlock Text="Role" Style="{DynamicResource Label}"/>
+                        <TextBlock Text="Role" Style="{DynamicResource LabelText}"/>
                         <ComboBox Name="CmbBulkRole" Width="130" Height="26"/>
                         <Button Name="BtnBulkGrant" Content="Grant" Margin="10,0,6,0"/>
-                        <Button Name="BtnBulkRevoke" Content="Remove" Style="{DynamicResource Danger}"/>
+                        <Button Name="BtnBulkRevoke" Content="Remove" Style="{DynamicResource DangerButton}"/>
                       </StackPanel>
                     </StackPanel>
                   </GroupBox>
@@ -2782,20 +2803,20 @@ $script:MainXaml = @'
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                       </Grid.RowDefinitions>
-                      <TextBlock Grid.Row="0" Grid.Column="0" Text="Type" Style="{DynamicResource Label}" Margin="0,0,6,0"/>
+                      <TextBlock Grid.Row="0" Grid.Column="0" Text="Type" Style="{DynamicResource LabelText}" Margin="0,0,6,0"/>
                       <ComboBox Name="CmbCredType" Grid.Row="0" Grid.Column="1" Height="26"/>
-                      <TextBlock Grid.Row="0" Grid.Column="2" Text="Encryption" Style="{DynamicResource Label}"/>
+                      <TextBlock Grid.Row="0" Grid.Column="2" Text="Encryption" Style="{DynamicResource LabelText}"/>
                       <ComboBox Name="CmbCredEncryption" Grid.Row="0" Grid.Column="3" Height="26"/>
-                      <TextBlock Grid.Row="1" Grid.Column="0" Text="Username" Style="{DynamicResource Label}" Margin="0,6,6,0"/>
+                      <TextBlock Grid.Row="1" Grid.Column="0" Text="Username" Style="{DynamicResource LabelText}" Margin="0,6,6,0"/>
                       <ComboBox Name="TxtCredUser" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Grid.Row="1" Grid.Column="1" Height="26" Margin="0,6,0,0" VerticalContentAlignment="Center"/>
-                      <TextBlock Grid.Row="1" Grid.Column="2" Text="Password" Style="{DynamicResource Label}" Margin="10,6,6,0"/>
+                      <TextBlock Grid.Row="1" Grid.Column="2" Text="Password" Style="{DynamicResource LabelText}" Margin="10,6,6,0"/>
                       <PasswordBox Name="PwdCred" Grid.Row="1" Grid.Column="3" Height="26" Margin="0,6,0,0" VerticalContentAlignment="Center"/>
                       <Button Name="BtnBulkCredentials" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="4" Content="Update credentials"
                               HorizontalAlignment="Left" Margin="0,8,0,0"/>
                     </Grid>
                   </GroupBox>
 
-                  <Button Name="BtnBulkDelete" Content="Delete all listed connections..." Style="{DynamicResource Danger}"
+                  <Button Name="BtnBulkDelete" Content="Delete all listed connections..." Style="{DynamicResource DangerButton}"
                           HorizontalAlignment="Left" Margin="0,10,0,0"/>
                 </StackPanel>
               </ScrollViewer>
@@ -2813,7 +2834,7 @@ $script:MainXaml = @'
           </Grid.RowDefinitions>
 
           <WrapPanel Grid.Row="0" Margin="0,0,0,8">
-            <TextBlock Text="Default gateway" Style="{DynamicResource Label}" Margin="0,0,6,0"/>
+            <TextBlock Text="Default gateway" Style="{DynamicResource LabelText}" Margin="0,0,6,0"/>
             <ComboBox Name="CmbCreateGateway" Width="200" Height="26"
                       ToolTip="Used for every row whose Gateway column is empty."/>
             <Button Name="BtnCreateAdd" Content="+ row" Margin="12,0,6,0"/>
@@ -2821,10 +2842,10 @@ $script:MainXaml = @'
             <Button Name="BtnCreateClear" Content="Clear"/>
             <Button Name="BtnCreateLoad" Content="Load CSV..." Margin="12,0,6,0"/>
             <Button Name="BtnCreateTemplate" Content="Save CSV template..."/>
-            <TextBlock Text="Password for this run" Style="{DynamicResource Label}" Margin="16,0,6,0"/>
+            <TextBlock Text="Password for this run" Style="{DynamicResource LabelText}" Margin="16,0,6,0"/>
             <PasswordBox Name="PwdCreate" Width="160" Height="26" VerticalContentAlignment="Center"
                          ToolTip="Used for every Windows, Basic or Key row. Never stored in the grid or in a CSV."/>
-            <Button Name="BtnCreateRun" Content="Create all" Style="{DynamicResource Primary}" Margin="12,0,0,0"/>
+            <Button Name="BtnCreateRun" Content="Create all" Style="{DynamicResource PrimaryButton}" Margin="12,0,0,0"/>
           </WrapPanel>
 
           <Grid Grid.Row="1">
@@ -2835,7 +2856,7 @@ $script:MainXaml = @'
             </Grid.ColumnDefinitions>
             <DataGrid Name="GridCreate" Grid.Column="0" IsReadOnly="False" CanUserAddRows="True" AutoGenerateColumns="True" SelectionMode="Extended"/>
             <DockPanel Grid.Column="2">
-              <TextBlock DockPanel.Dock="Top" Text="Paste connection strings, one per line" Style="{DynamicResource Section}" Margin="0,0,0,6"/>
+              <TextBlock DockPanel.Dock="Top" Text="Paste connection strings, one per line" Style="{DynamicResource SectionText}" Margin="0,0,0,6"/>
               <Button DockPanel.Dock="Bottom" Name="BtnCreateParse" Content="Add rows from connection strings" Margin="0,8,0,0" HorizontalAlignment="Left"/>
               <TextBlock DockPanel.Dock="Bottom" Foreground="{DynamicResource InkMuted}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0"
                          Text="Server and database are read from each line; the type is filled in where the keywords make it clear. Common types: Sql, Oracle, AnalysisServices, File, Folder, Web, OData, SharePointList, Odbc, Extension - for connectors not covered by server / path / url, put the JSON in ConnectionDetailsJson."/>
@@ -2853,21 +2874,21 @@ $script:MainXaml = @'
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
           <DockPanel Grid.Row="0" Margin="0,0,0,8">
-            <TextBlock Name="TxtActCount" DockPanel.Dock="Right" Style="{DynamicResource Label}"/>
+            <TextBlock Name="TxtActCount" DockPanel.Dock="Right" Style="{DynamicResource LabelText}"/>
             <WrapPanel>
-              <Button Name="BtnActRefresh" Content="Refresh" Style="{DynamicResource Primary}"/>
-              <TextBlock Text="Period" Style="{DynamicResource Label}"/>
+              <Button Name="BtnActRefresh" Content="Refresh" Style="{DynamicResource PrimaryButton}"/>
+              <TextBlock Text="Period" Style="{DynamicResource LabelText}"/>
               <ComboBox Name="CmbActPeriod" Width="100" Height="26"/>
-              <TextBlock Text="Action" Style="{DynamicResource Label}"/>
+              <TextBlock Text="Action" Style="{DynamicResource LabelText}"/>
               <ComboBox Name="CmbActAction" Width="160" Height="26"/>
-              <TextBlock Text="Result" Style="{DynamicResource Label}"/>
+              <TextBlock Text="Result" Style="{DynamicResource LabelText}"/>
               <ComboBox Name="CmbActResult" Width="100" Height="26"/>
-              <TextBlock Text="User" Style="{DynamicResource Label}"/>
+              <TextBlock Text="User" Style="{DynamicResource LabelText}"/>
               <ComboBox Name="CmbActUser" Width="200" Height="26"/>
-              <TextBlock Text="Search" Style="{DynamicResource Label}"/>
+              <TextBlock Text="Search" Style="{DynamicResource LabelText}"/>
               <ComboBox Name="TxtActFind" IsEditable="True" IsTextSearchEnabled="False" StaysOpenOnEdit="True" Width="190" Height="26"
                         ToolTip="Connection, gateway, person, details or run id."/>
-              <Button Name="BtnActUndo" Content="Undo selected..." Style="{DynamicResource Danger}" Margin="14,0,6,0"
+              <Button Name="BtnActUndo" Content="Undo selected..." Style="{DynamicResource DangerButton}" Margin="14,0,6,0"
                       ToolTip="Reverse your own completed access changes and member enable / disable. Each undo is recorded too."/>
               <Button Name="BtnActExport" Content="Export CSV"/>
               <Button Name="BtnActFolder" Content="Open folder" ToolTip="Where the change records and daily logs are kept."/>
@@ -2892,7 +2913,7 @@ $script:MainXaml = @'
             <Button Name="BtnLogFolder" Content="Open folder" ToolTip="The daily log files and the change records."/>
             <Button Name="BtnLogClear" Content="Clear" Margin="0" ToolTip="Clear the panel. The log file keeps everything."/>
           </StackPanel>
-          <TextBlock Text="Activity log" Style="{DynamicResource Section}"/>
+          <TextBlock Text="Activity log" Style="{DynamicResource SectionText}"/>
         </DockPanel>
         <TextBox Name="TxtLog" IsReadOnly="True" BorderThickness="0" Background="{DynamicResource LogBg}" Foreground="{DynamicResource LogInk}"
                  VerticalContentAlignment="Top" Padding="8,2,8,6" FontFamily="Consolas" FontSize="11" TextWrapping="NoWrap"
@@ -2939,7 +2960,7 @@ $script:DialogXaml = @'
     </Grid>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
       <Button Name="DlgOk" Content="Add" IsDefault="True" MinWidth="80" Height="28" Margin="0,0,8,0"
-              Style="{DynamicResource Primary}"/>
+              Style="{DynamicResource PrimaryButton}"/>
       <Button Name="DlgCancel" Content="Cancel" IsCancel="True" MinWidth="80" Height="28"/>
     </StackPanel>
   </StackPanel>
@@ -2958,7 +2979,7 @@ $script:PromptXaml = @'
     <TextBox Name="PrmInput" Height="26" VerticalContentAlignment="Center"/>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
       <Button Name="PrmOk" Content="Continue" IsDefault="True" MinWidth="90" Height="28" Margin="0,0,8,0"
-              Style="{DynamicResource DangerFilled}"/>
+              Style="{DynamicResource DangerFilledButton}"/>
       <Button Name="PrmCancel" Content="Cancel" IsCancel="True" MinWidth="80" Height="28"/>
     </StackPanel>
   </StackPanel>
@@ -3012,19 +3033,19 @@ $script:ModernStylesXaml = @'
     </Setter>
   </Style>
 
-  <Style x:Key="Primary" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+  <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
     <Setter Property="Background" Value="{DynamicResource Accent}"/>
     <Setter Property="BorderBrush" Value="{DynamicResource Accent}"/>
     <Setter Property="Foreground" Value="{DynamicResource AccentInk}"/>
     <Setter Property="FontWeight" Value="SemiBold"/>
   </Style>
 
-  <Style x:Key="Danger" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+  <Style x:Key="DangerButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
     <Setter Property="Foreground" Value="{DynamicResource Danger}"/>
     <Setter Property="BorderBrush" Value="{DynamicResource Danger}"/>
   </Style>
 
-  <Style x:Key="DangerFilled" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+  <Style x:Key="DangerFilledButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
     <Setter Property="Background" Value="{DynamicResource Danger}"/>
     <Setter Property="BorderBrush" Value="{DynamicResource Danger}"/>
     <Setter Property="Foreground" Value="{DynamicResource AccentInk}"/>
@@ -3032,13 +3053,13 @@ $script:ModernStylesXaml = @'
   </Style>
 
   <!-- ===== text ===== -->
-  <Style x:Key="Label" TargetType="TextBlock">
+  <Style x:Key="LabelText" TargetType="TextBlock">
     <Setter Property="VerticalAlignment" Value="Center"/>
     <Setter Property="Foreground" Value="{DynamicResource InkMuted}"/>
     <Setter Property="Margin" Value="12,0,6,0"/>
   </Style>
 
-  <Style x:Key="Section" TargetType="TextBlock">
+  <Style x:Key="SectionText" TargetType="TextBlock">
     <Setter Property="FontWeight" Value="SemiBold"/>
     <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
     <Setter Property="VerticalAlignment" Value="Center"/>
@@ -3490,18 +3511,18 @@ $script:ClassicStylesXaml = @'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
   <!-- The fallback: standard Windows controls, theme colours where it is safe. -->
-  <Style x:Key="Primary" TargetType="Button">
+  <Style x:Key="PrimaryButton" TargetType="Button">
     <Setter Property="Background" Value="{DynamicResource Accent}"/>
     <Setter Property="Foreground" Value="{DynamicResource AccentInk}"/>
     <Setter Property="Padding" Value="12,3"/>
     <Setter Property="Margin" Value="0,0,6,0"/>
   </Style>
-  <Style x:Key="Danger" TargetType="Button">
+  <Style x:Key="DangerButton" TargetType="Button">
     <Setter Property="Foreground" Value="{DynamicResource Danger}"/>
     <Setter Property="Padding" Value="12,3"/>
     <Setter Property="Margin" Value="0,0,6,0"/>
   </Style>
-  <Style x:Key="DangerFilled" TargetType="Button">
+  <Style x:Key="DangerFilledButton" TargetType="Button">
     <Setter Property="Background" Value="{DynamicResource Danger}"/>
     <Setter Property="Foreground" Value="{DynamicResource AccentInk}"/>
   </Style>
@@ -3509,12 +3530,12 @@ $script:ClassicStylesXaml = @'
     <Setter Property="Padding" Value="12,3"/>
     <Setter Property="Margin" Value="0,0,6,0"/>
   </Style>
-  <Style x:Key="Label" TargetType="TextBlock">
+  <Style x:Key="LabelText" TargetType="TextBlock">
     <Setter Property="VerticalAlignment" Value="Center"/>
     <Setter Property="Foreground" Value="{DynamicResource InkMuted}"/>
     <Setter Property="Margin" Value="12,0,6,0"/>
   </Style>
-  <Style x:Key="Section" TargetType="TextBlock">
+  <Style x:Key="SectionText" TargetType="TextBlock">
     <Setter Property="FontWeight" Value="SemiBold"/>
     <Setter Property="VerticalAlignment" Value="Center"/>
   </Style>
@@ -3601,7 +3622,9 @@ $script:HistoryFields = @('TxtGwFilter', 'TxtCnSearch', 'TxtCnUser', 'TxtCnAccou
 
 function New-GLBrush([string]$Hex) {
     $c = ConvertTo-GLColorValue $Hex
-    $b = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb($c[0], $c[1], $c[2], $c[3]))
+    # ::new(), not New-Object: New-Object wraps the brush in a PowerShell object, and a
+    # resource dictionary stores the wrapper as it is - WPF then sees only its text form.
+    $b = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb($c[0], $c[1], $c[2], $c[3]))
     $b.Freeze()
     return $b
 }
@@ -3612,7 +3635,15 @@ function Set-GLTheme {
     if (-not $script:Themes.Contains($Name)) { $Name = 'Light' }
     $t = $script:Themes[$Name]
     foreach ($w in @($Target)) {
-        foreach ($k in $t.Keys) { $w.Resources[$k] = New-GLBrush $t[$k] }
+        foreach ($k in $t.Keys) {
+            # Built here and stored as the raw .NET object. A resource dictionary keeps
+            # whatever it is given: a PowerShell wrapper around the brush - from New-Object,
+            # or picked up on the way out of a function - reaches WPF as plain text.
+            $c = ConvertTo-GLColorValue $t[$k]
+            $b = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb($c[0], $c[1], $c[2], $c[3]))
+            $b.Freeze()
+            $w.Resources[$k] = $b.psobject.BaseObject
+        }
     }
     return $Name
 }
@@ -3641,9 +3672,9 @@ function Get-GLIconImage {
     if ($script:IconImage) { return $script:IconImage }
     try {
         $bytes = [Convert]::FromBase64String($script:IconPng)
-        $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
+        $bmp = [System.Windows.Media.Imaging.BitmapImage]::new()
         $bmp.BeginInit()
-        $bmp.StreamSource = New-Object System.IO.MemoryStream (, $bytes)
+        $bmp.StreamSource = [System.IO.MemoryStream]::new([byte[]]$bytes)
         $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
         $bmp.EndInit()
         $bmp.Freeze()
@@ -3710,7 +3741,7 @@ function Initialize-GLWorkers {
     $script:Pool.Open()
     $script:Jobs = [System.Collections.Generic.List[object]]::new()
 
-    $script:Timer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:Timer = [System.Windows.Threading.DispatcherTimer]::new()
     $script:Timer.Interval = [TimeSpan]::FromMilliseconds(200)
     $script:Timer.Add_Tick({ Receive-GLJobs })
     $script:Timer.Start()
@@ -3866,7 +3897,7 @@ function Show-GLTypedConfirm {
     # For the irreversible: the user has to type the expected text.
     param([string]$Message, [string]$Ask, [string]$Expected)
     [xml]$x = $script:PromptXaml
-    $dlg = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($x))
     $dlg.Owner = $script:Window
     Initialize-GLDialog -Dialog $dlg
     $c = @{}
@@ -3984,7 +4015,7 @@ function Update-GLGatewayDetail {
 
 function Set-GLAutoRefresh {
     if (-not $script:AutoTimer) {
-        $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:AutoTimer = [System.Windows.Threading.DispatcherTimer]::new()
         $script:AutoTimer.Add_Tick({ if (-not $script:Progress.Active) { Invoke-GLGatewayRefresh } })
     }
     $script:AutoTimer.Stop()
@@ -4070,9 +4101,11 @@ function Invoke-GLResolveIps {
     }
     Start-GLJob -Name 'Resolving IP addresses' -Arguments @{ B = $blocks; S = $script:DnsSuffixes } -Work {
         param($B, $S)
-        foreach ($b in $B) {
+        # one result - the whole list: a job's result is the LAST thing it writes
+        $all = foreach ($b in $B) {
             [pscustomobject]@{ Name = $b.Name; Lines = @($b.Machines | ForEach-Object { Resolve-GLHostAddress -Machine $_ -Suffixes $S }) }
         }
+        , @($all)
     } -OnDone {
         param($r, $err, $ctx)
         if ($err) { return }
@@ -4397,7 +4430,7 @@ function Update-GLAccess {
 function Show-GLAccessDialog {
     param([string]$Target, [string[]]$Roles, [string]$DefaultRole)
     [xml]$x = $script:DialogXaml
-    $dlg = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($x))
     $dlg.Owner = $script:Window
     Initialize-GLDialog -Dialog $dlg
     $c = @{}
@@ -4512,7 +4545,7 @@ function Invoke-GLTestConnection {
 
 # ---- create ----------------------------------------------------------------------
 function Initialize-GLCreateTable {
-    $t = New-Object System.Data.DataTable 'Create'
+    $t = [System.Data.DataTable]::new('Create')
     foreach ($c in $script:CreateColumns) { [void]$t.Columns.Add($c, [string]) }
     $script:CreateTable = $t
     $script:UI.GridCreate.ItemsSource = $t.DefaultView
@@ -4534,7 +4567,7 @@ function Remove-GLCreateRows {
 }
 
 function Import-GLCreateCsv {
-    $dlg = New-Object Microsoft.Win32.OpenFileDialog
+    $dlg = [Microsoft.Win32.OpenFileDialog]::new()
     $dlg.Filter = 'CSV files (*.csv)|*.csv'
     if (-not $dlg.ShowDialog($script:Window)) { return }
     $recs = @(Import-Csv -Path $dlg.FileName)
@@ -4557,7 +4590,7 @@ function Import-GLCreateCsv {
 }
 
 function Save-GLCreateTemplate {
-    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg = [Microsoft.Win32.SaveFileDialog]::new()
     $dlg.FileName = 'gatewaylens-create-template.csv'
     $dlg.Filter   = 'CSV files (*.csv)|*.csv'
     if (-not $dlg.ShowDialog($script:Window)) { return }
@@ -4708,7 +4741,7 @@ function Copy-GLLog {
 function Save-GLLog {
     $t = $script:UI.TxtLog.Text
     if (-not $t) { Write-GLLog 'Nothing to save.' 'Warn'; return }
-    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg = [Microsoft.Win32.SaveFileDialog]::new()
     $dlg.FileName = 'gatewaylens-log-{0:yyyyMMdd-HHmm}.txt' -f (Get-Date)
     $dlg.Filter   = 'Text files (*.txt)|*.txt|All files (*.*)|*.*'
     if (-not $dlg.ShowDialog($script:Window)) { return }
@@ -4716,12 +4749,72 @@ function Save-GLLog {
     Write-GLLog "Log saved to $($dlg.FileName)"
 }
 
+# ---- smoke test ---------------------------------------------------------------------
+# -SmokeTest drives the real window on demo data: waits for each load to finish, then
+# every theme, every tab, two text sizes, and closes. Main reports the verdict.
+function Start-GLSmokeTest {
+    $plan = [System.Collections.Generic.List[object]]::new()
+    foreach ($t in $script:Themes.Keys) { $plan.Add(@{ Kind = 'Theme'; Value = $t }) }
+    for ($i = 0; $i -lt $script:UI.Tabs.Items.Count; $i++) { $plan.Add(@{ Kind = 'Tab'; Value = $i }) }
+    $plan.Add(@{ Kind = 'Tab'; Value = 0 })
+    $plan.Add(@{ Kind = 'Font'; Value = 16 })
+    $plan.Add(@{ Kind = 'Font'; Value = 12 })
+    $plan.Add(@{ Kind = 'Theme'; Value = 'Light' })
+    $plan.Add(@{ Kind = 'Close' })
+    $script:Smoke = @{ Plan = $plan; Next = 0; Deadline = (Get-Date).AddSeconds(120) }
+    $script:SmokeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:SmokeTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+    $script:SmokeTimer.Add_Tick({ Step-GLSmokeTest })
+    $script:SmokeTimer.Start()
+}
+
+function Step-GLSmokeTest {
+    $sm = $script:Smoke
+    if ((Get-Date) -gt $sm.Deadline) {
+        Write-GLLog "Smoke test: timed out at step $($sm.Next) of $($sm.Plan.Count)." 'Error'
+        $script:SmokeTimer.Stop()
+        $script:Window.Close()
+        return
+    }
+    if ($script:Jobs.Count -gt 0) { return }          # let every load and refresh finish first
+    if ($sm.Next -ge $sm.Plan.Count) { return }
+    $p = $sm.Plan[$sm.Next]
+    $sm.Next++
+    switch ($p.Kind) {
+        'Theme' { $script:UI.CmbTheme.SelectedItem = $p.Value }
+        'Tab'   { $script:UI.Tabs.SelectedIndex = $p.Value }
+        'Font'  { Set-GLFontSize $p.Value }
+        'Close' { $script:SmokeTimer.Stop(); $script:Window.Close() }
+    }
+}
+
+function Get-GLSmokeVerdict {
+    # Called after the window has closed. Returns the problems found - none means pass.
+    $problems = [System.Collections.Generic.List[string]]::new()
+    if ($script:StyleMode -ne 'Modern') { $problems.Add("the modern look did not load: $($script:StyleError)") }
+    $entries = @($script:LogEntries)
+    foreach ($e in ($entries | Where-Object Level -eq 'Error')) { $problems.Add("logged: $($e.Line)") }
+    if (-not $script:Smoke) { $problems.Add('the window never finished loading') }
+    elseif ($script:Smoke.Next -lt $script:Smoke.Plan.Count) { $problems.Add("stopped at step $($script:Smoke.Next) of $($script:Smoke.Plan.Count)") }
+    if (@($script:State.GatewayRows).Count -ne 6)   { $problems.Add("gateways shown: $(@($script:State.GatewayRows).Count), expected 6") }
+    if (@($script:State.ConnRows).Count -ne 26)     { $problems.Add("connections shown: $(@($script:State.ConnRows).Count), expected 26") }
+    if (@($script:State.Changes).Count -lt 8) {
+        # say where it looked and what is there, so the failure carries its own diagnosis
+        $files = @(Get-ChildItem -LiteralPath $script:LogFolder -Filter 'changes-*.csv' -ErrorAction SilentlyContinue)
+        $read  = Read-GLChanges -Folder $script:LogFolder
+        $problems.Add("changes in the Activity tab: $(@($script:State.Changes).Count), expected at least 8 - $($script:LogFolder) has $($files.Count) change file(s), $($read.Count) change(s) readable")
+    }
+    $outside = Test-GLDemoApart
+    if (@($outside).Count) { $problems.Add("the demo wrote outside its own folder: $($outside -join ', ')") }
+    return , $problems.ToArray()
+}
+
 # ---- small helpers ----------------------------------------------------------------
 function Export-GLGrid {
     param($Grid, [string]$Suggested)
     $rows = @($Grid.ItemsSource | Where-Object { $_ })
     if ($rows.Count -eq 0) { Write-GLLog 'Nothing to export.' 'Warn'; return }
-    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg = [Microsoft.Win32.SaveFileDialog]::new()
     $dlg.FileName = '{0}-{1:yyyyMMdd-HHmm}.csv' -f $Suggested, (Get-Date)
     $dlg.Filter   = 'CSV files (*.csv)|*.csv'
     if (-not $dlg.ShowDialog($script:Window)) { return }
@@ -4745,7 +4838,8 @@ function Copy-GLId {
 # ---- build and run the window ----------------------------------------------------
 function Show-GLWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-    $script:Settings = Read-GLSettings
+    if (-not $script:SettingsPath) { $script:SettingsPath = Get-GLSettingsPath }
+    $script:Settings = Read-GLSettings -Path $script:SettingsPath
     # from here on, everything logged also goes to today's log file
     $script:LogReady = $true
     $pruned = Remove-GLOldLogs -Folder $script:LogFolder -User $script:SignedInAs -Days 30
@@ -4754,7 +4848,7 @@ function Show-GLWindow {
     if ($pruned) { Write-GLLog "Removed $pruned log file(s) older than 30 days." -FileOnly }
 
     [xml]$x = $script:MainXaml
-    $script:Window = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    $script:Window = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($x))
     foreach ($n in ([regex]::Matches($script:MainXaml, 'Name="([A-Za-z]+)"') | ForEach-Object { $_.Groups[1].Value })) {
         $script:UI[$n] = $script:Window.FindName($n)
     }
@@ -4836,15 +4930,15 @@ function Show-GLWindow {
     # appearance
     $script:UI.CmbTheme.Add_SelectionChanged({
         $script:Settings.Theme = Set-GLTheme -Target $script:Window -Name ([string]$script:UI.CmbTheme.SelectedItem)
-        $null = Save-GLSettings -Settings $script:Settings
+        $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath
     })
-    $script:UI.BtnFontDown.Add_Click({ Set-GLFontSize ($script:Settings.FontSize - 1); $null = Save-GLSettings -Settings $script:Settings })
-    $script:UI.BtnFontUp.Add_Click({ Set-GLFontSize ($script:Settings.FontSize + 1); $null = Save-GLSettings -Settings $script:Settings })
+    $script:UI.BtnFontDown.Add_Click({ Set-GLFontSize ($script:Settings.FontSize - 1); $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath })
+    $script:UI.BtnFontUp.Add_Click({ Set-GLFontSize ($script:Settings.FontSize + 1); $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath })
     $script:UI.BtnClearHistory.Add_Click({
         if (-not (Confirm-GL 'Forget everything typed into the search and name boxes?' 'Clear history')) { return }
         $script:Settings.History = [ordered]@{}
         foreach ($f in $script:HistoryFields) { $script:UI[$f].ItemsSource = @() }
-        $null = Save-GLSettings -Settings $script:Settings
+        $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath
         Write-GLLog 'History cleared.'
     })
 
@@ -4922,6 +5016,13 @@ function Show-GLWindow {
         Update-GLBusy
     })
 
+    # Anything a handler did not expect is logged, and the window stays open.
+    $script:Window.Dispatcher.Add_UnhandledException({
+        param($s, $e)
+        Write-GLLog "Unexpected error: $($e.Exception.Message)" 'Error'
+        $e.Handled = $true
+    })
+
     $script:Window.Add_Loaded({
         Write-GLLog "$($script:AppName) $($script:AppVersion) - signed in as $($script:SignedInAs) via $($script:AuthMode)."
         if ($script:AuthMode -eq 'Demo') {
@@ -4935,6 +5036,7 @@ function Show-GLWindow {
         }
         Invoke-GLGatewayRefresh
         Invoke-GLConnectionRefresh
+        if ($script:SmokeTest) { Start-GLSmokeTest }
     })
     $script:Window.Add_Closing({
         param($s, $e)
@@ -4947,7 +5049,7 @@ function Show-GLWindow {
     $script:Window.Add_Closed({
         Write-GLLog 'Session ended.' -FileOnly
         foreach ($f in $script:HistoryFields) { Save-GLFieldHistory $f }
-        $null = Save-GLSettings -Settings $script:Settings
+        $null = Save-GLSettings -Settings $script:Settings -Path $script:SettingsPath
         try { $script:Timer.Stop() } catch { }
         try { if ($script:AutoTimer) { $script:AutoTimer.Stop() } } catch { }
         try { $script:Pool.Close(); $script:Pool.Dispose() } catch { }
@@ -4961,6 +5063,11 @@ function Show-GLWindow {
 #  MAIN
 # ============================================================================
 if ($LoadOnly) { return }
+
+if ($SmokeTest) {
+    $Demo = $true      # -SmokeTest is the demo, driven - and $SmokeTest is already the script variable functions read
+    $script:SettingsPath = Join-Path ([System.IO.Path]::GetTempPath()) ('gatewaylens-smoke-{0}.json' -f [guid]::NewGuid().ToString('N'))
+}
 
 function Stop-GL([string]$Message) {
     # Started from GatewayLens.exe there is no console to read - show a message box too.
@@ -4986,19 +5093,23 @@ if (-not ($SelfTest -or $Inspect) -and [System.Threading.Thread]::CurrentThread.
     if ($DeviceCode)            { $relaunch += '-DeviceCode' }
     if ($AuthModule -ne 'Auto') { $relaunch += @('-AuthModule', $AuthModule) }
     if ($DnsSuffix.Count)       { $relaunch += @('-DnsSuffix', ($DnsSuffix -join ',')) }
-    if ($BackupFolder)          { $relaunch += @('-BackupFolder', $BackupFolder) }
-    if ($LogFolder)             { $relaunch += @('-LogFolder', $LogFolder) }
+    if ($PSBoundParameters.ContainsKey('BackupFolder')) { $relaunch += @('-BackupFolder', $BackupFolder) }
+    if ($PSBoundParameters.ContainsKey('LogFolder'))    { $relaunch += @('-LogFolder', $LogFolder) }
     if ($Launched)              { $relaunch += '-Launched' }
-    if ($Demo)                  { $relaunch += '-Demo' }
+    if ($Demo -and -not $SmokeTest) { $relaunch += '-Demo' }
+    if ($SmokeTest)             { $relaunch += '-SmokeTest' }
     & $exe @relaunch
     exit $LASTEXITCODE
 }
 
 if ($Demo) {
     # demo changes and logs live apart from the real ones
+    # A script's parameters ARE its script variables: by now $LogFolder already holds
+    # the default path, so ask what was actually passed, not whether it has a value.
     $demoRoot = Join-Path (Join-Path $appData 'GatewayLens') 'demo'
-    if (-not $LogFolder)    { $script:LogFolder    = Join-Path $demoRoot 'logs' }
-    if (-not $BackupFolder) { $script:BackupFolder = Join-Path $demoRoot 'backups' }
+    if (-not $PSBoundParameters.ContainsKey('LogFolder'))    { $LogFolder    = Join-Path $demoRoot 'logs' }
+    if (-not $PSBoundParameters.ContainsKey('BackupFolder')) { $BackupFolder = Join-Path $demoRoot 'backups' }
+    $script:DemoRoot = $demoRoot
     Enable-GLDemo
     Write-Host 'Demo mode: Contoso is fictional - no sign-in, nothing leaves this computer.' -ForegroundColor Yellow
 }
@@ -5024,3 +5135,15 @@ if ($Inspect) {
 
 try { Show-GLWindow }
 catch { Stop-GL "$($script:AppName) stopped: $($_.Exception.Message)" }
+
+if ($SmokeTest) {
+    $problems = Get-GLSmokeVerdict
+    Remove-Item -LiteralPath $script:SettingsPath -ErrorAction SilentlyContinue
+    if ($problems.Count) {
+        Write-Host "Smoke test FAILED:" -ForegroundColor Red
+        foreach ($p in $problems) { Write-Host "  $p" -ForegroundColor Red }
+        exit 1
+    }
+    Write-Host "Smoke test passed: window, $($script:Themes.Count) themes, $($script:UI.Tabs.Items.Count) tabs, demo data loaded." -ForegroundColor Green
+    exit 0
+}

@@ -67,7 +67,9 @@ guard tests - never weaken a guard to make it pass; fix the code instead.
 8. **CSV meant for Excel: `Export-Csv -Encoding utf8BOM`**, or accented names come
    out garbled. Guard.
 9. **Colours only through theme brush names.** A new brush goes into all four themes
-   in `$script:Themes`. Guards.
+   in `$script:Themes`. Style keys end in what they style - `DangerButton`,
+   `LabelText` - and never share a name with a brush: the window's brushes are
+   found first, so a style named like a brush gets the brush. Guards.
 10. **XAML lives in here-strings and must stay well-formed** - the tests parse it.
     New controls need `Name="..."` and are reached as `$script:UI.Name`. Styling can
     fail at run time without the tests noticing; that is why the modern style
