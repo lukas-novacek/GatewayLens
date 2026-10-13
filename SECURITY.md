@@ -49,9 +49,14 @@ rest.
 ## Check what you run
 
 - The exe is built from this repository by GitHub Actions, and carries the script
-  inside it - the same `GatewayLens.ps1` as in the release.
+  inside it - the same `GatewayLens.ps1` as in the release. The release build checks
+  that before it publishes, and `build/Test-Release.ps1` checks it on a download.
 - Every release lists the SHA-256 of both. Compare with
   `Get-FileHash .\GatewayLens.exe`.
+- Signed releases are signed by SignPath Foundation - the exe, the script, and the
+  script inside the exe. `Get-AuthenticodeSignature .\GatewayLens.exe` says *Valid*.
+  Signing is applied for; the [code signing policy](README.md#code-signing-policy)
+  says when it starts, and [docs/code-signing.md](docs/code-signing.md) how to check.
 - The script is plain PowerShell: read it, or run the script instead of the exe.
 - `.\GatewayLens.ps1 -Demo` runs everything against a fictional company, without
   signing in and without a single call leaving your computer.

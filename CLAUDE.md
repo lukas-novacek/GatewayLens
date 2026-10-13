@@ -28,10 +28,14 @@ safety come before features.
   (XAML in here-strings, then the UI functions), MAIN.
 - `tests/Run-Tests.ps1` - the test suite. Needs no tenant and no sign-in.
 - `build/` - `GatewayLens.exe`: a small .NET Framework 4.8 launcher (C#) that carries
-  the script inside it, and `Build-Exe.ps1`.
+  the script inside it, and `Build-Exe.ps1`. `Test-Release.ps1` checks a release: the
+  exe carries exactly the released script, and the signatures. `signpath/` - the two
+  SignPath configurations. The release signs the script before it builds the exe -
+  guard.
 - `assets/` - icons. `docs/permissions.md` - which role each action needs.
   `docs/sign-in.md` - how sign-in works, approval by IT, the app registration.
   `docs/testing-on-a-real-tenant.md` - the checklist for a real tenant, read-only first.
+  `docs/code-signing.md` - what is signed, how to check it, how SignPath is set up.
 - `.github/workflows/` - tests on Linux and Windows, exe build, release on a tag.
 
 ## Commands

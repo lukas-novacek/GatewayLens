@@ -250,7 +250,8 @@ takes you to the start page. Things to try:
 **The exe** - download `GatewayLens.exe` from [Releases](../../releases) and run it.
 It carries the script inside it and starts it in PowerShell 7; if PowerShell 7 is
 missing, it says how to install it. It opens on a start page: sign in when you are
-ready - with an admin account, if you keep one - or try the demo first.
+ready - with an admin account, if you keep one - or try the demo first. How every
+release is built, checked and signed: the [code signing policy](#code-signing-policy).
 
 **Or the script:**
 
@@ -476,6 +477,7 @@ answer: it reached the gateway, and the gateway could not reach the data source.
 - Local snapshots, to show what changed and what was deleted since a given day
 - Sign-in as a service principal, for unattended reports
 - Credentials for virtual network gateway connections
+- Signed releases - [applied for](#code-signing-policy)
 
 Ideas and bug reports are welcome as [issues](../../issues).
 
@@ -501,6 +503,32 @@ The tests replace every call to Microsoft with a stand-in, so they run on every 
 via GitHub Actions - which also builds the exe; download it from the run's
 **Artifacts**. Pushing a tag such as `v0.9.0` publishes a release with the exe and
 the script attached. Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate
+by [SignPath Foundation](https://signpath.org/).
+
+> [!NOTE]
+> Applied for. Until it is in place, releases are not signed - check a download with
+> the SHA-256 in its release notes.
+
+- **What is signed:** `GatewayLens.exe` and `GatewayLens.ps1` of every release - and
+  the copy of the script inside the exe, which is signed before the exe is built.
+- **How:** every release is built from a version tag in this repository by GitHub
+  Actions ([release.yml](.github/workflows/release.yml)), checked, and signed in that
+  same run. Nothing built anywhere else is signed.
+- **Committers and reviewers:** [Lukas Novacek](https://github.com/lukas-novacek)
+- **Approvers:** [Lukas Novacek](https://github.com/lukas-novacek) - every release is
+  approved by hand before it is signed.
+- **Privacy:** GatewayLens sends nothing about you or your tenant anywhere except to
+  Microsoft, when you sign in and use it. It also reads two public Microsoft pages
+  for the newest gateway version, without a token or anything about your tenant, and
+  sends alerts only to a Teams workflow or Power Automate flow you set up. There is
+  no telemetry. [Where the data comes from](#where-the-data-comes-from) lists every
+  service it talks to.
+
+How to check a signature, and what IT may need: [docs/code-signing.md](docs/code-signing.md).
 
 ## Licence
 

@@ -137,11 +137,11 @@ $script:DnsSuffixes = @($DnsSuffix | ForEach-Object { $_ -split ',' } | ForEach-
 # reads them defensively instead. So the script sets its own rules.
 Set-StrictMode -Off
 
-$script:AppVersion = '0.10.1'
+$script:AppVersion = '0.10.2'
 # What is new, in a few lines for the window - shown once after an update. The full
 # list is CHANGELOG.md. The tests check that it is about the current version.
 $script:WhatsNew = @{
-    Version = '0.10.1'
+    Version = '0.10.2'
     Lines   = @(
         'Make room before a gateway cluster reaches 1,000: every tile says how many connections are unused, Show > Cleanup candidates lists them with the reason, and Cleanup report... makes a page for the owners.'
         'Right-click connections to verify the status or the users of just the selected ones.'
@@ -1228,7 +1228,7 @@ function ConvertTo-GLCleanupHtml {
         , @('Never', 'r5', 'No use recorded')
         , @('NoData', 'nodata', 'No recency data')
     )
-    $null = $sb.Append('<section class="card"><h2>How recently connections were used</h2><p class="note">As Microsoft records it: connection recency, a preview in Fabric, recorded since spring 2026.</p><div class="legend">')
+    $null = $sb.Append('<section class="card"><h2>How recently connections were used</h2><p class="note">As Microsoft records it: connection recency, a preview in Fabric. Use from before Microsoft began recording it does not show.</p><div class="legend">')
     foreach ($k in $keys) { $null = $sb.Append("<span><i class=`"sw $($k[1])`"></i>$($k[2])</span>") }
     $null = $sb.Append('</div><table><thead><tr><th>Cluster</th><th class="barcol">Its connections</th><th class="num">30 days</th><th class="num">31-120</th><th class="num">121-365</th><th class="num">Over a year</th><th class="num">Never</th><th class="num">No data</th></tr></thead><tbody>')
     foreach ($c in $sum) {
@@ -4708,7 +4708,7 @@ $script:MainXaml = @'
             <ComboBox Name="CmbCnType" Width="130" MinHeight="26"/>
             <TextBlock Text="Show" Style="{DynamicResource LabelText}"/>
             <ComboBox Name="CmbCnShow" Width="250" MinHeight="26"
-                      ToolTip="Cleanup views. Last used and No use recorded come from Microsoft's connection recency (preview): it records use since spring 2026 and can be up to 30 minutes behind. Duplicates: the same gateway, path and account and the same sign-in settings - the same path with other credentials is not a copy. Failing tests: after Verify status."/>
+                      ToolTip="Cleanup views. Last used and No use recorded come from Microsoft's connection recency (preview): use from before Microsoft began recording it does not show, and it can be up to 30 minutes behind. Duplicates: the same gateway, path and account and the same sign-in settings - the same path with other credentials is not a copy. Failing tests: after Verify status."/>
           </WrapPanel>
 
           <DockPanel Grid.Row="1" Margin="0,0,0,8">
@@ -6745,7 +6745,8 @@ function Update-GLMeter {
         }
         $script:MeterLast = @{ At = $now; Cpu = $cpuTime }
         $st = [System.AppDomain]::CurrentDomain.GetData('GatewayLens.Stats')
-        $script:UI.TxtMeter.Text = Get-GLMeterText -Cpu $cpu -MemoryBytes $p.WorkingSet64 -Busy @($script:Jobs).Count -Workers 4 -Threads $p.Threads.Count `
+        $workers = if ($script:Pool) { $script:Pool.GetMaxRunspaces() } else { 4 }
+        $script:UI.TxtMeter.Text = Get-GLMeterText -Cpu $cpu -MemoryBytes $p.WorkingSet64 -Busy @($script:Jobs).Count -Workers $workers -Threads $p.Threads.Count `
             -Calls ([long]$st.Calls) -Throttled ([long]$st.Throttled)
         $n = [int]$script:ErrorCount
         $script:UI.BtnErrors.Visibility = $(if ($n) { 'Visible' } else { 'Collapsed' })
@@ -7901,17 +7902,31 @@ function Invoke-GLAccessReportUi {
 }
 
 function Show-GLCleanupFor {
-    # From a gateway tile to the connections on it that can go - the fast way to make room.
+    <#
+        From a gateway tile to the connections on it that can go - the fast way to make
+        room. A search, User or Account filter, or an unticked gateway state left over
+        from earlier would hide some of them, so those are cleared - the list then holds
+        what the tile counts - and the log says what was cleared.
+    #>
     param($Tile)
     if (-not $Tile) { Write-GLLog 'Right-click a gateway tile first.' 'Warn'; return }
     if (@($script:State.ConnRows).Count -eq 0) { Write-GLLog 'The connections are not loaded yet - press Refresh on the Connections tab.' 'Warn'; return }
     if (@($script:UI.CmbCnGateway.ItemsSource) -notcontains [string]$Tile.Name) { Write-GLLog "No connections of '$($Tile.Name)' are listed." 'Warn'; return }
+    $cleared = [System.Collections.Generic.List[string]]::new()
     $script:State.Populating = $true
     try {
+        if ([string]$script:UI.TxtCnSearch.Text)  { $script:UI.TxtCnSearch.Text  = ''; $cleared.Add('Search') }
+        if ([string]$script:UI.TxtCnUser.Text)    { $script:UI.TxtCnUser.Text    = ''; $cleared.Add('User') }
+        if ([string]$script:UI.TxtCnAccount.Text) { $script:UI.TxtCnAccount.Text = ''; $cleared.Add('Account') }
+        if ([string]$script:UI.CmbCnConnectivity.SelectedItem -notin '', '(all)') { $script:UI.CmbCnConnectivity.SelectedItem = '(all)'; $cleared.Add('Connectivity') }
+        if ([string]$script:UI.CmbCnType.SelectedItem -notin '', '(all)') { $script:UI.CmbCnType.SelectedItem = '(all)'; $cleared.Add('Type') }
+        $states = @($script:UI.ChkStOnline, $script:UI.ChkStPartial, $script:UI.ChkStOffline, $script:UI.ChkStUnknown)
+        if (@($states | Where-Object { -not $_.IsChecked }).Count) { foreach ($c in $states) { $c.IsChecked = $true }; $cleared.Add('Gateway state') }
         $script:UI.CmbCnGateway.SelectedItem = [string]$Tile.Name
         $script:UI.CmbCnShow.SelectedItem    = 'Cleanup candidates'
     }
     finally { $script:State.Populating = $false }
+    if ($cleared.Count) { Write-GLLog "Cleared the $($cleared -join ', ') filter$(if ($cleared.Count -gt 1) { 's' }), so every connection on '$($Tile.Name)' that can go is listed." }
     $script:UI.Tabs.SelectedItem = $script:UI.TabConnections
     Show-GLConnections -Say
 }
@@ -8479,6 +8494,9 @@ function Get-GLSmokePlan {
     $plan.Add(@{ Kind = 'CleanupStart' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
     $plan.Add(@{ Kind = 'CleanupCheck' })
+    $plan.Add(@{ Kind = 'TileCleanup' })
+    $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
+    $plan.Add(@{ Kind = 'TileCleanupCheck' })
     $plan.Add(@{ Kind = 'Tab'; Value = 1 })
     $plan.Add(@{ Kind = 'HistoryPick' })
     $plan.Add(@{ Kind = 'Wait' }); $plan.Add(@{ Kind = 'Wait' })
@@ -8575,6 +8593,25 @@ function Step-GLSmokeTest {
             $rowsC = @($script:State.ConnRows | Where-Object { $_.Connectivity -ne 'ShareableCloud' -and $_.GatewayId })
             Start-GLCleanupReport -Rows $rowsC -Path $sm.CleanupFile -NoOpen
         }
+        'TileCleanup' {
+            # filters left over from earlier work must not hide what the tile counts
+            $tc = @($script:State.Tiles | Where-Object { [string]$_.ConnectionsText -match 'unused' })
+            $sm.TileCleanup = @(@($tc | Where-Object Status -eq 'Online') + @($tc))[0]
+            $script:UI.TxtCnAccount.Text = 'svc_nobody'
+            $script:UI.ChkStOnline.IsChecked = $false
+            Show-GLCleanupFor $sm.TileCleanup
+        }
+        'TileCleanupCheck' {
+            $tile = $sm.TileCleanup
+            $want = if ($tile) { [int](Get-GLCleanupCounts -Rows $script:State.ConnRows)[([string]$tile.Id).ToLowerInvariant()] } else { 0 }
+            $got  = @($script:UI.GridConnections.ItemsSource | Where-Object { $_ }).Count
+            $sm.TileCleanupOk = $want -gt 0 -and $got -eq $want -and -not [string]$script:UI.TxtCnAccount.Text -and [bool]$script:UI.ChkStOnline.IsChecked -and
+                                [object]::ReferenceEquals($script:UI.Tabs.SelectedItem, $script:UI.TabConnections)
+            $script:State.Populating = $true
+            try { $script:UI.CmbCnGateway.SelectedItem = '(all)'; $script:UI.CmbCnShow.SelectedItem = 'All connections' }
+            finally { $script:State.Populating = $false }
+            Show-GLConnections
+        }
         'CleanupCheck' {
             $page = if (Test-Path -LiteralPath $sm.CleanupFile) { Get-Content -Raw -LiteralPath $sm.CleanupFile } else { '' }
             $unusedTile = @($script:State.Tiles | Where-Object { [string]$_.ConnectionsText -match 'unused' }).Count
@@ -8666,6 +8703,7 @@ function Get-GLSmokeVerdict {
     $st = @($script:State.Tiles | ForEach-Object Status | Sort-Object -Unique)
     if (@($script:State.Tiles).Count -ne 5 -or ($st -notcontains 'Offline') -or ($st -notcontains 'VNet')) { $problems.Add("gateway tiles: $(@($script:State.Tiles).Count) with $($st -join ', '), expected 5 including Offline and VNet") }
     if ($script:Smoke -and -not $script:Smoke.MenuOk) { $problems.Add('Verify status on the right-click menu did not test exactly the selected connections') }
+    if ($script:Smoke -and -not $script:Smoke.TileCleanupOk) { $problems.Add('List the unused connections on a gateway tile did not list exactly what the tile counts, with the filters left over cleared') }
     if ($script:Smoke -and -not $script:Smoke.CleanupOk) { $problems.Add('the cleanup report, or the unused count on the tiles, did not come out') }
     if ($script:Smoke -and -not $script:Smoke.MeterOk) { $problems.Add('the meter at the bottom right showed no numbers') }
     if ($script:Smoke -and -not $script:Smoke.AlertsOk) { $problems.Add('the Alerts window did not load') }

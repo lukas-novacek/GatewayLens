@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration "script" - see docs/code-signing.md.
+  The release workflow uploads GatewayLens.ps1 alone; GitHub Actions wraps it in a zip.
+  It is signed before the exe is built, so the exe carries the signed script.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <powershell-file path="GatewayLens.ps1">
+      <authenticode-sign />
+    </powershell-file>
+  </zip-file>
+</artifact-configuration>

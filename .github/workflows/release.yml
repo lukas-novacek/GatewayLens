@@ -2,6 +2,14 @@ name: release
 
 # Push a tag such as v0.3.0 and this builds GatewayLens.exe, runs the tests, and
 # publishes a GitHub release with the exe and the script attached.
+#
+# Signing goes through SignPath Foundation's free code signing for open source -
+# docs/code-signing.md. It is on once the repository variable
+# SIGNPATH_ORGANIZATION_ID is set, with SIGNPATH_PROJECT_SLUG,
+# SIGNPATH_SIGNING_POLICY_SLUG and the secret SIGNPATH_API_TOKEN. The script is
+# signed first, so the exe carries the signed script - then the exe. Each signing
+# request waits for its approval in SignPath. Without the variable the release is
+# built unsigned, as before. With the test-signing policy the release stays a draft.
 
 on:
   push:
@@ -9,10 +17,14 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+      POLICY: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,9 +38,76 @@ jobs:
           $v = [regex]::Match((Get-Content ./GatewayLens.ps1 -Raw), "AppVersion\s*=\s*'([\d.]+)'").Groups[1].Value
           if ("v$v" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match the script version $v." }
 
+      - name: Upload the script for signing
+        if: env.SIGN == 'true'
+        id: script-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: script-unsigned
+          overwrite: true
+          path: GatewayLens.ps1
+          if-no-files-found: error
+
+      - name: Sign the script
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: script
+          github-artifact-id: ${{ steps.script-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed/script
+
+      - name: Use the signed script
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: Copy-Item ./signed/script/GatewayLens.ps1 ./GatewayLens.ps1 -Force
+
       - name: Build GatewayLens.exe
         shell: pwsh
         run: ./build/Build-Exe.ps1
+
+      - name: Upload the exe for signing
+        if: env.SIGN == 'true'
+        id: exe-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: exe-unsigned
+          overwrite: true
+          path: dist/GatewayLens.exe
+          if-no-files-found: error
+
+      - name: Sign the exe
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: exe
+          github-artifact-id: ${{ steps.exe-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed/exe
+
+      - name: Use the signed exe
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: Copy-Item ./signed/exe/GatewayLens.exe ./dist/GatewayLens.exe -Force
+
+      - name: Check the release - the exe carries the released script, and the signatures
+        shell: pwsh
+        run: |
+          $check = @{ Exe = './dist/GatewayLens.exe'; Script = './GatewayLens.ps1' }
+          if ($env:SIGN -eq 'true') {
+            if ($env:POLICY -eq 'release-signing') { $check.Publisher = 'SignPath Foundation' } else { $check.Signed = $true }
+          }
+          ./build/Test-Release.ps1 @check
 
       - name: Release notes from the changelog
         shell: pwsh
@@ -46,12 +125,17 @@ jobs:
           }
           $lines | Set-Content SHA256SUMS.txt
           $fence = [string]::new([char]96, 3)
-          Add-Content notes.md ("`n`n### SHA-256`n`nCheck a download with ``Get-FileHash <file>``:`n`n$fence`n" + ($lines -join "`n") + "`n$fence")
+          $policy = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY#code-signing-policy"
+          $signed = if ($env:SIGN -eq 'true' -and $env:POLICY -eq 'release-signing') { "Both files are signed by SignPath Foundation - [code signing policy]($policy)." }
+                    elseif ($env:SIGN -eq 'true') { "Test-signed only - a draft, not for use. [Code signing policy]($policy)." }
+                    else { "Not signed yet - [code signing policy]($policy). Check a download with the SHA-256 below." }
+          Add-Content notes.md ("`n`n### Signature and SHA-256`n`n$signed Check a file with ``Get-FileHash <file>``:`n`n$fence`n" + ($lines -join "`n") + "`n$fence")
 
       - uses: softprops/action-gh-release@v2
         with:
           name: GatewayLens ${{ github.ref_name }}
           body_path: notes.md
+          draft: ${{ env.SIGN == 'true' && env.POLICY != 'release-signing' }}
           files: |
             dist/GatewayLens.exe
             GatewayLens.ps1

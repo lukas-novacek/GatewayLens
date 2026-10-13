@@ -1730,7 +1730,7 @@ Assert ((Get-DemoRole connections $byN['Sales DW'].Id $janeU.id) -eq 'Owner' -an
 Assert ((Get-DemoRole connections $byN['Product Catalog'].Id $janeU.id) -eq 'Owner' -and ($h3 | Where-Object Name -eq 'Product Catalog').Message -eq 'gave Jane Doe Owner') 'no role yet: the same role is given'
 
 $h4 = Invoke-GLAccessHandover -Targets $allGw -From (Resolve-GLHandoverFrom -Value 'jane.doe@contoso.com' -GraphToken $T) -To $toAna -Move -FabricToken $T -Progress @{ Cancel = $false } -Audit $ha
-Assert ((Get-DemoRole gateways $prodG.id $anaU.id) -eq 'ConnectionCreator' -and -not (Get-DemoRole gateways $prodG.id $janeU.id)) 'gateways too: Ana takes over Jane''s connection-creator role on the Prod gateway'
+Assert ((Get-DemoRole gateways $prodG.id $anaU.id) -eq 'ConnectionCreator' -and -not (Get-DemoRole gateways $prodG.id $janeU.id) -and @($h4 | Where-Object { -not $_.Ok }).Count -eq 0) 'gateways too: Ana takes over Jane''s connection-creator role on the Prod gateway, and nothing fails'
 
 $ghost = [pscustomobject]@{ Id = (New-GLDemoId 'nobody'); DisplayName = 'Nobody'; Type = 'User' }
 $t5 = @($allConn | Where-Object Name -eq 'Sales Staging')
@@ -1893,7 +1893,7 @@ $script:AuthMode = $keepReset.Mode; $script:TenantShown = $keepReset.Tenant; $sc
 $keepStyle = $script:StyleMode; $keepErr = $script:StyleError; $keepSmoke = $script:Smoke
 $keepRows = @{ G = $script:State.GatewayRows; C = $script:State.ConnRows; A = $script:State.Changes }
 $script:StyleMode = 'Modern'; $script:StyleError = $null; $script:LogEntries.Clear()
-$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true; GoneOk = $true; CountdownOk = $true; AgainOk = $true; AlertsOk = $true; TaskbarOk = $true; MeterOk = $true; CleanupOk = $true; MenuOk = $true }
+$script:Smoke = @{ Plan = @(1, 2, 3); Next = 3; KioskOk = $true; Duplicates = 2; GridChecks = ''; TileScale = 16 / 12; FilterOk = $true; HistoryOk = $true; GoneOk = $true; CountdownOk = $true; AgainOk = $true; AlertsOk = $true; TaskbarOk = $true; MeterOk = $true; CleanupOk = $true; MenuOk = $true; TileCleanupOk = $true }
 $keepStart = $script:StartPageResult; $script:StartPageResult = 'Demo'
 $keepTiles = $script:State.Tiles
 $script:State.GatewayRows = @(1..5); $script:State.ConnRows = @(1..27)
@@ -1913,7 +1913,7 @@ Assert (((Get-GLSmokeVerdict) -join ' ') -match 'kiosk view') 'smoke verdict: a 
 $script:Smoke.KioskOk = $true; $script:Smoke.GridChecks = 'a cell wrote its text back into the row'
 Assert (((Get-GLSmokeVerdict) -join ' ') -match 'grids: a cell wrote') 'smoke verdict: a grid that sorts, opens or copies wrongly fails'
 $script:Smoke.GridChecks = ''
-foreach ($k in 'GoneOk', 'CountdownOk', 'AgainOk', 'AlertsOk', 'TaskbarOk', 'MeterOk', 'CleanupOk', 'MenuOk') {
+foreach ($k in 'GoneOk', 'CountdownOk', 'AgainOk', 'AlertsOk', 'TaskbarOk', 'MeterOk', 'CleanupOk', 'MenuOk', 'TileCleanupOk') {
     $script:Smoke[$k] = $false
     Assert ((Get-GLSmokeVerdict).Count -ge 1) "smoke verdict: $k false fails"
     $script:Smoke[$k] = $true
@@ -1994,6 +1994,27 @@ foreach ($sw in 'SelfTest', 'Inspect', 'DeviceCode') {
 }
 $m = [regex]::Match((Get-Content $script -Raw), "AppVersion\s*=\s*'(\d+\.\d+\.\d+)'")
 Assert ($m.Success) "the build script can read the version from GatewayLens.ps1 ($($m.Groups[1].Value))"
+
+# The release signs the script before it builds the exe, so the exe carries the
+# signed copy - and checks the result before anything is published.
+$relYml   = Get-Content (Join-Path $root '.github/workflows/release.yml') -Raw
+$relOrder = @('Sign the script', 'Use the signed script', 'Build GatewayLens.exe', 'Sign the exe', 'Use the signed exe', 'Check the release', 'Checksums', 'softprops/action-gh-release') |
+    ForEach-Object { $relYml.IndexOf($_) }
+Assert (($relOrder -notcontains -1) -and (($relOrder | Sort-Object) -join ',') -eq ($relOrder -join ',')) "the release signs the script, builds the exe with it, signs the exe, and checks both before it publishes ($($relOrder -join ', '))"
+foreach ($relCfg in @(@('script', 'powershell-file', 'GatewayLens.ps1'), @('exe', 'pe-file', 'GatewayLens.exe'))) {
+    $relCfgOk = $false
+    try {
+        [xml]$relCfgXml = Get-Content (Join-Path $root "build/signpath/$($relCfg[0]).xml") -Raw
+        $relNode = $relCfgXml.'artifact-configuration'.'zip-file'.($relCfg[1])
+        $relCfgOk = $relNode.path -eq $relCfg[2] -and $null -ne $relNode.'authenticode-sign' -and
+                    $relYml -match "artifact-configuration-slug: $($relCfg[0])\r?\n"
+        if ($relCfg[0] -eq 'exe') { $relCfgOk = $relCfgOk -and $relNode.'product-name' -eq $projXml.Project.PropertyGroup.Product }
+    } catch { $relCfgOk = $false }
+    Assert $relCfgOk "SignPath's '$($relCfg[0])' configuration signs $($relCfg[2]), and the release asks for it by that name"
+}
+$relErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'build/Test-Release.ps1'), [ref]$null, [ref]$relErrors)
+Assert ($relErrors.Count -eq 0) 'build/Test-Release.ps1 parses - the release runs it before it publishes'
 
 # ============================================================================
 Section 'Parallel requests against a real HTTP server'

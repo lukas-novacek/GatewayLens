@@ -4,6 +4,30 @@ All notable changes to GatewayLens are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.10.2] - 2026-10-13
+
+### Added
+- **Signed releases, once SignPath accepts GatewayLens.** The release build can sign
+  through SignPath Foundation's free code signing for open source: the script first,
+  so the exe carries the signed script, then the exe - each approved by hand. Until it
+  is set up, releases are built unsigned, as before.
+  [docs/code-signing.md](docs/code-signing.md) says what is signed, how to check it,
+  and what IT may need.
+- **Every release is checked before it is published** - `build/Test-Release.ps1`:
+  the exe carries exactly the script released next to it, and, once signing is on,
+  both are signed. It checks a download just the same.
+
+### Fixed
+- **Right-click a tile > List the unused connections** now lists all of them. A
+  search, User or Account filter, or an unticked gateway state left over from earlier
+  hid some - an unticked *Online* hid every one on an online cluster. Those filters
+  are cleared now, and the log says which.
+
+### Changed
+- The README has a code signing policy, with a privacy statement.
+- The cleanup report and the Show tooltip no longer give a date for when Microsoft
+  began recording connection use - Microsoft does not document one.
+
 ## [0.10.1] - 2026-10-13
 
 ### Changed
