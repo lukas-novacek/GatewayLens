@@ -5,7 +5,7 @@ how to check your work, and the traps this project has already fallen into.
 
 ## What it is
 
-A desktop console for Microsoft on-premises data gateways and their connections,
+A desktop console for Microsoft data gateways - on-premises and VNet - and their connections,
 for Power BI and Microsoft Fabric. One PowerShell 7 script with a WPF window. It
 talks only to Microsoft: the Fabric and Power BI REST APIs, Microsoft Graph for
 name lookups, and two public pages for the newest gateway version (Download Center,

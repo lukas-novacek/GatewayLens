@@ -2,7 +2,7 @@
 
 <h1 align="center">GatewayLens</h1>
 
-<p align="center"><b>The free admin console for Power BI and Microsoft Fabric on-premises data gateways.</b><br>
+<p align="center"><b>The free admin console for Power BI and Microsoft Fabric data gateways - on-premises and VNet.</b><br>
 Rotate a password on hundreds of gateway connections in one run, hand over a leaver's access,<br>
 find the access the portal hides, and watch every gateway cluster on one screen.</p>
 
@@ -158,7 +158,8 @@ Everything acts on every listed connection - filter first, exclude what you want
 leave alone, then press one button:
 - **Update credentials** - Windows, Basic, Anonymous or Key - the way the portal does
   it, so the username stays visible, and **tested afterwards**, so you know at once
-  which ones still fail.
+  which ones still fail. For connections on on-premises gateways; VNet gateway
+  connections are on the [roadmap](#roadmap).
 - **Grant** or **remove** access for any number of people and groups. Someone who
   already has the role is left alone, a lower role is raised, and the list is read
   again afterwards, so it shows what really happened.
